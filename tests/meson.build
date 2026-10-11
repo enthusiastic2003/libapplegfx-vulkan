@@ -1334,3 +1334,11 @@ sampler_test = executable('sampler-state-unit',
   build_by_default : true,
 )
 test('sampler state decode (unit)', sampler_test)
+
+psodesc_test = executable('pipeline-descriptor-unit',
+  'pipeline-descriptor-unit.c',
+  include_directories : [include_dir, internal_include_dir],
+  dependencies : [libapplegfx_vulkan_dep],
+  build_by_default : true,
+)
+test('pipeline descriptor decode (unit)', psodesc_test)

@@ -658,6 +658,42 @@ static BOOL case_sampler_probe(void) {
     return YES;
 }
 
+// Not a pass/fail case: pipelines with known blend settings, so the
+// host-side pipeline dump (LAGFX_DUMP_PSO=1) can be matched to them.
+static BOOL case_blend_probe(void) {
+    struct { const char *what; blend_cfg cfg; } p[] = {
+        {"blending off", nil},
+        {"enabled, defaults", ^(MTLRenderPipelineColorAttachmentDescriptor *a) { a.blendingEnabled = YES; }},
+        {"rgb src SourceAlpha(4) dst OneMinusSourceAlpha(5)", ^(MTLRenderPipelineColorAttachmentDescriptor *a) {
+            a.blendingEnabled = YES;
+            a.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            a.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha; }},
+        {"alpha src DestinationAlpha(8) dst OneMinusDestinationColor(7)", ^(MTLRenderPipelineColorAttachmentDescriptor *a) {
+            a.blendingEnabled = YES;
+            a.sourceAlphaBlendFactor = MTLBlendFactorDestinationAlpha;
+            a.destinationAlphaBlendFactor = MTLBlendFactorOneMinusDestinationColor; }},
+        {"rgb op ReverseSubtract(2)", ^(MTLRenderPipelineColorAttachmentDescriptor *a) {
+            a.blendingEnabled = YES; a.rgbBlendOperation = MTLBlendOperationReverseSubtract; }},
+        {"alpha op Max(4)", ^(MTLRenderPipelineColorAttachmentDescriptor *a) {
+            a.blendingEnabled = YES; a.alphaBlendOperation = MTLBlendOperationMax; }},
+        {"write mask Red|Alpha (9)", ^(MTLRenderPipelineColorAttachmentDescriptor *a) {
+            a.writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskAlpha; }},
+        {"rgb src BlendColor(11) dst OneMinusBlendAlpha(14)", ^(MTLRenderPipelineColorAttachmentDescriptor *a) {
+            a.blendingEnabled = YES;
+            a.sourceRGBBlendFactor = MTLBlendFactorBlendColor;
+            a.destinationRGBBlendFactor = MTLBlendFactorOneMinusBlendAlpha; }},
+    };
+    static bgra_t px[kSize * kSize];
+    static const float c[4] = {1, 0, 0, 0.5f};
+    for (size_t i = 0; i < sizeof p / sizeof p[0]; i++) {
+        printf("  pipeline %zu: %s\n", i, p[i].what);
+        draw_quad(make_pipeline(@"vs_quad", @"fs_const", nil, p[i].cfg), MTLClearColorMake(0, 0, 1, 1),
+                  ^(id<MTLRenderCommandEncoder> e) { [e setFragmentBytes:c length:sizeof c atIndex:0]; },
+                  px);
+    }
+    return YES;
+}
+
 // Not a pass/fail case: clears textures with distinct, known properties so
 // the host-side object dump (LAGFX_DUMP_OBJ=1) can be matched to fields.
 static BOOL case_probe(void) {
@@ -704,6 +740,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
     {"sampler-probe", case_sampler_probe, NO},
+    {"blend-probe", case_blend_probe, NO},
 };
 #define kNumCases (sizeof kCases / sizeof kCases[0])
 
@@ -768,8 +805,11 @@ int main(int argc, const char *argv[]) {
             return 0;
         }
 
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        printf("device: %s\n", dev ? dev.name.UTF8String : "(none)");
+        // Right after boot the GPU driver may not be up yet: wait for it.
+        id<MTLDevice> dev = nil;
+        for (int t = 0; t < 60 && !(dev = MTLCreateSystemDefaultDevice()); t++) sleep(1);
+        printf("device: %s\n", dev ? dev.name.UTF8String : "(none after 60 s)");
+        if (!dev) return 100;
         // Warm up: right after boot the first shader compile (compiler service
         // start-up) can take longer than a case's timeout. Compile the library
         // once here, untimed, so the cases measure the GPU, not the cold start.

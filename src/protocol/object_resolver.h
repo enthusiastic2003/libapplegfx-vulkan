@@ -129,6 +129,13 @@ size_t lagfx_scan_descriptor_function_refs(const uint8_t *desc, uint32_t limit,
  * Returns the number of attributes found (<= cap): sorted by attribute index
  * when the record decoder (vertex_descriptor.h) succeeds, else by offset. */
 typedef struct { uint32_t fmt, off, bufidx; } lagfx_pso_vtx_attr_t;
+/* Read pipeline object `pipeline_object_id`'s data into blob[0..cap).
+ * Returns its length (0 if it isn't a readable pipeline object); *out_va (if
+ * non-NULL) receives its task virtual address. */
+uint32_t lagfx_read_pso_blob(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                             uint32_t pipeline_object_id, uint8_t *blob, uint32_t cap,
+                             uint64_t *out_va);
+
 uint32_t lagfx_parse_pso_vertex_attrs(lagfx_protocol_t *p,
                                       const lagfx_task_entry_t *task,
                                       uint32_t pipeline_object_id,

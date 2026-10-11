@@ -895,6 +895,15 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
         .color_format         = (VkFormat)task->render_pass_desc.color_format,
         .depth_format         = (VkFormat)task->render_pass_desc.depth_format,
     };
+    if (task->pending_pipeline.has_blend) {
+        const lagfx_pso_color_attachment_t *bl = &task->pending_pipeline.blend;
+        pdesc.has_blend  = true;
+        pdesc.blending   = bl->blending != 0u;
+        pdesc.src_rgb    = bl->src_rgb;    pdesc.dst_rgb   = bl->dst_rgb;
+        pdesc.rgb_op     = bl->rgb_op;     pdesc.alpha_op  = bl->alpha_op;
+        pdesc.src_alpha  = bl->src_alpha;  pdesc.dst_alpha = bl->dst_alpha;
+        pdesc.write_mask = bl->write_mask;
+    }
     /* Vertex input (gated by LAGFX_VTX_INPUT): feed the vertex shader's
      * reflected stage-in attributes from a bound guest vertex buffer. Without
      * this the positions read unbound → 0 → degenerate → black. */

@@ -16,4 +16,5 @@ lagfx_sources += files(
    'vertex_descriptor.c',  # serialized MTLVertexDescriptor decoder
    'texture_object.c',  # texture object (slot type 0x02/0x03/0x0c) decoder
    'sampler_state.c',  # sampler state object / constexpr sampler decoders
+   'pipeline_descriptor.c',  # pipeline colour attachments / blend state
 )

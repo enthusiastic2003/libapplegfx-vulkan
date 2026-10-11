@@ -1233,6 +1233,31 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
         LAGFX_WARN("compute_inner: 0x74 SetRenderPipelineState task_id=%u not live", task_id);
         return 1;
     }
+    if (getenv("LAGFX_DUMP_PSO")) {   /* the parser dumps each pipeline blob once */
+        lagfx_pso_vtx_attr_t tmp[8];
+        (void)lagfx_parse_pso_vertex_attrs(p, task, reference, tmp, 8u);
+    }
+    /* Blend state of colour attachment 0 (the only one drawn into). */
+    task->pending_pipeline.has_blend = 0;
+    if (!getenv("LAGFX_DISABLE_PSO_BLEND")) {
+        uint8_t blob[512];
+        uint32_t bl = lagfx_read_pso_blob(p, task, reference, blob, sizeof blob, NULL);
+        lagfx_pso_color_attachment_t ca[8];
+        uint32_t nca = bl ? lagfx_parse_pso_color_attachments(blob, bl, ca, 8u) : 0u;
+        for (uint32_t i = 0; i < nca; i++) {
+            if (ca[i].index != 0u) continue;
+            task->pending_pipeline.blend = ca[i];
+            task->pending_pipeline.has_blend = 1;
+        }
+        if (getenv("LAGFX_DUMP_PSO"))
+            LAGFX_WARN("PSO-BLEND task=%u ref=0x%x attachments=%u blend=%u src=%u/%u dst=%u/%u "
+                       "op=%u/%u mask=0x%x fmt=%u", task_id, reference, nca,
+                       task->pending_pipeline.blend.blending, task->pending_pipeline.blend.src_rgb,
+                       task->pending_pipeline.blend.src_alpha, task->pending_pipeline.blend.dst_rgb,
+                       task->pending_pipeline.blend.dst_alpha, task->pending_pipeline.blend.rgb_op,
+                       task->pending_pipeline.blend.alpha_op, task->pending_pipeline.blend.write_mask,
+                       task->pending_pipeline.blend.pixel_format);
+    }
 
     /* Look up resource registry entry for this reference. */
     lagfx_resource_entry_t *entry = NULL;

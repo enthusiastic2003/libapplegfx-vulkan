@@ -13,6 +13,8 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
+
+#include "protocol/pipeline_descriptor.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
@@ -238,6 +240,10 @@ typedef struct {
      * global initializer); bound to the translator's default sampler. */
     uint64_t   constexpr_sampler_bits;
     uint8_t    has_constexpr_sampler;
+    /* Colour attachment 0's blend state from the pipeline descriptor
+     * (protocol/pipeline_descriptor.h); has_blend 0 = not decoded. */
+    lagfx_pso_color_attachment_t blend;
+    uint8_t    has_blend;
     uint8_t    n_spv_bindings;
     /* Vertex stage-in attributes reflected from the translated VERTEX shader
      * (Location-decorated Inputs). The host builds a non-empty vertex-input

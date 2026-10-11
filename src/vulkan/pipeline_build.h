@@ -52,8 +52,14 @@ typedef struct {
     uint32_t         pso_attr_fmt[8];
     uint32_t         pso_attr_off[8];
     uint8_t          n_pso_attrs;
+    /* Colour attachment blend state from the guest pipeline (MTLBlendFactor /
+     * MTLBlendOperation / MTLColorWriteMask values). has_blend false = the
+     * legacy fixed premultiplied source-over. */
+    bool             has_blend;
+    bool             blending;
+    uint8_t          src_rgb, dst_rgb, rgb_op, src_alpha, dst_alpha, alpha_op, write_mask;
     /* Future fields (Stage 70b+):
-     *   cull_mode, front_face, blend factor, depth-stencil state... */
+     *   cull_mode, front_face, depth-stencil state... */
 } lagfx_pipeline_desc_t;
 
 /**

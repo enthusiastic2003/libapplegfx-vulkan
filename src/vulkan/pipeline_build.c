@@ -5,6 +5,43 @@
 
 #ifdef LAGFX_HAVE_VULKAN
 
+/* MTLBlendFactor -> VkBlendFactor */
+static VkBlendFactor blend_factor(uint8_t f) {
+    static const VkBlendFactor map[] = {
+        VK_BLEND_FACTOR_ZERO,                      /* 0  Zero */
+        VK_BLEND_FACTOR_ONE,                       /* 1  One */
+        VK_BLEND_FACTOR_SRC_COLOR,                 /* 2  SourceColor */
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,       /* 3  OneMinusSourceColor */
+        VK_BLEND_FACTOR_SRC_ALPHA,                 /* 4  SourceAlpha */
+        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,       /* 5  OneMinusSourceAlpha */
+        VK_BLEND_FACTOR_DST_COLOR,                 /* 6  DestinationColor */
+        VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,       /* 7  OneMinusDestinationColor */
+        VK_BLEND_FACTOR_DST_ALPHA,                 /* 8  DestinationAlpha */
+        VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,       /* 9  OneMinusDestinationAlpha */
+        VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,        /* 10 SourceAlphaSaturated */
+        VK_BLEND_FACTOR_CONSTANT_COLOR,            /* 11 BlendColor */
+        VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR,  /* 12 OneMinusBlendColor */
+        VK_BLEND_FACTOR_CONSTANT_ALPHA,            /* 13 BlendAlpha */
+        VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,  /* 14 OneMinusBlendAlpha */
+        VK_BLEND_FACTOR_SRC1_COLOR,                /* 15 Source1Color */
+        VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR,      /* 16 OneMinusSource1Color */
+        VK_BLEND_FACTOR_SRC1_ALPHA,                /* 17 Source1Alpha */
+        VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA,      /* 18 OneMinusSource1Alpha */
+    };
+    return f < sizeof map / sizeof map[0] ? map[f] : VK_BLEND_FACTOR_ONE;
+}
+
+/* MTLBlendOperation -> VkBlendOp */
+static VkBlendOp blend_op(uint8_t o) {
+    switch (o) {
+    case 1: return VK_BLEND_OP_SUBTRACT;
+    case 2: return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case 3: return VK_BLEND_OP_MIN;
+    case 4: return VK_BLEND_OP_MAX;
+    default: return VK_BLEND_OP_ADD;
+    }
+}
+
 lagfx_status_t lagfx_pipeline_build(VkDevice device,
                                     const lagfx_pipeline_desc_t *desc,
                                     VkPipeline *out_pipeline) {
@@ -184,6 +221,19 @@ lagfx_status_t lagfx_pipeline_build(VkDevice device,
                         | VK_COLOR_COMPONENT_B_BIT
                         | VK_COLOR_COMPONENT_A_BIT,
     };
+    if (desc->has_blend) {
+        blend_att.blendEnable         = desc->blending ? VK_TRUE : VK_FALSE;
+        blend_att.srcColorBlendFactor = blend_factor(desc->src_rgb);
+        blend_att.dstColorBlendFactor = blend_factor(desc->dst_rgb);
+        blend_att.colorBlendOp        = blend_op(desc->rgb_op);
+        blend_att.srcAlphaBlendFactor = blend_factor(desc->src_alpha);
+        blend_att.dstAlphaBlendFactor = blend_factor(desc->dst_alpha);
+        blend_att.alphaBlendOp        = blend_op(desc->alpha_op);
+        blend_att.colorWriteMask      = ((desc->write_mask & 8u) ? VK_COLOR_COMPONENT_R_BIT : 0u)
+                                      | ((desc->write_mask & 4u) ? VK_COLOR_COMPONENT_G_BIT : 0u)
+                                      | ((desc->write_mask & 2u) ? VK_COLOR_COMPONENT_B_BIT : 0u)
+                                      | ((desc->write_mask & 1u) ? VK_COLOR_COMPONENT_A_BIT : 0u);
+    }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = 1,

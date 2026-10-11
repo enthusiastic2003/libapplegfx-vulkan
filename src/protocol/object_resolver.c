@@ -12,6 +12,8 @@
  */
 
 #include "object_resolver.h"
+
+#include <string.h>
 #include "vertex_descriptor.h"
 #include "handlers/compute/task_translate.h"
 #include "device.h"
@@ -489,11 +491,10 @@ lagfx_lookup_pipeline_function_ref_list(lagfx_protocol_t *p,
 
 
 uint32_t
-lagfx_parse_pso_vertex_attrs(lagfx_protocol_t *p,
-                             const lagfx_task_entry_t *task,
-                             uint32_t pipeline_object_id,
-                             lagfx_pso_vtx_attr_t *out, uint32_t cap) {
-    if (!p || !task || !out || cap == 0u || task->heap_pfn == 0u) return 0u;
+lagfx_read_pso_blob(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                    uint32_t pipeline_object_id, uint8_t *blob, uint32_t cap,
+                    uint64_t *out_va) {
+    if (!p || !task || !blob || cap < 16u || task->heap_pfn == 0u) return 0u;
     uint64_t slot_va = slot_va_for(task->heap_pfn, pipeline_object_id);
     uint64_t slot_gpa = 0;
     if (!lagfx_task_translate(p, task, slot_va, &slot_gpa)) return 0u;
@@ -504,28 +505,43 @@ lagfx_parse_pso_vertex_attrs(lagfx_protocol_t *p,
                           slot_gpa, &slot_type, &bytes_va))
         return 0u;
     if (slot_type != LAGFX_APV_TYPE_PIPELINE) return 0u;
-    uint64_t bytes_gpa = 0;
-    if (!lagfx_task_translate(p, task, bytes_va, &bytes_gpa)) return 0u;
-    uint8_t blob[512] = {0};
-    if (!dev->desc.shell.read_memory(dev->desc.shell.opaque, bytes_gpa,
-                                     sizeof(blob), blob))
-        return 0u;
+    memset(blob, 0, cap);
+    /* header first for the length, then exactly the blob (it may straddle a
+     * page boundary; reading past it could hit an unmapped page) */
+    if (!lagfx_task_read_virtual(p, task, bytes_va, 16u, blob)) return 0u;
     uint32_t total = lagfx_le32(blob + 4);
-    uint32_t limit = (total >= 16u && total <= sizeof(blob)) ? total : (uint32_t)sizeof(blob);
+    if (total < 16u || total > cap) total = cap;
+    if (!lagfx_task_read_virtual(p, task, bytes_va, total, blob)) return 0u;
+    if (out_va) *out_va = bytes_va;
+    return total;
+}
+
+uint32_t
+lagfx_parse_pso_vertex_attrs(lagfx_protocol_t *p,
+                             const lagfx_task_entry_t *task,
+                             uint32_t pipeline_object_id,
+                             lagfx_pso_vtx_attr_t *out, uint32_t cap) {
+    if (!out || cap == 0u) return 0u;
+    uint8_t blob[512];
+    uint64_t bytes_va = 0;
+    uint32_t limit = lagfx_read_pso_blob(p, task, pipeline_object_id, blob, sizeof blob,
+                                         &bytes_va);
+    if (limit == 0u) return 0u;
 
     /* LAGFX_DUMP_PSO=1: hex-dump each pipeline's serialized descriptor once,
      * for working out the vertex-descriptor encoding. */
     if (getenv("LAGFX_DUMP_PSO")) {
-        static uint8_t dumped[256];
+        static uint64_t dumped[LAGFX_MAX_TASKS][256];
         uint32_t id = pipeline_object_id & 0xffu;
-        if (!dumped[id]) {
-            dumped[id] = 1u;
-            LAGFX_WARN("PSO-DUMP ref=0x%x len=%u", pipeline_object_id, limit);
+        if (task->id < LAGFX_MAX_TASKS && dumped[task->id][id] != bytes_va) {
+            dumped[task->id][id] = bytes_va;
+            LAGFX_WARN("PSO-DUMP task=%u ref=0x%x len=%u", task->id, pipeline_object_id, limit);
             for (uint32_t row = 0; row < limit; row += 32u) {
                 char hx[3 * 32 + 1]; size_t hn = 0;
                 for (uint32_t k = row; k < row + 32u && k < limit; k++)
                     hn += (size_t)snprintf(hx + hn, sizeof(hx) - hn, "%02x ", blob[k]);
-                LAGFX_WARN("PSO-DUMP ref=0x%x +%03x: %s", pipeline_object_id, row, hx);
+                LAGFX_WARN("PSO-DUMP task=%u ref=0x%x +%03x: %s", task->id, pipeline_object_id,
+                           row, hx);
             }
         }
     }
