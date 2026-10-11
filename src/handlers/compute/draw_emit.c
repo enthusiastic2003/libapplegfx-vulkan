@@ -149,20 +149,76 @@ static void lagfx_flag_pixel_texcoords(lagfx_task_entry_t *task, const uint8_t *
  * placement descriptor PFN<<12 + page-table translate — the M2 path) into a
  * host VkBuffer for vertex-input binding. Returns VK_NULL_HANDLE if there is no
  * real vertex data; the caller frees the returned buffer + *out_mem. */
+/* How the last upload picked its vertex source, for the stats in the wrapper. */
+static __thread const char *vtx_sel;
+
+/* The vertex_buffers[] slot the PSO's vertex descriptor says the stage-in
+ * attributes come from (MTLVertexAttributeDescriptor.bufferIndex), or -1 when
+ * the descriptor wasn't decoded, the attributes span several buffers, or that
+ * slot isn't bound. */
+static int pso_vertex_slot(const lagfx_task_entry_t *task) {
+    uint8_t na = task->pending_pipeline.n_vtx_attrs;
+    if (na == 0u || na > 8u) return -1;
+    uint8_t b = task->pending_pipeline.vtx_attr_buf[0];
+    for (uint8_t a = 1; a < na; a++)
+        if (task->pending_pipeline.vtx_attr_buf[a] != b) return -1;
+    if (b >= LAGFX_MAX_BINDING_SLOTS) return -1;
+    const lagfx_binding_slot_t *cs = &task->bindings.vertex_buffers[b];
+    if (!cs->valid || cs->ref == 0u) return -1;
+    return (int)b;
+}
+
+static VkBuffer upload_guest_vertex_buffer(lagfx_protocol_t *p,
+                                           lagfx_task_entry_t *task,
+                                           struct lagfx_vk_state *vk,
+                                           VkDeviceMemory *out_mem,
+                                           uint32_t *out_size);
+
 VkBuffer lagfx_upload_guest_vertex_buffer(lagfx_protocol_t *p,
                                                  lagfx_task_entry_t *task,
                                                  struct lagfx_vk_state *vk,
                                                  VkDeviceMemory *out_mem,
                                                  uint32_t *out_size) {
+    static unsigned long n_pso, n_slot1, n_scan, n_other, n_fail_unbound, n_fail;
+    vtx_sel = "other";
+    VkBuffer b = upload_guest_vertex_buffer(p, task, vk, out_mem, out_size);
+    if (b == VK_NULL_HANDLE) {
+        if (vtx_sel[0] == 'u') n_fail_unbound++;
+        else n_fail++;
+    } else if (vtx_sel[0] == 'p') n_pso++;
+    else if (vtx_sel[0] == 's' && vtx_sel[1] == 'l') n_slot1++;
+    else if (vtx_sel[0] == 's') n_scan++;
+    else n_other++;
+    unsigned long total = n_pso + n_slot1 + n_scan + n_other + n_fail_unbound + n_fail;
+    if (total % 500u == 0u)
+        LAGFX_WARN("vtx-source stats after %lu uploads: pso=%lu slot1=%lu scan=%lu "
+                   "other=%lu | failed: unbound=%lu other=%lu",
+                   total, n_pso, n_slot1, n_scan, n_other, n_fail_unbound, n_fail);
+    return b;
+}
+
+static VkBuffer upload_guest_vertex_buffer(lagfx_protocol_t *p,
+                                           lagfx_task_entry_t *task,
+                                           struct lagfx_vk_state *vk,
+                                           VkDeviceMemory *out_mem,
+                                           uint32_t *out_size) {
     *out_mem = VK_NULL_HANDLE;
     *out_size = LAGFX_DRAW_DS_BUF_SZ;
     /* Fresh per draw — cleared here so a draw that bails before computing the
      * bbox (BACKUPD/placement paths) can't leave a stale rect for the tile
      * compositor (KICKOFF-scanout-composite-reliability). */
     task->vtx_bbox_valid = 0u;
-    if (!task->bindings.vertex_buffers[0].valid
-        || task->bindings.vertex_buffers[0].ref == 0u)
-        return VK_NULL_HANDLE;
+    {
+        bool any_bound = false;
+        for (uint32_t s = 0; s < 8u && s < LAGFX_MAX_BINDING_SLOTS; s++)
+            if (task->bindings.vertex_buffers[s].valid
+                && task->bindings.vertex_buffers[s].ref != 0u)
+                any_bound = true;
+        if (!any_bound) {
+            vtx_sel = "unbound";
+            return VK_NULL_HANDLE;
+        }
+    }
     lagfx_binding_slot_t *vbs = &task->bindings.vertex_buffers[0];
     /* MULTI-STREAM interleave (GOAL-M2x): when the guest binds separate
      * per-attribute streams (SkyLight composites: pos f2/8B + tex f2/8B +
@@ -345,13 +401,33 @@ VkBuffer lagfx_upload_guest_vertex_buffer(lagfx_protocol_t *p,
          * contains other draws' embedded verts (573,87..) and wins — feeding
          * stretched caret-junk to the frame draws (the band artifact). For the
          * c4-led interleaved family, use slot 1 verbatim. */
-        if (task->pending_pipeline.n_vtx_inputs >= 2u
+        int pso_s = getenv("LAGFX_DISABLE_PSO_VTXSLOT") ? -1 : pso_vertex_slot(task);
+        if (pso_s >= 0) {
+            /* The descriptor names the slot; pick the read mode that returns
+             * data (placement read first, then VA-translated). */
+            lagfx_binding_slot_t *cs = &task->bindings.vertex_buffers[pso_s];
+            uint8_t sample[256];
+            const char *how = "none";
+            best_mode = 0;
+            for (int m = 0; m < 2; m++) {
+                uint32_t got = lagfx_read_vtx_source(p, task, cs->ref, cs->offset,
+                                                     sizeof(sample), sample, &how, m);
+                bool any = false;
+                for (uint32_t z = 0; z < got; z++)
+                    if (sample[z]) { any = true; break; }
+                if (any) { best_mode = m; break; }
+            }
+            best_s = (uint32_t)pso_s; best_score = 3000u; have_best = true;
+            vtx_sel = "pso";
+        } else if (task->pending_pipeline.n_vtx_inputs >= 2u
             && task->pending_pipeline.vtx_in_comp[0] == 4u
             && task->bindings.vertex_buffers[1].valid
             && task->bindings.vertex_buffers[1].ref != 0u
             && getenv("LAGFX_DISABLE_SLOT1AUTH") == NULL) {
             best_s = 1u; best_mode = 0; best_score = 2000u; have_best = true;
+            vtx_sel = "slot1";
         } else {
+        vtx_sel = "scan";
         /* Scan slots 0..7 (was 0..2): the per-vertex stream is bound at a slot
          * that varies per draw — live SetVertexBuffers binds ref 0x24 at slots
          * 1/2/3, and the ~20% of composites that fell back to the matrix had
@@ -585,6 +661,9 @@ VkBuffer lagfx_upload_guest_vertex_buffer(lagfx_protocol_t *p,
         }
         /* nothing plausible → fall through to legacy slot-0 behavior */
     }
+    vtx_sel = "other";
+    if (!vbs->valid || vbs->ref == 0u)
+        return VK_NULL_HANDLE;
     /* M2c BACKUPD (LAGFX_M2_BACKUPD): if a 0x3b backing update recorded a data
      * address for this ref, read the vertex bytes from THAT (task VA, page-aware)
      * instead of the placement-table PFN walk — the placement is stale for some

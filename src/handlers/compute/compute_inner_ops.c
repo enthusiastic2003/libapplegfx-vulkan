@@ -1542,6 +1542,7 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                         for (uint32_t ai = 0; ai < na; ai++) {
                             task->pending_pipeline.vtx_attr_fmt[ai] = pat[ai].fmt;
                             task->pending_pipeline.vtx_attr_off[ai] = pat[ai].off;
+                            task->pending_pipeline.vtx_attr_buf[ai] = (uint8_t)pat[ai].bufidx;
                         }
                         task->pending_pipeline.n_vtx_attrs = (uint8_t)na;
                         if (na && getenv("LAGFX_DUMP_SPV")) {

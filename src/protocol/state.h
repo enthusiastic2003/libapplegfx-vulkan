@@ -253,6 +253,9 @@ typedef struct {
      * PSO's MTLVertexDescriptor (sorted by offset). 0 attrs = not decoded. */
     uint32_t   vtx_attr_fmt[8];
     uint32_t   vtx_attr_off[8];
+    /* Metal buffer index (MTLVertexAttributeDescriptor.bufferIndex) each
+     * attribute is fetched from, i.e. the vertex_buffers[] slot holding it. */
+    uint8_t    vtx_attr_buf[8];
     uint8_t    n_vtx_attrs;
     /* B1 (M0): cached VkPipeline built from this pending_pipeline + the RT
      * formats it was built for. Reused across draws (was rebuilt + LEAKED every
