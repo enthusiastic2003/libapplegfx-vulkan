@@ -114,6 +114,16 @@ bool lagfx_vtx_multi_stream(lagfx_task_entry_t *task) {
         || task->pending_pipeline.vtx_in_comp[0] != 2u
         || task->pending_pipeline.vtx_in_comp[1] != 2u)
         return false;
+    /* With the vertex descriptor decoded it's authoritative: multi-stream only
+     * when the attributes really come from more than one buffer. (The 2+2+1
+     * CA pipelines are interleaved in buffer 0, stride 24.) */
+    uint8_t na = task->pending_pipeline.n_vtx_attrs;
+    if (na > 0u && getenv("LAGFX_DISABLE_PSO_VTXSLOT") == NULL) {
+        for (uint8_t a = 1; a < na && a < 8u; a++)
+            if (task->pending_pipeline.vtx_attr_buf[a] != task->pending_pipeline.vtx_attr_buf[0])
+                return true;
+        return false;
+    }
     /* lldb ground truth: this family ALWAYS binds pos stream at slot 0 and
      * tex stream at slot 1 (MVP at 2). Do NOT consult the AIR-claimed mask
      * here — the map's mvp index (fixture: [[buffer(1)]]) differs from the
@@ -234,6 +244,13 @@ static VkBuffer upload_guest_vertex_buffer(lagfx_protocol_t *p,
         uint32_t slots[8] = {0u, 1u};
         uint32_t sstart = 0;
         uint32_t nstreams = 2u;
+        if (task->pending_pipeline.n_vtx_attrs >= 2u) {
+            /* Decoded descriptor: each attribute's own buffer. */
+            nstreams = task->pending_pipeline.n_vtx_attrs > 8u ? 8u
+                                                               : task->pending_pipeline.n_vtx_attrs;
+            for (uint32_t a = 0; a < nstreams; a++)
+                slots[a] = task->pending_pipeline.vtx_attr_buf[a];
+        }
         uint32_t want = getenv("LAGFX_M2_BIGVERTS")
                             ? LAGFX_BIGVERTS_BUF_SZ : LAGFX_DRAW_DS_BUF_SZ;
         uint32_t nvi = task->pending_pipeline.n_vtx_inputs > 8u

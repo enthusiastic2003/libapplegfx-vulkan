@@ -1308,3 +1308,12 @@ if fs.is_file(meson.current_source_dir() / 'compute-inner-buffer-offset-unit.c')
   )
   test('PGCmdSetBufferOffset field order (unit)', buf_off_test)
 endif
+
+# Serialized MTLVertexDescriptor record decoder (synthetic blobs).
+vtxdesc_test = executable('vertex-descriptor-unit',
+  'vertex-descriptor-unit.c',
+  include_directories : [include_dir, internal_include_dir],
+  dependencies : [libapplegfx_vulkan_dep],
+  build_by_default : true,
+)
+test('vertex descriptor decode (unit)', vtxdesc_test)

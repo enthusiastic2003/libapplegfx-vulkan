@@ -1545,6 +1545,20 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                             task->pending_pipeline.vtx_attr_buf[ai] = (uint8_t)pat[ai].bufidx;
                         }
                         task->pending_pipeline.n_vtx_attrs = (uint8_t)na;
+                        if (getenv("LAGFX_DUMP_PSO")) {
+                            char fb[256]; size_t fn = 0;
+                            for (uint32_t v = 0; v < task->pending_pipeline.n_vtx_inputs
+                                 && fn + 16 < sizeof(fb); v++)
+                                fn += (size_t)snprintf(fb + fn, sizeof(fb) - fn, "L%u:c%u ",
+                                                       task->pending_pipeline.vtx_in_loc[v],
+                                                       task->pending_pipeline.vtx_in_comp[v]);
+                            fn += (size_t)snprintf(fb + fn, sizeof(fb) - fn, "| stride=%u |",
+                                                   task->pending_pipeline.vtx_stride);
+                            for (uint32_t ai = 0; ai < na && fn + 24 < sizeof(fb); ai++)
+                                fn += (size_t)snprintf(fb + fn, sizeof(fb) - fn, " f%u@%u/b%u",
+                                                       pat[ai].fmt, pat[ai].off, pat[ai].bufidx);
+                            LAGFX_WARN("PSO-ATTRS ref=0x%x inputs: %s", reference, fb);
+                        }
                         if (na && getenv("LAGFX_DUMP_SPV")) {
                             char fb[128]; size_t fn = 0;
                             for (uint32_t ai = 0; ai < na && fn + 16 < sizeof(fb); ai++)

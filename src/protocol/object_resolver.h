@@ -126,7 +126,8 @@ size_t lagfx_scan_descriptor_function_refs(const uint8_t *desc, uint32_t limit,
  * 02=offset, 03=bufferIndex; 0x04 = u32 type tag). Ground truth: caret/9patch
  * pipes carry fmt 31 (Float4) @0, 29 (Float2) @16, 9 (UChar4Normalized) @32 —
  * the rgba8 color our SFLOAT binding read as NaN (invisible fills).
- * Returns the number of attributes found (<= cap), sorted by offset. */
+ * Returns the number of attributes found (<= cap): sorted by attribute index
+ * when the record decoder (vertex_descriptor.h) succeeds, else by offset. */
 typedef struct { uint32_t fmt, off, bufidx; } lagfx_pso_vtx_attr_t;
 uint32_t lagfx_parse_pso_vertex_attrs(lagfx_protocol_t *p,
                                       const lagfx_task_entry_t *task,

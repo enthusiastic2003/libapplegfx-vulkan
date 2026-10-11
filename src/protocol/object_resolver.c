@@ -12,6 +12,7 @@
  */
 
 #include "object_resolver.h"
+#include "vertex_descriptor.h"
 #include "handlers/compute/task_translate.h"
 #include "device.h"
 #include "common/log.h"
@@ -512,6 +513,40 @@ lagfx_parse_pso_vertex_attrs(lagfx_protocol_t *p,
     uint32_t total = lagfx_le32(blob + 4);
     uint32_t limit = (total >= 16u && total <= sizeof(blob)) ? total : (uint32_t)sizeof(blob);
 
+    /* LAGFX_DUMP_PSO=1: hex-dump each pipeline's serialized descriptor once,
+     * for working out the vertex-descriptor encoding. */
+    if (getenv("LAGFX_DUMP_PSO")) {
+        static uint8_t dumped[256];
+        uint32_t id = pipeline_object_id & 0xffu;
+        if (!dumped[id]) {
+            dumped[id] = 1u;
+            LAGFX_WARN("PSO-DUMP ref=0x%x len=%u", pipeline_object_id, limit);
+            for (uint32_t row = 0; row < limit; row += 32u) {
+                char hx[3 * 32 + 1]; size_t hn = 0;
+                for (uint32_t k = row; k < row + 32u && k < limit; k++)
+                    hn += (size_t)snprintf(hx + hn, sizeof(hx) - hn, "%02x ", blob[k]);
+                LAGFX_WARN("PSO-DUMP ref=0x%x +%03x: %s", pipeline_object_id, row, hx);
+            }
+        }
+    }
+
+    /* Record-level decode first (handles omitted zero fields, e.g. attribute 0
+     * at offset 0 / buffer 0); the token scan below is the fallback. */
+    {
+        lagfx_vtxdesc_attr_t va[8];
+        uint32_t na = getenv("LAGFX_DISABLE_VTXDESC") ? 0u
+                      : lagfx_parse_vertex_descriptor(blob, limit, va, 8u, NULL, 0u, NULL);
+        if (na > 0u) {
+            uint32_t n = 0;
+            for (uint32_t a = 0; a < na && n < cap; a++, n++) {
+                out[n].fmt = va[a].fmt;
+                out[n].off = va[a].off;
+                out[n].bufidx = va[a].bufidx;
+            }
+            return n;
+        }
+    }
+
     /* Scan for `01 04 <fmt> 02 04 <off> 03 04 <bufidx>` (18 bytes). Accept
      * plausible fields only (fmt 1..64, off <= 240, bufidx <= 30); dedupe by
      * offset (a blob can serialize the descriptor twice). */
@@ -575,6 +610,17 @@ lagfx_parse_pso_vertex_stride(lagfx_protocol_t *p,
      * scan to it so we don't read trailing heap garbage. */
     uint32_t total = lagfx_le32(blob + 4);
     uint32_t limit = (total >= 16u && total <= sizeof(blob)) ? total : (uint32_t)sizeof(blob);
+
+    /* Record-level decode: the stride of the layout the attributes read from. */
+    {
+        lagfx_vtxdesc_attr_t va[8];
+        lagfx_vtxdesc_layout_t vl[8];
+        uint32_t nl = 0;
+        uint32_t na = getenv("LAGFX_DISABLE_VTXDESC") ? 0u
+                      : lagfx_parse_vertex_descriptor(blob, limit, va, 8u, vl, 8u, &nl);
+        for (uint32_t l = 0; na > 0u && l < nl; l++)
+            if (vl[l].index == va[0].bufidx) return vl[l].stride;
+    }
 
     /* Token stream: `04 <u32 value> <tag:u8>`. A MTLVertexBufferLayout stride is
      * `04 <stride> 02`. Since 0x04 also occurs as data, only count tokens whose
