@@ -13,5 +13,6 @@ lagfx_sources += files(
   # Legacy handlers moved to src/handlers/display/display.c for vchan opcodes (0x01-0x07)
   'test_api.c',     # Test API exports: dispatch_one, mmio_read/write
    'object_resolver.c',
-   'vertex_descriptor.c',  # serialized MTLVertexDescriptor decoder  # Phase B object ID resolver for metallib lookup
+   'vertex_descriptor.c',  # serialized MTLVertexDescriptor decoder
+   'texture_object.c',  # texture object (slot type 0x02/0x03/0x0c) decoder  # Phase B object ID resolver for metallib lookup
 )

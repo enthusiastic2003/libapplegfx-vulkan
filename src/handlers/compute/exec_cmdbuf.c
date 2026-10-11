@@ -26,6 +26,7 @@
  */
 
 #include "../handlers.h"
+#include "guest_texture.h"
 #include "info_replies.h"
 #include "render_inner_ops.h"
 #include "blit_inner_ops.h"
@@ -556,6 +557,14 @@ lagfx_handler_status_t lagfx_compute_exec_cmdbuf(lagfx_protocol_t *p, const lagf
                             res_start, resource_count);
     }
 
+#ifdef LAGFX_HAVE_VULKAN
+    /* Results become CPU-visible before the guest sees the stamp complete. */
+    {
+        lagfx_device_t *gdev = (lagfx_device_t *)p->dev;
+        if (task && task->n_written_tex && gdev && gdev->vk && gdev->vk->initialized)
+            lagfx_guest_texture_writeback(p, task, gdev->vk);
+    }
+#endif
     LAGFX_LOG("CmdExecIndirect2: completed taskID=%u (observation-only)",
               task_id);
 

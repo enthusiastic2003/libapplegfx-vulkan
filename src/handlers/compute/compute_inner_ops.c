@@ -38,6 +38,8 @@
  */
 
 #include "compute_inner_ops.h"
+#include "protocol/render_pass.h"
+#include "guest_texture.h"
 #include "compute_draw_internal.h"
 #include "display.h"  /* Full lagfx_display_t definition with rt field */
 #include "task_translate.h"
@@ -505,6 +507,81 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
     task->sc_have = 0u;
     task->vp_current = 0u;
 
+    /* Full 584-byte decode (src/protocol/render_pass.h layout). */
+    uint32_t rp_target = 0u;   /* colour target bound as a guest texture, if any */
+    uint32_t rp_target_vkfmt = 0u;
+    {
+        lagfx_render_pass_full_desc_t rp;
+        if (body_len >= LAGFX_RENDER_PASS_WIRE_SIZE
+            && lagfx_parse_render_pass_descriptor(body, body_len, &rp) == 0) {
+            LAGFX_LOG("0x1a RP task=%u len=%zu colors=%u size=%llux%llu layers=%llu depth=%s",
+                      task_id, body_len, rp.color_attachment_count,
+                      (unsigned long long)rp.render_target_width,
+                      (unsigned long long)rp.render_target_height,
+                      (unsigned long long)rp.render_target_array_length,
+                      rp.has_depth ? "yes" : "no");
+            for (uint32_t c = 0; c < rp.color_attachment_count; c++)
+                LAGFX_LOG("0x1a RP   color[%u] tex=0x%x resolve=0x%x load=%u store=%u clear=[%g %g %g %g]",
+                          c, rp.colors[c].texture_ref, rp.colors[c].resolve_texture_ref,
+                          rp.colors[c].load_action, rp.colors[c].store_action,
+                          rp.colors[c].clear_color[0], rp.colors[c].clear_color[1],
+                          rp.colors[c].clear_color[2], rp.colors[c].clear_color[3]);
+#ifdef LAGFX_HAVE_VULKAN
+            /* Colour attachment 0 is a guest texture: give it a host image of the
+             * guest's real size/format, run the load-action clear, and record a
+             * store for write-back. */
+            lagfx_device_t *gdev = (lagfx_device_t *)p->dev;
+            if (rp.color_attachment_count > 0u && gdev && gdev->vk && gdev->vk->initialized
+                && getenv("LAGFX_DISABLE_GUEST_RT") == NULL) {
+                lagfx_texture_object_t tobj;
+                lagfx_vk_iosurface_t *gios = lagfx_guest_texture_target(
+                    p, task, gdev->vk, rp.colors[0].texture_ref, &tobj);
+                if (gios) {
+                    rp_target = rp.colors[0].texture_ref;
+                    rp_target_vkfmt = (uint32_t)gios->format;
+                    if (rp.colors[0].load_action == 2u /* MTLLoadActionClear */
+                        && !lagfx_guest_texture_clear(gdev->vk, gios, rp.colors[0].clear_color))
+                        LAGFX_WARN("0x1a: clear of ref 0x%x failed", rp_target);
+                    if (rp.colors[0].store_action == 1u /* MTLStoreActionStore */)
+                        lagfx_guest_texture_mark_written(task, rp_target);
+                }
+            }
+#endif
+            /* LAGFX_DUMP_OBJ=1: hex-dump each colour target object's data once
+             * per (task, ref), to work out the texture object encoding. */
+            if (getenv("LAGFX_DUMP_OBJ")) {
+                static uint64_t dumped_va[LAGFX_MAX_TASKS][256];
+                for (uint32_t c = 0; c < rp.color_attachment_count; c++) {
+                    uint32_t ref = rp.colors[c].texture_ref;
+                    if (ref == 0u || ref > 0xffu) continue;
+                    uint8_t ot = 0; uint64_t ova = 0, ogpa = 0;
+                    if (!lagfx_resolve_object_data(p, task, ref, &ot, &ova, &ogpa) || ova == 0u) {
+                        LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x unresolved", task_id, ref);
+                        continue;
+                    }
+                    if (dumped_va[task_id][ref] == ova) continue;
+                    dumped_va[task_id][ref] = ova;
+                    uint8_t ob[192];
+                    if (!lagfx_task_read_virtual(p, task, ova, sizeof ob, ob)) {
+                        LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x type=0x%02x va=0x%llx unreadable",
+                                   task_id, ref, ot, (unsigned long long)ova);
+                        continue;
+                    }
+                    LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x type=0x%02x va=0x%llx",
+                               task_id, ref, ot, (unsigned long long)ova);
+                    for (uint32_t row = 0; row < sizeof ob; row += 32u) {
+                        char hx[3 * 32 + 1]; size_t hn = 0;
+                        for (uint32_t k = row; k < row + 32u; k++)
+                            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", ob[k]);
+                        LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x +%03x: %s", task_id, ref, row, hx);
+                    }
+                }
+            }
+        } else {
+            LAGFX_LOG("0x1a RP task=%u len=%zu (short — not decoded)", task_id, body_len);
+        }
+    }
+
     /* Parse payload fields using lagfx_le32 for alignment-safe reads. */
     uint32_t view_count = lagfx_le32(body + 0);           /* offset 0 — u32 */
     uint32_t color_fmt_raw = lagfx_le32(body + 4);        /* offset 4 — u32 Apple format code */
@@ -586,6 +663,12 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
                 break;
             }
         }
+    }
+
+    if (rp_target != 0u) {
+        task->render_pass_desc.target_ref = rp_target;
+        /* Pipelines for this pass must be built for the target's real format. */
+        task->render_pass_desc.color_format = rp_target_vkfmt;
     }
 
     /* OPEN: The remaining 536 B (584 - 48) contain attachment descriptor arrays.

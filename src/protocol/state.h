@@ -280,7 +280,13 @@ typedef struct {
     uint32_t heap_pfn;
     uint32_t heap_size;
     bool live;                  /* Slot is in use */
-    
+
+    /* Texture refs stored into by render passes in the command buffer being
+     * processed; copied back to guest memory when it completes
+     * (handlers/compute/guest_texture.c). */
+    uint32_t written_tex[16];
+    uint8_t  n_written_tex;
+
     /* Render pass description from PGCmdDescribeRenderPass (0x1a).
      * Per-task state: each task has its own render pass descriptor. */
     lagfx_render_pass_desc_t render_pass_desc;

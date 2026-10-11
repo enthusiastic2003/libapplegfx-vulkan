@@ -1,0 +1,280 @@
+/*
+ * libapplegfx-vulkan — guest textures as render targets
+ * src/handlers/compute/guest_texture.c
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ * See guest_texture.h.
+ */
+
+#include "guest_texture.h"
+
+#include "common/log.h"
+#include "device.h"
+#include "protocol/object_resolver.h"
+#include "protocol/resource_registry.h"
+#include "task_translate.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* Periodic warn-level summary, so cost is visible without info logging. */
+static struct {
+    unsigned long targets, created, clears, writebacks, skipped_storage;
+    unsigned long long wb_bytes;
+    double clear_ms, wb_ms;
+    unsigned long events;
+} stats;
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static void stats_tick(void) {
+    if (++stats.events % 500u) return;
+    LAGFX_WARN("guest_texture stats: targets=%lu created=%lu clears=%lu (%.0f ms) "
+               "writebacks=%lu (%llu KiB, %.0f ms) skipped(storage)=%lu",
+               stats.targets, stats.created, stats.clears, stats.clear_ms, stats.writebacks,
+               stats.wb_bytes / 1024u, stats.wb_ms, stats.skipped_storage);
+}
+
+void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref) {
+    if (!task || ref == 0u) return;
+    for (uint8_t i = 0; i < task->n_written_tex; i++)
+        if (task->written_tex[i] == ref) return;
+    if (task->n_written_tex < sizeof task->written_tex / sizeof task->written_tex[0])
+        task->written_tex[task->n_written_tex++] = ref;
+    else
+        LAGFX_WARN("guest_texture: written list full (task %u), dropping ref 0x%x",
+                   task->id, ref);
+}
+
+#ifdef LAGFX_HAVE_VULKAN
+#include "vulkan/command.h"
+#include "vulkan/instance.h"
+#include "vulkan/render_target.h"
+
+static bool read_texture_object(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                                uint32_t ref, lagfx_texture_object_t *obj) {
+    uint8_t type = 0;
+    uint64_t va = 0, gpa = 0;
+    if (!lagfx_resolve_object_data(p, task, ref, &type, &va, &gpa) || va == 0u) return false;
+    if (type != 0x02u && type != 0x03u && type != 0x0cu) return false;
+    uint8_t b[LAGFX_TEXTURE_OBJECT_MIN_LEN];
+    if (!lagfx_task_read_virtual(p, task, va, sizeof b, b)) return false;
+    return lagfx_parse_texture_object(b, sizeof b, obj);
+}
+
+lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
+                                                 lagfx_task_entry_t *task,
+                                                 struct lagfx_vk_state *vk,
+                                                 uint32_t ref,
+                                                 lagfx_texture_object_t *out_obj) {
+    lagfx_texture_object_t obj;
+    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj)) return NULL;
+    if (out_obj) *out_obj = obj;
+    stats.targets++;
+    stats_tick();
+    VkFormat fmt = lagfx_metal_pixel_format_to_vk(obj.pixel_format);
+
+    lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task->id);
+    if (e && e->type == LAGFX_RESOURCE_TYPE_TEXTURE && e->host_handle) {
+        lagfx_vk_iosurface_t *cur = (lagfx_vk_iosurface_t *)e->host_handle;
+        if (cur->width == obj.width && cur->height == obj.height && cur->format == fmt)
+            return cur;
+    }
+
+    lagfx_vk_iosurface_t *ios = NULL;
+    if (lagfx_vk_iosurface_create(vk, obj.width, obj.height, obj.pixel_format, &ios) != LAGFX_OK
+        || !ios)
+        return NULL;
+    if (!e || e->type != LAGFX_RESOURCE_TYPE_TEXTURE) {
+        lagfx_resource_register(&p->resources, ref, LAGFX_RESOURCE_TYPE_TEXTURE, task->id, 0u, 0u);
+        e = lagfx_resource_lookup(&p->resources, ref, task->id);
+        if (!e || e->type != LAGFX_RESOURCE_TYPE_TEXTURE) {
+            LAGFX_WARN("guest_texture: can't register ref 0x%x (task %u)", ref, task->id);
+            lagfx_vk_iosurface_destroy(vk, ios);
+            return NULL;
+        }
+    } else if (e->host_handle) {
+        /* Same ref, different size/format (the guest reused the object id, or
+         * an older path created it with guessed dimensions). The old image is
+         * deliberately not freed: cached descriptor sets may still reference
+         * it. TODO: release once descriptor/pipeline caches track images. */
+        LAGFX_LOG("guest_texture: replacing image for ref 0x%x (task %u)", ref, task->id);
+    }
+    stats.created++;
+    e->host_handle = ios;
+    e->image = ios->image;
+    e->view = ios->view;
+    e->size = (uint64_t)obj.bytes_per_row * obj.height;
+    LAGFX_LOG("guest_texture: task %u ref 0x%x -> %ux%u fmt %u storage %u bpr %u",
+              task->id, ref, obj.width, obj.height, obj.pixel_format, obj.storage,
+              obj.bytes_per_row);
+    return ios;
+}
+
+/* Record + submit a one-shot command buffer and wait for it. */
+static bool submit_wait(struct lagfx_vk_state *vk, VkCommandBuffer cb) {
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    if (vkCreateFence(vk->device, &fci, NULL, &fence) != VK_SUCCESS) return false;
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cb,
+    };
+    bool ok = vkQueueSubmit(vk->graphics_queue, 1, &si, fence) == VK_SUCCESS
+              && vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 2000000000ull) == VK_SUCCESS;
+    vkDestroyFence(vk->device, fence, NULL);
+    return ok;
+}
+
+bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                               const double rgba[4]) {
+    if (!vk || !ios || ios->image == VK_NULL_HANDLE) return false;
+    double t0 = now_ms();
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (lagfx_vk_cmdbuf_alloc(vk, &cb) != LAGFX_OK) return false;
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cb, &bi);
+    VkImageSubresourceRange range = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1,
+    };
+    VkImageMemoryBarrier to_dst = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        /* A clear overwrites everything, so prior contents may be discarded. */
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = ios->image,
+        .subresourceRange = range,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_dst);
+    VkClearColorValue cv = { .float32 = { (float)rgba[0], (float)rgba[1],
+                                          (float)rgba[2], (float)rgba[3] } };
+    vkCmdClearColorImage(cb, ios->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &range);
+    VkImageMemoryBarrier to_read = to_dst;
+    to_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 0, NULL, 0, NULL, 1, &to_read);
+    vkEndCommandBuffer(cb);
+    bool ok = submit_wait(vk, cb);
+    lagfx_vk_cmdbuf_free(vk, cb);
+    if (ok) ios->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    stats.clears++;
+    stats.clear_ms += now_ms() - t0;
+    return ok;
+}
+
+static uint32_t bytes_per_pixel(uint32_t metal_format) {
+    switch (metal_format) {
+    case 70: case 71: case 80: case 81: return 4u;   /* RGBA8 / BGRA8 (+sRGB) */
+    default: return 0u;                               /* readback helper is 4-byte only */
+    }
+}
+
+/* Write `len` bytes at texture-memory offset `off` through the placement
+ * entries, page by page via the task's VA translation. Never writes to an
+ * address that doesn't translate. */
+static bool write_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                                 const lagfx_texture_object_t *obj, uint64_t off,
+                                 const uint8_t *src, uint64_t len) {
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    if (!dev->desc.shell.write_memory) return false;
+    uint64_t base = 0;
+    for (uint32_t e = 0; e < obj->n_place && len > 0u; e++) {
+        uint64_t esize = obj->place[e].size;
+        if (off >= base + esize) { base += esize; continue; }
+        uint64_t va = (obj->place[e].page << 12) + (off - base);
+        uint64_t n = base + esize - off;
+        if (n > len) n = len;
+        while (n > 0u) {
+            uint64_t page_left = 0x1000u - (va & 0xfffu);
+            uint64_t chunk = n < page_left ? n : page_left;
+            uint64_t gpa = 0;
+            if (!lagfx_task_translate(p, task, va, &gpa)) return false;
+            if (!dev->desc.shell.write_memory(dev->desc.shell.opaque, gpa, chunk, src))
+                return false;
+            va += chunk; src += chunk; off += chunk; len -= chunk; n -= chunk;
+        }
+        base += esize;
+    }
+    return len == 0u;
+}
+
+static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                          struct lagfx_vk_state *vk, uint32_t ref) {
+    lagfx_texture_object_t obj;
+    if (!read_texture_object(p, task, ref, &obj)) return;
+    /* Managed only for now: Metal makes those CPU-visible at an explicit
+     * synchronize, which is when the guest reads them. Shared storage
+     * (IOSurfaces) would need a full copy after every command buffer — far too
+     * slow this way; it needs host-mapped guest memory instead. */
+    if (obj.storage != LAGFX_STORAGE_MANAGED) {
+        stats.skipped_storage++;
+        return;
+    }
+    double t0 = now_ms();
+    uint32_t bpp = bytes_per_pixel(obj.pixel_format);
+    if (bpp == 0u) {
+        LAGFX_WARN("guest_texture: write-back of format %u not supported (ref 0x%x)",
+                   obj.pixel_format, ref);
+        return;
+    }
+    lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task->id);
+    lagfx_vk_iosurface_t *ios = e ? (lagfx_vk_iosurface_t *)e->host_handle : NULL;
+    if (!ios || ios->width != obj.width || ios->height != obj.height) return;
+
+    lagfx_vk_render_target_t rt;
+    if (lagfx_vk_render_target_wrap(ios->image, ios->view, ios->memory, ios->width,
+                                    ios->height, ios->format, &rt) != LAGFX_OK)
+        return;
+    rt.layout = ios->layout;
+    size_t tight = (size_t)obj.width * bpp, stride = 0;
+    uint8_t *px = malloc(tight * obj.height);
+    if (!px) return;
+    if (lagfx_vk_render_target_readback(vk, &rt, px, tight * obj.height, &stride) != LAGFX_OK) {
+        free(px);
+        return;
+    }
+    ios->layout = rt.layout;
+    if (stride == 0u) stride = tight;
+    bool ok = true;
+    for (uint32_t y = 0; y < obj.height && ok; y++)
+        ok = write_texture_memory(p, task, &obj, (uint64_t)y * obj.bytes_per_row,
+                                  px + (size_t)y * stride, tight);
+    free(px);
+    stats.writebacks++;
+    stats.wb_bytes += (unsigned long long)tight * obj.height;
+    stats.wb_ms += now_ms() - t0;
+    stats_tick();
+    if (ok)
+        LAGFX_LOG("guest_texture: wrote back task %u ref 0x%x (%ux%u)", task->id, ref,
+                  obj.width, obj.height);
+    else
+        LAGFX_WARN("guest_texture: write-back of ref 0x%x (task %u) failed to reach guest memory",
+                   ref, task->id);
+}
+
+void lagfx_guest_texture_writeback(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                   struct lagfx_vk_state *vk) {
+    if (!p || !task || !vk) return;
+    for (uint8_t i = 0; i < task->n_written_tex; i++)
+        writeback_one(p, task, vk, task->written_tex[i]);
+    task->n_written_tex = 0;
+}
+#endif /* LAGFX_HAVE_VULKAN */

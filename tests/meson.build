@@ -1317,3 +1317,12 @@ vtxdesc_test = executable('vertex-descriptor-unit',
   build_by_default : true,
 )
 test('vertex descriptor decode (unit)', vtxdesc_test)
+
+# Texture object decoder (synthetic objects).
+texobj_test = executable('texture-object-unit',
+  'texture-object-unit.c',
+  include_directories : [include_dir, internal_include_dir],
+  dependencies : [libapplegfx_vulkan_dep],
+  build_by_default : true,
+)
+test('texture object decode (unit)', texobj_test)

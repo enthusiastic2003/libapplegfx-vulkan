@@ -21,6 +21,7 @@ lagfx_sources += files(
   'compute/compute_inner_ops.c',  # encType=0/1 inner-opcode dispatch (Stage 30 Task 6 prep)
   'compute/draw_resources.c',     # draw-path guest-memory reads + content scoring
   'compute/draw_descriptors.c',   # descriptor-set construction for translated draws
+  'compute/guest_texture.c',      # guest textures as render targets, write-back
   'compute/draw_emit.c',          # pipeline cache, vertex upload, draw emission
 
   # IOSurface outer-FIFO handlers (opcodes 0x26-0x2a)

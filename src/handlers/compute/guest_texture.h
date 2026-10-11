@@ -1,0 +1,49 @@
+/*
+ * libapplegfx-vulkan — guest textures as render targets
+ * src/handlers/compute/guest_texture.h
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ * Ties a guest texture object (decoded with protocol/texture_object.h) to a
+ * host VkImage registered under (ref, task) in the resource registry, runs a
+ * render pass's load-action clear on it, and copies CPU-visible textures
+ * (shared/managed storage) back into their guest memory once the command
+ * buffer that wrote them has been processed.
+ */
+#ifndef LIBAPPLEGFX_HANDLERS_COMPUTE_GUEST_TEXTURE_H
+#define LIBAPPLEGFX_HANDLERS_COMPUTE_GUEST_TEXTURE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "protocol/state.h"
+#include "protocol/texture_object.h"
+
+#ifdef LAGFX_HAVE_VULKAN
+#include "vulkan/iosurface.h"
+
+struct lagfx_vk_state;
+
+/* Find or create the host image for texture object `ref` of `task`, sized and
+ * formatted from the guest's descriptor. Returns NULL if `ref` isn't a texture
+ * object we can decode. *out_obj receives the decoded object. */
+lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
+                                                 lagfx_task_entry_t *task,
+                                                 struct lagfx_vk_state *vk,
+                                                 uint32_t ref,
+                                                 lagfx_texture_object_t *out_obj);
+
+/* Clear the whole image to rgba (one-shot submit, waits). */
+bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                               const double rgba[4]);
+
+/* Copy every texture marked written in this task back to guest memory
+ * (CPU-visible storage modes only) and clear the marks. */
+void lagfx_guest_texture_writeback(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                   struct lagfx_vk_state *vk);
+#endif
+
+/* Remember that a pass stored into texture `ref` of `task`. */
+void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref);
+
+#endif /* LIBAPPLEGFX_HANDLERS_COMPUTE_GUEST_TEXTURE_H */

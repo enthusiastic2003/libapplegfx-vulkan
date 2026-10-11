@@ -96,6 +96,11 @@ lagfx_status_t lagfx_pipeline_build(VkDevice device,
          * MTLVertexDescriptor knows the buffer layout. */
         if (desc->vtx_stride >= off && desc->vtx_stride <= 256u)
             stride = desc->vtx_stride;
+        /* With the attribute formats decoded, the reflected sum (`off`) is not
+         * a lower bound — packed formats (uchar4 = 4 bytes for a float4 input)
+         * make the real stride smaller than the shader's view. */
+        if (use_pso_attrs && desc->vtx_stride > 0u && desc->vtx_stride <= 2048u)
+            stride = desc->vtx_stride;
         const char *vs = getenv("LAGFX_VTX_STRIDE");
         if (vs) { unsigned long s = strtoul(vs, NULL, 0); if (s >= off && s <= 256u) stride = (uint32_t)s; }
         vbind = (VkVertexInputBindingDescription){

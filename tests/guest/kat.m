@@ -210,6 +210,34 @@ static BOOL case_triangle_vbuf(void) {
                    ^BOOL(int x, int y) { return on_tri_edge(x, y); });
 }
 
+// Not a pass/fail case: clears textures with distinct, known properties so
+// the host-side object dump (LAGFX_DUMP_OBJ=1) can be matched to fields.
+static BOOL case_probe(void) {
+    struct { NSUInteger w, h; MTLPixelFormat fmt; MTLStorageMode sm; MTLTextureUsage use; } t[] = {
+        {48, 32, MTLPixelFormatRGBA8Unorm, MTLStorageModePrivate, MTLTextureUsageRenderTarget},
+        {100, 20, MTLPixelFormatRGBA16Float, MTLStorageModeManaged,
+         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite},
+        {256, 7, MTLPixelFormatBGRA8Unorm, MTLStorageModePrivate,
+         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead},
+    };
+    for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:t[i].fmt width:t[i].w height:t[i].h mipmapped:NO];
+        td.storageMode = t[i].sm;
+        td.usage = t[i].use;
+        id<MTLTexture> tex = [gDevice newTextureWithDescriptor:td];
+        id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+        [[cb renderCommandEncoderWithDescriptor:clear_pass(tex, MTLClearColorMake(0.25, 0.5, 0.75, 1))]
+            endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        printf("  probe %zu: %lux%lu fmt=%lu storage=%lu usage=%lu\n", i, (unsigned long)t[i].w,
+               (unsigned long)t[i].h, (unsigned long)t[i].fmt, (unsigned long)t[i].sm,
+               (unsigned long)t[i].use);
+    }
+    return YES;
+}
+
 // ------------------------------------------------------------------- main
 
 int main(int argc, const char *argv[]) {
@@ -223,10 +251,12 @@ int main(int argc, const char *argv[]) {
             {"clear", case_clear},
             {"triangle", case_triangle},
             {"triangle-vbuf", case_triangle_vbuf},
+            {"probe", case_probe},
         };
         int failed = 0, ran = 0;
         for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
-            if (argc > 1 && strcmp(argv[1], cases[i].name) != 0) continue;
+            if (argc > 1 ? strcmp(argv[1], cases[i].name) != 0
+                         : strcmp(cases[i].name, "probe") == 0) continue;
             printf("[%s]\n", cases[i].name);
             BOOL ok = cases[i].fn();
             printf("  %s\n", ok ? "PASS" : "FAIL");

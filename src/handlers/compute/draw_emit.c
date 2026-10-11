@@ -402,7 +402,9 @@ static VkBuffer upload_guest_vertex_buffer(lagfx_protocol_t *p,
         for (uint32_t a = 0; a < task->pending_pipeline.n_vtx_inputs && a < 8u; a++)
             pstride += (uint32_t)task->pending_pipeline.vtx_in_comp[a] * 4u;
         pstride = (pstride + 7u) & ~7u;
-        if (task->pending_pipeline.vtx_stride >= pstride
+        if ((task->pending_pipeline.vtx_stride >= pstride
+             || task->pending_pipeline.n_vtx_attrs > 0u)
+            && task->pending_pipeline.vtx_stride > 0u
             && task->pending_pipeline.vtx_stride <= 256u)
             pstride = task->pending_pipeline.vtx_stride;
         if (pstride == 0u) pstride = 48u;
@@ -545,7 +547,9 @@ static VkBuffer upload_guest_vertex_buffer(lagfx_protocol_t *p,
                     for (uint32_t a = 0; a < task->pending_pipeline.n_vtx_inputs && a < 8u; a++)
                         vs += (uint32_t)task->pending_pipeline.vtx_in_comp[a] * 4u;
                     vs = (vs + 7u) & ~7u;
-                    if (task->pending_pipeline.vtx_stride >= vs
+                    if ((task->pending_pipeline.vtx_stride >= vs
+                         || task->pending_pipeline.n_vtx_attrs > 0u)
+                        && task->pending_pipeline.vtx_stride > 0u
                         && task->pending_pipeline.vtx_stride <= 256u)
                         vs = task->pending_pipeline.vtx_stride;
                     if (vs == 0u) vs = 48u;
@@ -972,7 +976,10 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     bool perpass_real_draw = false;  /* set only when a TRANSLATED draw lands in it */
     if (LAGFX_POLICY("M2_PERPASS") && task->render_pass_desc.target_ref != 0u) {
         uint32_t tref = task->render_pass_desc.target_ref;
-        lagfx_resource_entry_t *te = lagfx_resource_lookup_texture(&p->resources, tref);
+        /* Object ids are per task: prefer this task's entry for the ref. */
+        lagfx_resource_entry_t *te = lagfx_resource_lookup(&p->resources, tref, task->id);
+        if (!te || te->type != LAGFX_RESOURCE_TYPE_TEXTURE)
+            te = lagfx_resource_lookup_texture(&p->resources, tref);
         lagfx_vk_iosurface_t *ios = te ? (lagfx_vk_iosurface_t *)te->host_handle : NULL;
         /* M2q GROUND-TRUTH PROBE (LAGFX_M2_PPPROBE, log-only): does the pass
          * target ref's guest BACKING hold real content (the forest), or is it
@@ -1088,6 +1095,9 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
             && lagfx_vk_render_target_wrap(ios->image, ios->view, ios->memory,
                                            ios->width, ios->height, ios->format,
                                            &perpass_rt) == LAGFX_OK) {
+            /* Start from the image's real layout (wrap reports UNDEFINED, which
+             * would let the driver discard a clear or earlier draws). */
+            if (ios->layout != VK_IMAGE_LAYOUT_UNDEFINED) perpass_rt.layout = ios->layout;
             active_rt = &perpass_rt;
             ios->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; /* sampleable after render */
             perpass_ios = ios;      /* M2a: candidate for the scanout-assembly blit */
@@ -1144,7 +1154,11 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
          * known, so the vertex-count cap below (vc = BUF_SZ/stride) matches how
          * pipeline_build reads the buffer. The tight-packed sum under-counts the
          * stride (48→24) → an over-large vc that reads past valid vertices. */
-        if (task->pending_pipeline.vtx_stride >= vstride
+        /* Decoded descriptor stride wins even when smaller than the reflected
+         * sum (packed attribute formats). */
+        if ((task->pending_pipeline.vtx_stride >= vstride
+             || task->pending_pipeline.n_vtx_attrs > 0u)
+            && task->pending_pipeline.vtx_stride > 0u
             && task->pending_pipeline.vtx_stride <= 256u)
             vstride = task->pending_pipeline.vtx_stride;
         if (vstride == 0u) vstride = 16u;
@@ -1327,6 +1341,23 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
         /* vtx-input pipeline but no real vertex data → skip (no unbound fault). */
         LAGFX_LOG("%s VTX: ref=0x%x no real vertex data — skip (no crash)",
                   op, task->pending_pipeline.reference);
+    } else if (task->pending_pipeline.translated
+               && getenv("LAGFX_DISABLE_RESOURCE_FREE_DRAW") == NULL) {
+        /* Translated pipeline with no resources and no stage-in: positions
+         * come from vertex_id (e.g. full-screen triangles). Draw it as is. */
+        st = lagfx_vk_draw_record_and_submit(dev_with_vk->vk, pipeline, active_rt, false,
+                                             vc, 1, 0, 0, 0);
+        if (st == LAGFX_OK) {
+            LAGFX_LOG("%s: drew TRANSLATED resource-free pipeline ref=0x%x verts=%u",
+                      op, task->pending_pipeline.reference, vc);
+            if (active_rt == &perpass_rt) {
+                perpass_real_draw = true;
+                if (perpass_ios) perpass_ios->gpu_drawn = 1u;
+            }
+            if (getenv("LAGFX_FRAME_ON_SWAP") == NULL) lagfx_display_signal_frame_ready(display);
+        } else {
+            LAGFX_WARN("%s: resource-free draw failed (%d)", op, (int)st);
+        }
     } else if ((getenv("LAGFX_SUBSTITUTE") != NULL)
                && !(LAGFX_POLICY("M2_ASMBLIT") && active_rt == &perpass_rt)) {
         /* Substitute / resource-free path: bundled 3-vertex triangle.
