@@ -457,6 +457,36 @@ static uint32_t apple_format_to_vk(uint32_t fmt) {
 #endif
 }
 
+/* LAGFX_DUMP_OBJ=1: hex-dump an object's data once per (task, ref, address),
+ * to work out object encodings against objects created with known properties
+ * (tests/guest/kat.m probe cases). */
+static void dump_object(lagfx_protocol_t *p, const lagfx_task_entry_t *task, uint32_t ref,
+                        const char *what) {
+    static uint64_t dumped_va[LAGFX_MAX_TASKS][256];
+    if (ref == 0u || ref > 0xffu || task->id >= LAGFX_MAX_TASKS) return;
+    uint8_t ot = 0; uint64_t ova = 0, ogpa = 0;
+    if (!lagfx_resolve_object_data(p, task, ref, &ot, &ova, &ogpa) || ova == 0u) {
+        LAGFX_WARN("OBJ-DUMP %s task=%u ref=0x%x unresolved", what, task->id, ref);
+        return;
+    }
+    if (dumped_va[task->id][ref] == ova) return;
+    dumped_va[task->id][ref] = ova;
+    uint8_t ob[192];
+    if (!lagfx_task_read_virtual(p, task, ova, sizeof ob, ob)) {
+        LAGFX_WARN("OBJ-DUMP %s task=%u ref=0x%x type=0x%02x va=0x%llx unreadable",
+                   what, task->id, ref, ot, (unsigned long long)ova);
+        return;
+    }
+    LAGFX_WARN("OBJ-DUMP %s task=%u ref=0x%x type=0x%02x va=0x%llx",
+               what, task->id, ref, ot, (unsigned long long)ova);
+    for (uint32_t row = 0; row < sizeof ob; row += 32u) {
+        char hx[3 * 32 + 1]; size_t hn = 0;
+        for (uint32_t k = row; k < row + 32u; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", ob[k]);
+        LAGFX_WARN("OBJ-DUMP %s task=%u ref=0x%x +%03x: %s", what, task->id, ref, row, hx);
+    }
+}
+
 static int op_render_describe_render_pass(lagfx_protocol_t *p,
                                              uint32_t          encoder_type,
                                              uint32_t          task_id,
@@ -549,34 +579,9 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
 #endif
             /* LAGFX_DUMP_OBJ=1: hex-dump each colour target object's data once
              * per (task, ref), to work out the texture object encoding. */
-            if (getenv("LAGFX_DUMP_OBJ")) {
-                static uint64_t dumped_va[LAGFX_MAX_TASKS][256];
-                for (uint32_t c = 0; c < rp.color_attachment_count; c++) {
-                    uint32_t ref = rp.colors[c].texture_ref;
-                    if (ref == 0u || ref > 0xffu) continue;
-                    uint8_t ot = 0; uint64_t ova = 0, ogpa = 0;
-                    if (!lagfx_resolve_object_data(p, task, ref, &ot, &ova, &ogpa) || ova == 0u) {
-                        LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x unresolved", task_id, ref);
-                        continue;
-                    }
-                    if (dumped_va[task_id][ref] == ova) continue;
-                    dumped_va[task_id][ref] = ova;
-                    uint8_t ob[192];
-                    if (!lagfx_task_read_virtual(p, task, ova, sizeof ob, ob)) {
-                        LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x type=0x%02x va=0x%llx unreadable",
-                                   task_id, ref, ot, (unsigned long long)ova);
-                        continue;
-                    }
-                    LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x type=0x%02x va=0x%llx",
-                               task_id, ref, ot, (unsigned long long)ova);
-                    for (uint32_t row = 0; row < sizeof ob; row += 32u) {
-                        char hx[3 * 32 + 1]; size_t hn = 0;
-                        for (uint32_t k = row; k < row + 32u; k++)
-                            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", ob[k]);
-                        LAGFX_WARN("OBJ-DUMP task=%u ref=0x%x +%03x: %s", task_id, ref, row, hx);
-                    }
-                }
-            }
+            if (getenv("LAGFX_DUMP_OBJ"))
+                for (uint32_t c = 0; c < rp.color_attachment_count; c++)
+                    dump_object(p, task, rp.colors[c].texture_ref, "target");
         } else {
             LAGFX_LOG("0x1a RP task=%u len=%zu (short — not decoded)", task_id, body_len);
         }
@@ -617,10 +622,10 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
               (color_fmt_raw == 80u) ? "BGRA8" :
               (color_fmt_raw == 70u) ? "RGBA8" :
               (color_fmt_raw == 252u) ? "D32Float" :
-              (color_fmt_raw == 25u) ? "D16Unorm" : "UNKNOWN",
+              (color_fmt_raw == 250u) ? "D16Unorm" : "UNKNOWN",
               (unsigned)depth_fmt_raw,
               (depth_fmt_raw == 252u) ? "D32Float" :
-              (depth_fmt_raw == 25u) ? "D16Unorm" :
+              (depth_fmt_raw == 250u) ? "D16Unorm" :
               (depth_fmt_raw == 0u) ? "none" : "UNKNOWN",
               clear_color[0], clear_color[1], clear_color[2], clear_color[3],
               clear_depth,
@@ -912,12 +917,11 @@ static int op_set_fragment_buffer_offset(lagfx_protocol_t *p,
     return 0;
 }
 
-static int op_set_fragment_sampler_states(lagfx_protocol_t *p,
-                                            uint32_t          encoder_type,
-                                            uint32_t          task_id,
-                                            const uint8_t    *body,
-                                            size_t            body_len) {
-    (void)p; (void)encoder_type; (void)task_id;
+/* SetFragmentSamplerStates (0x70, entries: u32 ref) and its LODClamp variant
+ * (0x71, entries: u32 ref + 8 bytes of LOD clamp). */
+static int set_fragment_sampler_states(lagfx_protocol_t *p, uint32_t task_id,
+                                       const uint8_t *body, size_t body_len,
+                                       size_t entry_bytes) {
     /* RE: render-decoder-handlers.md line 109 — PGCmdSetSamplerStates (8 B head) + N×u32 ref, array */
     if (body_len < 8u) {
         LAGFX_WARN("compute_inner: 0x70 SetFragmentSamplerStates payload too small (%zu < 8)", body_len);
@@ -925,7 +929,6 @@ static int op_set_fragment_sampler_states(lagfx_protocol_t *p,
     }
     uint32_t first_index = lagfx_le32(body + 0);
     uint32_t count = lagfx_le32(body + 4);
-    size_t entry_bytes = 4u;
     size_t needed = 8u + (size_t)count * entry_bytes;
     if (body_len < needed) {
         LAGFX_WARN("compute_inner: 0x70 SetFragmentSamplerStates count=%u needs %zu bytes, got %zu",
@@ -939,8 +942,40 @@ static int op_set_fragment_sampler_states(lagfx_protocol_t *p,
         LAGFX_LOG("compute_inner: 0x70 SetFragmentSamplerStates [%u] ref=0x%x",
                   first_index + i, ref);
     }
-    /* TODO: Stage 70 — translate to vkCmdBindDescriptorSets (sampler descriptors). */
+    if (task_id >= LAGFX_MAX_TASKS || !p->tasks[task_id].live) return 1;
+    lagfx_task_entry_t *task = &p->tasks[task_id];
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t slot = first_index + i, ref = lagfx_le32(body + 8 + (size_t)i * entry_bytes);
+        if (slot >= LAGFX_MAX_BINDING_SLOTS) continue;
+        task->bindings.fragment_samplers[slot].ref = ref;
+        task->bindings.fragment_samplers[slot].offset = 0u;
+        task->bindings.fragment_samplers[slot].valid = (ref != 0u);
+        if (getenv("LAGFX_DUMP_OBJ")) {
+            uint8_t ot = 0; uint64_t ova = 0, ogpa = 0; uint8_t rec[0x24] = {0};
+            bool ok = lagfx_resolve_object_data(p, task, ref, &ot, &ova, &ogpa) && ova
+                      && lagfx_task_read_virtual(p, task, ova, sizeof rec, rec);
+            char hx[3 * sizeof rec + 1]; size_t hn = 0;
+            for (size_t k = 0; ok && k < sizeof rec; k++)
+                hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", rec[k]);
+            LAGFX_WARN("OBJ-DUMP sampler bind task=%u slot=%u ref=0x%x entry=%zuB: %s",
+                       task_id, slot, ref, entry_bytes, ok ? hx : "(unreadable)");
+        }
+    }
     return 0;
+}
+
+static int op_set_fragment_sampler_states(lagfx_protocol_t *p, uint32_t encoder_type,
+                                          uint32_t task_id, const uint8_t *body,
+                                          size_t body_len) {
+    (void)encoder_type;
+    return set_fragment_sampler_states(p, task_id, body, body_len, 4u);
+}
+
+static int op_set_fragment_sampler_states_lod_clamp(lagfx_protocol_t *p, uint32_t encoder_type,
+                                                    uint32_t task_id, const uint8_t *body,
+                                                    size_t body_len) {
+    (void)encoder_type;
+    return set_fragment_sampler_states(p, task_id, body, body_len, 12u);
 }
 
 static int op_set_fragment_textures(lagfx_protocol_t *p,
@@ -997,6 +1032,7 @@ static int op_set_fragment_textures(lagfx_protocol_t *p,
         task->bindings.fragment_textures[slot_index].ref = ref;
         task->bindings.fragment_textures[slot_index].offset = 0u;
         task->bindings.fragment_textures[slot_index].valid = (ref != 0u);
+        if (getenv("LAGFX_DUMP_OBJ")) dump_object(p, task, ref, "texture");
 
         if (i < 4u) { /* Log first 4 entries */
             LAGFX_LOG("compute_inner: 0x72 SetFragmentTextures [%u] ref=0x%x valid=%s",
@@ -1306,6 +1342,7 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
              * same arg order the translator assigns sequential bindings. */
             lagfx_air_arg_binding_t stage_ab[2][16];
             size_t stage_nab[2] = { 0, 0 };
+            task->pending_pipeline.has_constexpr_sampler = 0;
 
             /* Inline helper: read metallib at vert/frag ref → extract
              * AIR for that stage → translate → vkCreateShaderModule.
@@ -1418,6 +1455,17 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                 /* Capture the stage's Metal resource indexes (air.location_index
                  * per resource arg, in binding order) before the module goes. */
                 stage_nab[stage] = lagfx_air_arg_bindings(m, stage_ab[stage], 16);
+                {
+                    lagfx_air_constexpr_sampler_t cs[4];
+                    size_t ncs = lagfx_air_constexpr_samplers(m, cs, 4);
+                    if (stage == 1 && ncs > 0u) {
+                        task->pending_pipeline.constexpr_sampler_bits = cs[0].bits;
+                        task->pending_pipeline.has_constexpr_sampler = 1;
+                        if (ncs > 1u)
+                            LAGFX_WARN("op_0x74: ref=0x%x has %zu constexpr samplers; "
+                                       "all use the first", reference, ncs);
+                    }
+                }
                 lagfx_air_module_free(m);
                 if (xl_st != LAGFX_OK || !spv || spv_sz == 0u) {
                     LAGFX_WARN("op_0x74 P6a: translate_module failed (st=%d)", (int)xl_st);
@@ -1834,6 +1882,7 @@ static const lagfx_compute_inner_op_desc_t compute_inner_op_table[] = {
     { 0x0075, "SetScissorRect",                  op_set_scissor_rect },
     { 0x0082, "SetViewport",                     op_set_viewport },
     { 0x0070, "SetFragmentSamplerStates",        op_set_fragment_sampler_states },
+    { 0x0071, "SetFragmentSamplerStatesLODClamp", op_set_fragment_sampler_states_lod_clamp },
     { 0x001a, "RenderDescribeRenderPass",        op_render_describe_render_pass },
     { 0x0017, "RenderBarrierScope",              op_render_barrier_scope },
     { 0x0003, "DrawInstancedPrimitives16",       op_draw_instanced_primitives_16 },
@@ -1868,6 +1917,16 @@ int lagfx_compute_inner_dispatch(lagfx_protocol_t *p,
         LAGFX_TRACE("compute_inner: encType=%u op=0x%04x body_len=%zu "
                     "(UNKNOWN — not in encType=0 table)",
                     (unsigned)encoder_type, (unsigned)opcode, body_len);
+        /* LAGFX_DUMP_UNKNOWN_OPS=1: first occurrence of each unhandled opcode. */
+        static uint8_t seen[0x200];
+        if (getenv("LAGFX_DUMP_UNKNOWN_OPS") && opcode < sizeof seen && !seen[opcode]) {
+            seen[opcode] = 1;
+            char hx[3 * 48 + 1]; size_t hn = 0;
+            for (size_t k = 0; k < body_len && k < 48u; k++)
+                hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", body[k]);
+            LAGFX_WARN("UNKNOWN-OP enc=%u op=0x%04x len=%zu: %s", (unsigned)encoder_type,
+                       (unsigned)opcode, body_len, hn ? hx : "");
+        }
         return 1;
     }
     return desc->handler(p, encoder_type, task_id, body, body_len);

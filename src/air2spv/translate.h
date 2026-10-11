@@ -86,6 +86,20 @@ lagfx_air_arg_bindings(const lagfx_air_module_t *m,
                         lagfx_air_arg_binding_t  *out,
                         size_t                    max);
 
+/* Samplers declared in the shader body (`constexpr sampler s(...)`): each is
+ * a module global whose initializer packs the sampler state into one 64-bit
+ * value. Returns the number written, in global order. LAGFX_DUMP_AIR_GLOBALS
+ * logs every global (to match the packed bits against known settings). */
+typedef struct {
+    uint32_t global_index;
+    uint64_t bits;
+} lagfx_air_constexpr_sampler_t;
+
+size_t
+lagfx_air_constexpr_samplers(const lagfx_air_module_t      *m,
+                             lagfx_air_constexpr_sampler_t *out,
+                             size_t                         max);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

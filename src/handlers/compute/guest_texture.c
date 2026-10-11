@@ -21,8 +21,8 @@
 
 /* Periodic warn-level summary, so cost is visible without info logging. */
 static struct {
-    unsigned long targets, created, clears, writebacks, skipped_storage;
-    unsigned long long wb_bytes;
+    unsigned long targets, created, clears, writebacks, skipped_storage, uploads;
+    unsigned long long wb_bytes, up_bytes;
     double clear_ms, wb_ms;
     unsigned long events;
 } stats;
@@ -36,9 +36,10 @@ static double now_ms(void) {
 static void stats_tick(void) {
     if (++stats.events % 500u) return;
     LAGFX_WARN("guest_texture stats: targets=%lu created=%lu clears=%lu (%.0f ms) "
-               "writebacks=%lu (%llu KiB, %.0f ms) skipped(storage)=%lu",
+               "writebacks=%lu (%llu KiB, %.0f ms) skipped(storage)=%lu uploads=%lu (%llu KiB)",
                stats.targets, stats.created, stats.clears, stats.clear_ms, stats.writebacks,
-               stats.wb_bytes / 1024u, stats.wb_ms, stats.skipped_storage);
+               stats.wb_bytes / 1024u, stats.wb_ms, stats.skipped_storage, stats.uploads,
+               stats.up_bytes / 1024u);
 }
 
 void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref) {
@@ -68,27 +69,32 @@ static bool read_texture_object(lagfx_protocol_t *p, const lagfx_task_entry_t *t
     return lagfx_parse_texture_object(b, sizeof b, obj);
 }
 
-lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
-                                                 lagfx_task_entry_t *task,
-                                                 struct lagfx_vk_state *vk,
-                                                 uint32_t ref,
-                                                 lagfx_texture_object_t *out_obj) {
-    lagfx_texture_object_t obj;
-    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj)) return NULL;
-    if (out_obj) *out_obj = obj;
-    stats.targets++;
-    stats_tick();
-    VkFormat fmt = lagfx_metal_pixel_format_to_vk(obj.pixel_format);
-
+/* Find or create the host image for (task, ref) matching the decoded object.
+ * *created is set when a new image was made (its contents are undefined). */
+static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                          struct lagfx_vk_state *vk, uint32_t ref,
+                                          const lagfx_texture_object_t *obj, bool *created) {
+    *created = false;
+    VkFormat fmt = lagfx_metal_pixel_format_to_vk(obj->pixel_format);
+    /* Object ids are reused for new objects; the texture's memory location
+     * tells an entry for a new texture from a stale one. */
+    uint64_t where = obj->n_place ? obj->place[0].page << 12 : 0u;
     lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task->id);
     if (e && e->type == LAGFX_RESOURCE_TYPE_TEXTURE && e->host_handle) {
         lagfx_vk_iosurface_t *cur = (lagfx_vk_iosurface_t *)e->host_handle;
-        if (cur->width == obj.width && cur->height == obj.height && cur->format == fmt)
+        if (cur->width == obj->width && cur->height == obj->height && cur->format == fmt) {
+            if (e->gpu_addr == where) return cur;
+            /* same shape, different texture: reuse the image, new contents */
+            e->gpu_addr = where;
+            e->backing_dirty = 0u;
+            cur->gpu_drawn = 0u;
+            *created = true;
             return cur;
+        }
     }
 
     lagfx_vk_iosurface_t *ios = NULL;
-    if (lagfx_vk_iosurface_create(vk, obj.width, obj.height, obj.pixel_format, &ios) != LAGFX_OK
+    if (lagfx_vk_iosurface_create(vk, obj->width, obj->height, obj->pixel_format, &ios) != LAGFX_OK
         || !ios)
         return NULL;
     if (!e || e->type != LAGFX_RESOURCE_TYPE_TEXTURE) {
@@ -110,10 +116,112 @@ lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
     e->host_handle = ios;
     e->image = ios->image;
     e->view = ios->view;
-    e->size = (uint64_t)obj.bytes_per_row * obj.height;
+    e->size = (uint64_t)obj->bytes_per_row * obj->height;
+    e->gpu_addr = where;
+    e->backing_dirty = 0u;
+    *created = true;
     LAGFX_LOG("guest_texture: task %u ref 0x%x -> %ux%u fmt %u storage %u bpr %u",
-              task->id, ref, obj.width, obj.height, obj.pixel_format, obj.storage,
-              obj.bytes_per_row);
+              task->id, ref, obj->width, obj->height, obj->pixel_format, obj->storage,
+              obj->bytes_per_row);
+    return ios;
+}
+
+lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
+                                                 lagfx_task_entry_t *task,
+                                                 struct lagfx_vk_state *vk,
+                                                 uint32_t ref,
+                                                 lagfx_texture_object_t *out_obj) {
+    lagfx_texture_object_t obj;
+    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj)) return NULL;
+    if (out_obj) *out_obj = obj;
+    stats.targets++;
+    stats_tick();
+    bool created;
+    lagfx_vk_iosurface_t *ios = ensure_image(p, task, vk, ref, &obj, &created);
+    /* Rendered into: the GPU copy is now the authoritative one. */
+    if (ios) ios->gpu_drawn = 1u;
+    return ios;
+}
+
+/* Read `len` bytes at texture-memory offset `off` through the placement
+ * entries (task virtual addresses). */
+static bool read_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                                const lagfx_texture_object_t *obj, uint64_t off,
+                                uint8_t *dst, uint64_t len) {
+    uint64_t base = 0;
+    for (uint32_t e = 0; e < obj->n_place && len > 0u; e++) {
+        uint64_t esize = obj->place[e].size;
+        if (off >= base + esize) { base += esize; continue; }
+        uint64_t va = (obj->place[e].page << 12) + (off - base);
+        uint64_t n = base + esize - off;
+        if (n > len) n = len;
+        if (!lagfx_task_read_virtual(p, task, va, (uint32_t)n, dst)) return false;
+        dst += n; off += n; len -= n;
+        base += esize;
+    }
+    return len == 0u;
+}
+
+/* Copy the texture's guest memory (rows of bytes_per_row) into the image. */
+static bool upload_from_guest(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                              struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                              const lagfx_texture_object_t *obj, uint32_t ref) {
+    uint32_t bpp = lagfx_metal_pixel_format_bytes(obj->pixel_format);
+    if (bpp == 0u) {
+        LAGFX_WARN("guest_texture: upload of format %u not supported (ref 0x%x)",
+                   obj->pixel_format, ref);
+        return false;
+    }
+    size_t tight = (size_t)obj->width * bpp;
+    if (obj->bytes_per_row < tight) return false;
+    uint8_t *px = malloc(tight * obj->height);
+    if (!px) return false;
+    bool ok = true;
+    for (uint32_t y = 0; y < obj->height && ok; y++)
+        ok = read_texture_memory(p, task, obj, (uint64_t)y * obj->bytes_per_row,
+                                 px + (size_t)y * tight, tight);
+    if (getenv("LAGFX_DUMP_OBJ")) {
+        uint32_t nz = 0;
+        for (size_t k = 0; ok && k < tight * obj->height; k++) nz += px[k] != 0u;
+        LAGFX_WARN("guest_texture: upload task %u ref 0x%x %ux%u fmt %u storage %u bpr %u "
+                   "place %u x {0x%llx @ page 0x%llx} read=%d nonzero=%u/%zu first=%02x%02x%02x%02x",
+                   task->id, ref, obj->width, obj->height, obj->pixel_format, obj->storage,
+                   obj->bytes_per_row, obj->n_place,
+                   (unsigned long long)(obj->n_place ? obj->place[0].size : 0u),
+                   (unsigned long long)(obj->n_place ? obj->place[0].page : 0u), ok, nz,
+                   tight * obj->height, px[0], px[1], px[2], px[3]);
+    }
+    if (ok) ok = lagfx_vk_iosurface_upload_pixels(vk, ios, px, tight * obj->height) == LAGFX_OK;
+    free(px);
+    stats.uploads++;
+    stats.up_bytes += (unsigned long long)tight * obj->height;
+    stats_tick();
+    if (!ok)
+        LAGFX_WARN("guest_texture: upload of ref 0x%x (task %u) failed", ref, task->id);
+    return ok;
+}
+
+lagfx_vk_iosurface_t *lagfx_guest_texture_source(lagfx_protocol_t *p,
+                                                 lagfx_task_entry_t *task,
+                                                 struct lagfx_vk_state *vk,
+                                                 uint32_t ref) {
+    lagfx_texture_object_t obj;
+    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj)) return NULL;
+    bool created;
+    lagfx_vk_iosurface_t *ios = ensure_image(p, task, vk, ref, &obj, &created);
+    if (!ios) return NULL;
+    lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task->id);
+    bool dirty = e && e->backing_dirty;
+    /* Contents come from guest memory when the image is new, or when the guest
+     * announced a CPU write since. Private textures have no CPU-written memory,
+     * and an image the GPU rendered into is newer than guest memory. */
+    if ((created || dirty) && obj.storage != LAGFX_STORAGE_PRIVATE
+        && (!ios->gpu_drawn || dirty)) {
+        if (upload_from_guest(p, task, vk, ios, &obj, ref)) {
+            ios->gpu_drawn = 0u;
+            if (e) e->backing_dirty = 0u;
+        }
+    }
     return ios;
 }
 
@@ -181,10 +289,8 @@ bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *
 }
 
 static uint32_t bytes_per_pixel(uint32_t metal_format) {
-    switch (metal_format) {
-    case 70: case 71: case 80: case 81: return 4u;   /* RGBA8 / BGRA8 (+sRGB) */
-    default: return 0u;                               /* readback helper is 4-byte only */
-    }
+    /* the readback helper is 4-byte only */
+    return lagfx_metal_pixel_format_bytes(metal_format) == 4u ? 4u : 0u;
 }
 
 /* Write `len` bytes at texture-memory offset `off` through the placement

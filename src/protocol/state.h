@@ -188,6 +188,7 @@ typedef struct {
     lagfx_binding_slot_t fragment_buffers[LAGFX_MAX_BINDING_SLOTS];
     lagfx_binding_slot_t vertex_textures[LAGFX_MAX_BINDING_SLOTS];
     lagfx_binding_slot_t fragment_textures[LAGFX_MAX_BINDING_SLOTS];
+    lagfx_binding_slot_t fragment_samplers[LAGFX_MAX_BINDING_SLOTS];
 } lagfx_bindings_t;
 
 /* Stage 65d Option 3: shader modules selected for this task.
@@ -233,6 +234,10 @@ typedef struct {
      * content/skip heuristics can't substitute. -1 = unknown → legacy
      * heuristics apply. */
     int16_t    spv_binding_metal[32];
+    /* Fragment-stage `constexpr sampler` state (packed bits from the AIR
+     * global initializer); bound to the translator's default sampler. */
+    uint64_t   constexpr_sampler_bits;
+    uint8_t    has_constexpr_sampler;
     uint8_t    n_spv_bindings;
     /* Vertex stage-in attributes reflected from the translated VERTEX shader
      * (Location-decorated Inputs). The host builds a non-empty vertex-input

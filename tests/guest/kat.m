@@ -96,6 +96,43 @@ static NSString *const kShaderSrc =
      "                               sampler s [[sampler(0)]]) {\n"
      "    return t.sample(s, in.uv);\n"
      "}\n"
+     // sampler probe: one constexpr sampler per function (see case_sampler_probe)
+     "fragment float4 fs_sp0(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(filter::nearest); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp1(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(filter::linear); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp2(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(mag_filter::linear, min_filter::nearest); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp3(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(address::repeat); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp4(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(address::mirrored_repeat); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp5(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(s_address::repeat, t_address::clamp_to_edge); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp6(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(coord::pixel); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp7(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(address::clamp_to_zero); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp8(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(mip_filter::linear); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp9(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(max_anisotropy(4)); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp10(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(filter::linear, address::repeat); return t.sample(s, in.uv);\n"
+     "}\n"
+     "fragment float4 fs_sp11(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    constexpr sampler s(address::clamp_to_border, border_color::opaque_white); return t.sample(s, in.uv);\n"
+     "}\n"
      // compute
      "kernel void k_fill(device uint *out [[buffer(0)]], constant uint &mul [[buffer(1)]],\n"
      "                   uint i [[thread_position_in_grid]]) { out[i] = i * mul + 1u; }\n";
@@ -563,6 +600,64 @@ static BOOL case_compute(void) {
     return bad == 0;
 }
 
+// Not a pass/fail case: draws with known samplers so the host-side dumps
+// (LAGFX_DUMP_AIR_GLOBALS=1 for constexpr samplers, LAGFX_DUMP_OBJ=1 for
+// sampler state objects) can be matched to the settings.
+static const char *const kProbeSamplers[] = {
+    "filter::nearest",
+    "filter::linear",
+    "mag_filter::linear, min_filter::nearest",
+    "address::repeat",
+    "address::mirrored_repeat",
+    "s_address::repeat, t_address::clamp_to_edge",
+    "coord::pixel",
+    "address::clamp_to_zero",
+    "mip_filter::linear",
+    "max_anisotropy(4)",
+    "filter::linear, address::repeat",
+    "address::clamp_to_border, border_color::opaque_white",
+};
+
+static BOOL case_sampler_probe(void) {
+    id<MTLTexture> src = make_texture(2, 2, MTLTextureUsageShaderRead);
+    const bgra_t c[4] = {kBlack, kRed, kGreen, kBlue};
+    [src replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:c bytesPerRow:8];
+    static bgra_t px[kSize * kSize];
+    for (size_t i = 0; i < sizeof kProbeSamplers / sizeof kProbeSamplers[0]; i++) {
+        printf("  constexpr %zu: %s\n", i, kProbeSamplers[i]);
+        draw_quad(make_pipeline(@"vs_quad", [NSString stringWithFormat:@"fs_sp%zu", i], nil, nil),
+                  MTLClearColorMake(0, 0, 0, 1),
+                  ^(id<MTLRenderCommandEncoder> e) { [e setFragmentTexture:src atIndex:0]; }, px);
+    }
+    struct { const char *what; void (^set)(MTLSamplerDescriptor *); } objs[] = {
+        {"default", ^(MTLSamplerDescriptor *d) {}},
+        {"min/mag linear", ^(MTLSamplerDescriptor *d) {
+            d.minFilter = MTLSamplerMinMagFilterLinear; d.magFilter = MTLSamplerMinMagFilterLinear; }},
+        {"mag linear only", ^(MTLSamplerDescriptor *d) { d.magFilter = MTLSamplerMinMagFilterLinear; }},
+        {"s repeat", ^(MTLSamplerDescriptor *d) { d.sAddressMode = MTLSamplerAddressModeRepeat; }},
+        {"t mirror", ^(MTLSamplerDescriptor *d) { d.tAddressMode = MTLSamplerAddressModeMirrorRepeat; }},
+        {"unnormalized", ^(MTLSamplerDescriptor *d) { d.normalizedCoordinates = NO; }},
+        {"mip linear", ^(MTLSamplerDescriptor *d) { d.mipFilter = MTLSamplerMipFilterLinear; }},
+        {"aniso 4", ^(MTLSamplerDescriptor *d) { d.maxAnisotropy = 4; }},
+        {"lod 1..5", ^(MTLSamplerDescriptor *d) { d.lodMinClamp = 1; d.lodMaxClamp = 5; }},
+        {"border white", ^(MTLSamplerDescriptor *d) {
+            d.sAddressMode = MTLSamplerAddressModeClampToBorderColor;
+            d.borderColor = MTLSamplerBorderColorOpaqueWhite; }},
+    };
+    for (size_t i = 0; i < sizeof objs / sizeof objs[0]; i++) {
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+        objs[i].set(sd);
+        id<MTLSamplerState> ss = [gDevice newSamplerStateWithDescriptor:sd];
+        printf("  object %zu: %s\n", i, objs[i].what);
+        draw_quad(make_pipeline(@"vs_quad", @"fs_tex_sampler", nil, nil), MTLClearColorMake(0, 0, 0, 1),
+                  ^(id<MTLRenderCommandEncoder> e) {
+                      [e setFragmentTexture:src atIndex:0];
+                      [e setFragmentSamplerState:ss atIndex:0];
+                  }, px);
+    }
+    return YES;
+}
+
 // Not a pass/fail case: clears textures with distinct, known properties so
 // the host-side object dump (LAGFX_DUMP_OBJ=1) can be matched to fields.
 static BOOL case_probe(void) {
@@ -608,6 +703,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"iosurface-target", case_iosurface_target, YES},
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
+    {"sampler-probe", case_sampler_probe, NO},
 };
 #define kNumCases (sizeof kCases / sizeof kCases[0])
 

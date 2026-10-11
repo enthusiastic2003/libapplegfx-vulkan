@@ -87,6 +87,10 @@ void lagfx_vk_iosurface_destroy(struct lagfx_vk_state *vk,
  *   25 -> VK_FORMAT_D16_UNORM (MTLPixelFormatDepth16Unorm)
  * Unknown formats fall back to BGRA8 with a WARN log. */
 VkFormat lagfx_metal_pixel_format_to_vk(uint32_t pixel_format);
+/* Bytes per texel of a MTLPixelFormat (0 if unknown) / of a VkFormat this
+ * module creates (4 if unknown). */
+uint32_t lagfx_metal_pixel_format_bytes(uint32_t pixel_format);
+uint32_t lagfx_vk_format_bytes(VkFormat format);
 
 #else
 

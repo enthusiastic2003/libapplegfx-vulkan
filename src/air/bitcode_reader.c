@@ -167,6 +167,9 @@ struct lagfx_air_module {
      * <4 x i32> <0,1,2,undef> mask resolved its constituents to the
      * wrong constants when this was assumed zero. */
     uint32_t                     num_globalvars;
+    /* The first LAGFX_AIR_MAX_GLOBALVARS GLOBALVAR records, kept for their
+     * initializers (constexpr samplers live in module globals). */
+    lagfx_air_globalvar_t        globalvars[LAGFX_AIR_MAX_GLOBALVARS];
     /* Arena OFFSETS for the three tables above (0 = unset). The table
      * pointers are raw arena addresses and a later arena_reserve() may
      * realloc the arena out from under them (e.g. a CONSTANTS block
@@ -323,6 +326,11 @@ lagfx_air_module_functions(const lagfx_air_module_t *m, uint32_t *count) {
 uint32_t
 lagfx_air_module_num_globalvars(const lagfx_air_module_t *m) {
     return m->num_globalvars;
+}
+
+const lagfx_air_globalvar_t *
+lagfx_air_module_globalvar(const lagfx_air_module_t *m, uint32_t i) {
+    return (i < m->num_globalvars && i < LAGFX_AIR_MAX_GLOBALVARS) ? &m->globalvars[i] : NULL;
 }
 
 const lagfx_air_metadata_t *
@@ -1598,8 +1606,22 @@ lagfx_air_module_open(const uint8_t *blob, size_t blob_len,
                          * functions in LLVM's enumeration). Count it so
                          * the absolute-value-id base lines up — see
                          * num_globalvars doc comment. */
+                    {
+                        /* [strtab_off, strtab_size,] type, isconst|explicit<<1|addrspace<<2,
+                         * initid (value id + 1, 0 = none), linkage, ... */
+                        const uint32_t goff = m->has_strtab ? 2u : 0u;
+                        if (m->num_globalvars < LAGFX_AIR_MAX_GLOBALVARS
+                            && rec.num_ops >= goff + 3u) {
+                            lagfx_air_globalvar_t *g = &m->globalvars[m->num_globalvars];
+                            g->name_offset = m->has_strtab ? (uint32_t)rec.ops[0] : 0u;
+                            g->name_len    = m->has_strtab ? (uint32_t)rec.ops[1] : 0u;
+                            g->type_index  = (uint32_t)rec.ops[goff + 0u];
+                            g->flags       = (uint32_t)rec.ops[goff + 1u];
+                            g->init_id     = (uint32_t)rec.ops[goff + 2u];
+                        }
                         m->num_globalvars++;
                         break;
+                    }
                     default:
                         /* Other module-level records (ALIAS, IFUNC,
                          * VSTOFFSET, etc.) — Phase 1 ignores. */

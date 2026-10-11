@@ -9,6 +9,9 @@
 #include "compute_draw_internal.h"
 #include "display.h"
 #include "protocol/object_resolver.h"
+#include "guest_texture.h"
+#include "protocol/sampler_state.h"
+#include "vulkan/sampler_cache.h"
 
 #include "common/le.h"
 #include "common/log.h"
@@ -177,8 +180,19 @@ VkDescriptorSet lagfx_build_draw_descriptor_set(
             if (tex_idx < LAGFX_MAX_BINDING_SLOTS
                 && task->bindings.fragment_textures[tex_idx].valid) {
                 tref = task->bindings.fragment_textures[tex_idx].ref;
-                lagfx_resource_entry_t *te =
-                    lagfx_resource_lookup_texture(&p->resources, tref);
+                /* Decoded texture object first: this task's texture, its real
+                 * size and format, contents from its guest memory. */
+                lagfx_vk_iosurface_t *gs = getenv("LAGFX_DISABLE_GUEST_TEXSRC")
+                    ? NULL : lagfx_guest_texture_source(p, task, vk, tref);
+                if (gs && gs->view != VK_NULL_HANDLE
+                    && (gs->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                        || gs->layout == VK_IMAGE_LAYOUT_GENERAL)) {
+                    view = gs->view;
+                    lay = gs->layout;
+                    tex_src = "decoded";
+                }
+                lagfx_resource_entry_t *te = view != VK_NULL_HANDLE ? NULL
+                    : lagfx_resource_lookup_texture(&p->resources, tref);
                 if (te && te->view != VK_NULL_HANDLE) {
                     lagfx_vk_iosurface_t *ios =
                         (lagfx_vk_iosurface_t *)te->host_handle;
@@ -330,10 +344,35 @@ VkDescriptorSet lagfx_build_draw_descriptor_set(
                 *out_n = 0;
                 return VK_NULL_HANDLE;
             }
+            /* The guest's own sampler: a [[sampler(n)]] argument binds the
+             * sampler state object at fragment slot n; the translator's extra
+             * sampler binding (no Metal index) is the shader's constexpr
+             * sampler. */
+            VkSampler guest_sampler = VK_NULL_HANDLE;
+            if (!getenv("LAGFX_DISABLE_GUEST_SAMPLERS")) {
+                lagfx_sampler_desc_t sd;
+                int16_t smidx = task->pending_pipeline.spv_binding_metal[i];
+                if (smidx >= 0 && smidx < (int16_t)LAGFX_MAX_BINDING_SLOTS
+                    && task->bindings.fragment_samplers[smidx].valid) {
+                    uint8_t st = 0; uint64_t sva = 0, sgpa = 0;
+                    uint8_t sb[LAGFX_SAMPLER_OBJECT_LEN];
+                    if (lagfx_resolve_object_data(p, task,
+                                                  task->bindings.fragment_samplers[smidx].ref,
+                                                  &st, &sva, &sgpa)
+                        && sva != 0u && lagfx_task_read_virtual(p, task, sva, sizeof sb, sb)
+                        && lagfx_parse_sampler_object(sb, sizeof sb, &sd))
+                        guest_sampler = lagfx_vk_sampler_get(vk, &sd);
+                } else if (smidx < 0 && task->pending_pipeline.has_constexpr_sampler) {
+                    lagfx_decode_constexpr_sampler(
+                        task->pending_pipeline.constexpr_sampler_bits, &sd);
+                    guest_sampler = lagfx_vk_sampler_get(vk, &sd);
+                }
+            }
             /* GOAL-M2x: pixel-space texcoords (Metal coord::pixel) need the
              * unnormalized sampler — the normalized one clamp-smears atlases. */
             iinfos[nw] = (VkDescriptorImageInfo){
-                .sampler = (task->pending_draw.pixel_texcoords
+                .sampler = guest_sampler != VK_NULL_HANDLE ? guest_sampler
+                         : (task->pending_draw.pixel_texcoords
                             && vk->unnorm_sampler != VK_NULL_HANDLE)
                                ? vk->unnorm_sampler : vk->default_sampler };
             writes[nw] = (VkWriteDescriptorSet){

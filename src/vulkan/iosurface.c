@@ -28,20 +28,52 @@ static uint32_t find_memory_type(VkPhysicalDevice phys,
     return UINT32_MAX;
 }
 
+/* MTLPixelFormat -> VkFormat + bytes per texel. Values are the public
+ * MTLPixelFormat enum (Metal/MTLPixelFormat.h). */
+static const struct { uint32_t mtl; VkFormat vk; uint8_t bytes; } kPixelFormats[] = {
+    {1,   VK_FORMAT_R8_UNORM, 1},              /* A8Unorm — glyph-atlas coverage bytes */
+    {10,  VK_FORMAT_R8_UNORM, 1},              /* R8Unorm */
+    {11,  VK_FORMAT_R8_SRGB, 1},               /* R8Unorm_sRGB */
+    {20,  VK_FORMAT_R16_UNORM, 2},             /* R16Unorm */
+    {25,  VK_FORMAT_R16_SFLOAT, 2},            /* R16Float */
+    {30,  VK_FORMAT_R8G8_UNORM, 2},            /* RG8Unorm */
+    {53,  VK_FORMAT_R32_UINT, 4},              /* R32Uint */
+    {55,  VK_FORMAT_R32_SFLOAT, 4},            /* R32Float */
+    {60,  VK_FORMAT_R16G16_UNORM, 4},          /* RG16Unorm */
+    {65,  VK_FORMAT_R16G16_SFLOAT, 4},         /* RG16Float */
+    {70,  VK_FORMAT_R8G8B8A8_UNORM, 4},        /* RGBA8Unorm */
+    {71,  VK_FORMAT_R8G8B8A8_SRGB, 4},         /* RGBA8Unorm_sRGB */
+    {80,  VK_FORMAT_B8G8R8A8_UNORM, 4},        /* BGRA8Unorm */
+    {81,  VK_FORMAT_B8G8R8A8_SRGB, 4},         /* BGRA8Unorm_sRGB */
+    {90,  VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4}, /* RGB10A2Unorm */
+    {92,  VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4},  /* RG11B10Float */
+    {94,  VK_FORMAT_A2R10G10B10_UNORM_PACK32, 4}, /* BGR10A2Unorm */
+    {105, VK_FORMAT_R32G32_SFLOAT, 8},         /* RG32Float */
+    {110, VK_FORMAT_R16G16B16A16_UNORM, 8},    /* RGBA16Unorm */
+    {115, VK_FORMAT_R16G16B16A16_SFLOAT, 8},   /* RGBA16Float */
+    {125, VK_FORMAT_R32G32B32A32_SFLOAT, 16},  /* RGBA32Float */
+    {250, VK_FORMAT_D16_UNORM, 2},             /* Depth16Unorm */
+    {252, VK_FORMAT_D32_SFLOAT, 4},            /* Depth32Float */
+};
+
 VkFormat lagfx_metal_pixel_format_to_vk(uint32_t pixel_format) {
-    switch (pixel_format) {
-    case 80: return VK_FORMAT_B8G8R8A8_UNORM;      /* MTLPixelFormatBGRA8Unorm */
-    case 70: return VK_FORMAT_R8G8B8A8_UNORM;      /* MTLPixelFormatRGBA8Unorm */
-    case 115: return VK_FORMAT_R16G16B16A16_SFLOAT; /* MTLPixelFormatRGBA16Float */
-    case 1:  /* MTLPixelFormatA8Unorm — glyph-atlas coverage bytes */
-    case 10: return VK_FORMAT_R8_UNORM;            /* MTLPixelFormatR8Unorm */
-    case 252: return VK_FORMAT_D32_SFLOAT;         /* MTLPixelFormatDepth32Float */
-    case 25: return VK_FORMAT_D16_UNORM;           /* MTLPixelFormatDepth16Unorm */
-    default:
-        LAGFX_WARN("iosurface: unknown Metal pixel format %u, "
-                    "falling back to BGRA8", (unsigned)pixel_format);
-        return VK_FORMAT_B8G8R8A8_UNORM;
-    }
+    for (size_t i = 0; i < sizeof kPixelFormats / sizeof kPixelFormats[0]; i++)
+        if (kPixelFormats[i].mtl == pixel_format) return kPixelFormats[i].vk;
+    LAGFX_WARN("iosurface: unknown Metal pixel format %u, "
+                "falling back to BGRA8", (unsigned)pixel_format);
+    return VK_FORMAT_B8G8R8A8_UNORM;
+}
+
+uint32_t lagfx_metal_pixel_format_bytes(uint32_t pixel_format) {
+    for (size_t i = 0; i < sizeof kPixelFormats / sizeof kPixelFormats[0]; i++)
+        if (kPixelFormats[i].mtl == pixel_format) return kPixelFormats[i].bytes;
+    return 0u;
+}
+
+uint32_t lagfx_vk_format_bytes(VkFormat format) {
+    for (size_t i = 0; i < sizeof kPixelFormats / sizeof kPixelFormats[0]; i++)
+        if (kPixelFormats[i].vk == format) return kPixelFormats[i].bytes;
+    return 4u;
 }
 
 static VkFormat metal_pixel_format_to_vk(uint32_t pixel_format) {
@@ -247,13 +279,7 @@ lagfx_status_t lagfx_vk_iosurface_upload_pixels(struct lagfx_vk_state *vk,
     if (vk->graphics_queue == VK_NULL_HANDLE || ios->image == VK_NULL_HANDLE)
         return LAGFX_ERR_BACKEND;
 
-    uint32_t texel_bytes = 4u;
-    switch (ios->format) {
-    case VK_FORMAT_R16G16B16A16_SFLOAT: texel_bytes = 8u; break;
-    case VK_FORMAT_D16_UNORM:           texel_bytes = 2u; break;
-    case VK_FORMAT_R8_UNORM:            texel_bytes = 1u; break;
-    default:                            texel_bytes = 4u; break;
-    }
+    uint32_t texel_bytes = lagfx_vk_format_bytes(ios->format);
     const VkDeviceSize img_bytes = (VkDeviceSize)ios->width * ios->height * texel_bytes;
     VkDeviceSize copy_bytes = data_len < img_bytes ? (VkDeviceSize)data_len : img_bytes;
 

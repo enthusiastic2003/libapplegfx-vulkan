@@ -1326,3 +1326,11 @@ texobj_test = executable('texture-object-unit',
   build_by_default : true,
 )
 test('texture object decode (unit)', texobj_test)
+
+sampler_test = executable('sampler-state-unit',
+  'sampler-state-unit.c',
+  include_directories : [include_dir, internal_include_dir],
+  dependencies : [libapplegfx_vulkan_dep],
+  build_by_default : true,
+)
+test('sampler state decode (unit)', sampler_test)

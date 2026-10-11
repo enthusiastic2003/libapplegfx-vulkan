@@ -193,6 +193,17 @@ typedef struct {
     uint32_t            raw_offset;     /* arena offset backing `raw` (re-derived post-realloc) */
 } lagfx_air_param_attr_group_t;
 
+/* === Global variable ============================================= */
+
+#define LAGFX_AIR_MAX_GLOBALVARS 64u
+
+typedef struct {
+    uint32_t name_offset, name_len;  /* into the STRTAB (0/0 without one) */
+    uint32_t type_index;             /* value type when flags bit 1 is set */
+    uint32_t flags;                  /* bit 0 constant, bit 1 explicit type, >>2 addrspace */
+    uint32_t init_id;                /* absolute value id + 1 of the initializer, 0 = none */
+} lagfx_air_globalvar_t;
+
 /* === Top-level module ============================================ */
 
 typedef struct lagfx_air_module lagfx_air_module_t;
@@ -207,6 +218,8 @@ const lagfx_air_function_t   *lagfx_air_module_functions(const lagfx_air_module_
  * constituents, module-constant references) must add this to their
  * module-value base. Relative-encoded operands are unaffected. */
 uint32_t                      lagfx_air_module_num_globalvars(const lagfx_air_module_t *m);
+/* GLOBALVAR record i (value id i), or NULL past the kept ones. */
+const lagfx_air_globalvar_t  *lagfx_air_module_globalvar(const lagfx_air_module_t *m, uint32_t i);
 const lagfx_air_metadata_t   *lagfx_air_module_metadata(const lagfx_air_module_t *m, uint32_t *count);
 /* Module-level metadata strings pool. Each entry is a NUL-terminated
  * string in the module arena, ordered by LLVM metadata-ID (0..count-1).

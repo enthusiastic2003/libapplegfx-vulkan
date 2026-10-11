@@ -150,6 +150,82 @@ lagfx_air_arg_bindings(const lagfx_air_module_t *m,
     return n_out;
 }
 
+/* Module constant for absolute value id `vid` (globals and functions come
+ * first in LLVM's value numbering), or NULL. */
+static const lagfx_air_constant_t *module_constant(const lagfx_air_module_t *m, uint32_t vid) {
+    uint32_t n_fns = 0, n_c = 0;
+    (void)lagfx_air_module_functions(m, &n_fns);
+    const lagfx_air_constant_t *cs = lagfx_air_module_constants(m, &n_c);
+    uint32_t base = lagfx_air_module_num_globalvars(m) + n_fns;
+    if (!cs || vid < base || vid - base >= n_c) return NULL;
+    return &cs[vid - base];
+}
+
+/* Integer value of a constant, looking through single-element aggregates
+ * (a struct wrapping one integer). */
+static bool constant_int(const lagfx_air_module_t *m, const lagfx_air_constant_t *c,
+                         uint64_t *out, int depth) {
+    if (!c || depth > 2) return false;
+    if (c->kind == LAGFX_AIR_CONST_INTEGER) { *out = (uint64_t)c->payload.i64; return true; }
+    if (c->kind == LAGFX_AIR_CONST_AGGREGATE && c->payload.bytes.len == sizeof(uint32_t)) {
+        /* payload: u32 absolute value ids of the elements, in the module arena */
+        const char *bytes = lagfx_air_module_string(m, c->payload.bytes.offset);
+        if (!bytes) return false;
+        uint32_t elem;
+        memcpy(&elem, bytes, sizeof elem);
+        return constant_int(m, module_constant(m, elem), out, depth + 1);
+    }
+    return false;
+}
+
+static const char *type_name(const lagfx_air_module_t *m, uint32_t ti) {
+    uint32_t n_t = 0;
+    const lagfx_air_type_t *ts = lagfx_air_module_types(m, &n_t);
+    if (!ts || ti >= n_t || ts[ti].kind != LAGFX_AIR_TYPE_STRUCT_NAMED) return NULL;
+    return lagfx_air_module_string(m, ts[ti].name_offset);
+}
+
+size_t
+lagfx_air_constexpr_samplers(const lagfx_air_module_t *m, lagfx_air_constexpr_sampler_t *out,
+                             size_t max) {
+    if (!m || !out) return 0u;
+    const bool dump = getenv("LAGFX_DUMP_AIR_GLOBALS") != NULL;
+    const char *entry = NULL;
+    if (dump) {
+        uint32_t n_fns = 0;
+        const lagfx_air_function_t *fns = lagfx_air_module_functions(m, &n_fns);
+        for (uint32_t i = 0; i < n_fns && !entry; i++) {
+            const char *nm = fns[i].is_proto ? NULL : lagfx_air_module_string(m, fns[i].name_offset);
+            if (nm && strncmp(nm, "_GLOBAL__", 9) != 0) entry = nm;
+        }
+    }
+    uint32_t n_t = 0;
+    const lagfx_air_type_t *ts = lagfx_air_module_types(m, &n_t);
+    size_t n = 0;
+    uint32_t ng = lagfx_air_module_num_globalvars(m);
+    for (uint32_t i = 0; i < ng; i++) {
+        const lagfx_air_globalvar_t *g = lagfx_air_module_globalvar(m, i);
+        if (!g) break;
+        const lagfx_air_constant_t *c = g->init_id ? module_constant(m, g->init_id - 1u) : NULL;
+        uint64_t v = 0;
+        bool is_int = constant_int(m, c, &v, 0);
+        const char *tn = (g->flags & 2u) ? type_name(m, g->type_index) : NULL;
+        const lagfx_air_type_t *gt = (ts && g->type_index < n_t) ? &ts[g->type_index] : NULL;
+        bool i64 = gt && gt->kind == LAGFX_AIR_TYPE_INTEGER && gt->num_op >= 1u && gt->op[0] == 64u;
+        if (dump)
+            LAGFX_WARN("AIR-GLOBAL %s #%u: type=%u (%s%s) flags=0x%x init=%u kind=%d value=%s0x%llx",
+                       entry ? entry : "?", i, g->type_index, tn ? tn : "-", i64 ? " i64" : "",
+                       g->flags, g->init_id, c ? (int)c->kind : -1, is_int ? "" : "(none) ",
+                       (unsigned long long)v);
+        /* A constexpr sampler is a constant i64 global in the constant address
+         * space (2) whose initializer packs the sampler state. */
+        if (!is_int || !i64 || (g->flags & 1u) == 0u || (g->flags >> 2) != 2u) continue;
+        if (n < max) { out[n].global_index = i; out[n].bits = v; }
+        n++;
+    }
+    return n < max ? n : max;
+}
+
 lagfx_status_t
 lagfx_air2spv_translate_module(const lagfx_air_module_t *m,
                                 uint8_t                 **out_blob,

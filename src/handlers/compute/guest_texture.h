@@ -5,7 +5,8 @@
  * SPDX-License-Identifier: MIT
  *
  * Ties a guest texture object (decoded with protocol/texture_object.h) to a
- * host VkImage registered under (ref, task) in the resource registry, runs a
+ * host VkImage registered under (ref, task) in the resource registry, uploads
+ * sampled textures from guest memory, runs a
  * render pass's load-action clear on it, and copies CPU-visible textures
  * (shared/managed storage) back into their guest memory once the command
  * buffer that wrote them has been processed.
@@ -32,6 +33,16 @@ lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
                                                  struct lagfx_vk_state *vk,
                                                  uint32_t ref,
                                                  lagfx_texture_object_t *out_obj);
+
+/* Find or create the host image for texture object `ref` of `task` to sample
+ * from. A new image (or one whose guest memory the guest announced it wrote)
+ * gets its contents from the texture's guest memory, unless the storage is
+ * private or the GPU rendered into it. Returns NULL if `ref` isn't a texture
+ * object we can decode. */
+lagfx_vk_iosurface_t *lagfx_guest_texture_source(lagfx_protocol_t *p,
+                                                 lagfx_task_entry_t *task,
+                                                 struct lagfx_vk_state *vk,
+                                                 uint32_t ref);
 
 /* Clear the whole image to rgba (one-shot submit, waits). */
 bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
