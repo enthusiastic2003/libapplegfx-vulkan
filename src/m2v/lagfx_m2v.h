@@ -146,6 +146,8 @@ typedef struct {
     const lagfx_m2v_texture_t *textures;
     uint32_t n_samplers;
     const lagfx_m2v_sampler_t *samplers;
+    uint32_t n_threadgroup;                 /* kernel: setThreadgroupMemoryLength pairs */
+    const uint32_t (*threadgroup)[2];       /* {index, length} */
 } lagfx_m2v_stage_t;
 
 enum {
@@ -213,5 +215,53 @@ const uint32_t *lagfx_m2v_draw_holes(const lagfx_m2v_draw_t *d, uint32_t *n);
 const uint8_t *lagfx_m2v_draw_root_table(const lagfx_m2v_draw_t *d, uint32_t i, uint32_t *stages,
                                          size_t *len);
 uint32_t lagfx_m2v_root_sink_offset(void);
+
+/* ---- compute ---- */
+
+typedef struct M2vCompute lagfx_m2v_compute_t;
+typedef struct M2vDispatch lagfx_m2v_dispatch_t;
+
+/* Compile a compute pipeline from a library holding its kernel; NULL on
+ * failure or refusal, with the reason in `err`. */
+lagfx_m2v_compute_t *lagfx_m2v_compile_compute(const lagfx_m2v_device_t *dev, const uint8_t *lib,
+                                               size_t lib_len, char *err, size_t err_len);
+void lagfx_m2v_compute_free(lagfx_m2v_compute_t *c);
+const uint32_t *lagfx_m2v_compute_spirv(const lagfx_m2v_compute_t *c, size_t *n_words);
+void lagfx_m2v_compute_entry(const lagfx_m2v_compute_t *c, char *out, size_t cap);
+const uint8_t *lagfx_m2v_compute_constant_blob(const lagfx_m2v_compute_t *c, size_t *len);
+/* As lagfx_m2v_pipeline_layout. */
+uint32_t lagfx_m2v_compute_layout(const lagfx_m2v_compute_t *c, lagfx_m2v_layout_binding_t *out,
+                                  uint32_t cap, uint32_t *push_size, uint32_t *push_stages);
+/* out[3]: maxTotalThreadsPerThreadgroup, threadExecutionWidth,
+ * staticThreadgroupMemoryLength. */
+void lagfx_m2v_compute_info(const lagfx_m2v_compute_t *c, uint32_t *out);
+
+/* Plan one dispatch on the kernel stage `stage` (its write `stage` field is 2).
+ * threads != 0: dispatchThreads, `size` is the grid in threads; else
+ * dispatchThreadgroups, `size` is the group count. NULL (reason in err) when
+ * it can't (yet). */
+lagfx_m2v_dispatch_t *lagfx_m2v_plan_dispatch(const lagfx_m2v_device_t *dev,
+                                              const lagfx_m2v_compute_t *c,
+                                              const lagfx_m2v_stage_t *stage, const uint32_t size[3],
+                                              const uint32_t per_group[3], uint32_t threads,
+                                              char *err, size_t err_len);
+void lagfx_m2v_dispatch_free(lagfx_m2v_dispatch_t *d);
+/* The pipeline the dispatch was planned on (the one given or its variant,
+ * owned by it): use its SPIR-V and layout. */
+const lagfx_m2v_compute_t *lagfx_m2v_dispatch_pipeline(const lagfx_m2v_dispatch_t *d);
+const lagfx_m2v_write_t *lagfx_m2v_dispatch_writes(const lagfx_m2v_dispatch_t *d, uint32_t *n);
+const uint8_t *lagfx_m2v_dispatch_bytes(const lagfx_m2v_dispatch_t *d, uint32_t i, size_t *len);
+const uint32_t *lagfx_m2v_dispatch_holes(const lagfx_m2v_dispatch_t *d, uint32_t *n);
+const uint8_t *lagfx_m2v_dispatch_root_table(const lagfx_m2v_dispatch_t *d, size_t *len);
+uint32_t lagfx_m2v_dispatch_region_count(const lagfx_m2v_dispatch_t *d);
+/* Region i: groups[3], VkPipelineShaderStageCreateFlags, required subgroup
+ * size (0 none). Returns 0 past the last. */
+uint32_t lagfx_m2v_dispatch_region(const lagfx_m2v_dispatch_t *d, uint32_t i, uint32_t *groups,
+                                   uint32_t *flags, uint32_t *subgroup_size);
+const uint32_t *lagfx_m2v_dispatch_region_specialization(const lagfx_m2v_dispatch_t *d, uint32_t i,
+                                                         const uint8_t **data, size_t *data_len,
+                                                         uint32_t *n_entries);
+const lagfx_m2v_push_t *lagfx_m2v_dispatch_region_push(const lagfx_m2v_dispatch_t *d, uint32_t i,
+                                                       uint32_t *n, const uint8_t **data);
 
 #endif /* LAGFX_M2V_H */

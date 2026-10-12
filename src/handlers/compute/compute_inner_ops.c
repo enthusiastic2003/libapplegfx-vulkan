@@ -204,7 +204,124 @@ static int op_set_compute_pipeline_state(lagfx_protocol_t *p, uint32_t enc,
                        task_id, ref);
         }
     }
+    p->tasks[task_id].bindings.compute_pipeline = ref;
     return 0;
+}
+
+/* ---- compute encoder (segment type 1); layouts per the public PVG
+ * implementation (pvg-vulkan-wire ops/compute.rs), matching our captures:
+ *   0xcb setBuffers            {u32 first, u32 count, count x {u32 ref, u64 offset}}
+ *   0xcf setBufferOffset       {u32 index, u64 offset} (the render encoder's 0x7e record)
+ *   0xce setTextures           {u32 first, u32 count, count x u32 ref}
+ *   0xcc setSamplerStates      as 0xce
+ *   0xcd setSamplerState:lodMinClamp:lodMaxClamp: {u32 first, u32 count, count x
+ *                              {u32 ref, f32 min, f32 max}}
+ *   0xd3 setThreadgroupMemoryLength {u64 length, u32 index}
+ *   0xc8 dispatchThreadgroups  {u64 groups x,y,z; u64 threads per group x,y,z}
+ *   0xca dispatchThreads       {u64 threads x,y,z; u64 threads per group x,y,z} */
+static lagfx_task_entry_t *compute_task(lagfx_protocol_t *p, uint32_t task_id) {
+    return task_id < LAGFX_MAX_TASKS && p->tasks[task_id].live ? &p->tasks[task_id] : NULL;
+}
+
+static int bind_refs(lagfx_binding_slot_t *slots, const uint8_t *b, size_t len, size_t entry,
+                     bool with_offset) {
+    if (len < 8u) return 1;
+    uint32_t first = lagfx_le32(b), count = lagfx_le32(b + 4);
+    if (len < 8u + (size_t)count * entry) return 1;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t slot = first + i;
+        if (slot >= LAGFX_MAX_BINDING_SLOTS) continue;
+        const uint8_t *e = b + 8u + (size_t)i * entry;
+        slots[slot].ref = lagfx_le32(e);
+        slots[slot].offset = with_offset ? lagfx_le64(e + 4) : 0u;
+        slots[slot].valid = slots[slot].ref != 0u;
+    }
+    return 0;
+}
+
+static int op_compute_set_buffers(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                  const uint8_t *b, size_t len) {
+    (void)enc;
+    lagfx_task_entry_t *task = compute_task(p, task_id);
+    return task ? bind_refs(task->bindings.kernel_buffers, b, len, 12u, true) : 1;
+}
+
+static int op_compute_set_textures(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                   const uint8_t *b, size_t len) {
+    (void)enc;
+    lagfx_task_entry_t *task = compute_task(p, task_id);
+    return task ? bind_refs(task->bindings.kernel_textures, b, len, 4u, false) : 1;
+}
+
+static int op_compute_set_samplers(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                   const uint8_t *b, size_t len) {
+    (void)enc;
+    lagfx_task_entry_t *task = compute_task(p, task_id);
+    return task ? bind_refs(task->bindings.kernel_samplers, b, len, 4u, false) : 1;
+}
+
+static int op_compute_set_samplers_lod(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                       const uint8_t *b, size_t len) {
+    (void)enc;
+    lagfx_task_entry_t *task = compute_task(p, task_id);
+    /* the LOD clamps are not applied yet: the sampler object's own are used */
+    return task ? bind_refs(task->bindings.kernel_samplers, b, len, 12u, false) : 1;
+}
+
+/* setBufferOffset {u32 index, u64 offset}, as the render encoder's 0x7e. */
+static int op_compute_buffer_offset(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                    const uint8_t *b, size_t len) {
+    (void)enc;
+    lagfx_task_entry_t *task = compute_task(p, task_id);
+    if (!task || len < 12u) return 1;
+    uint32_t index = lagfx_le32(b);
+    if (index >= LAGFX_MAX_BINDING_SLOTS) return 1;
+    task->bindings.kernel_buffers[index].offset = lagfx_le64(b + 4);
+    return 0;
+}
+
+static int op_compute_threadgroup_memory(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                         const uint8_t *b, size_t len) {
+    (void)enc;
+    lagfx_task_entry_t *task = compute_task(p, task_id);
+    if (!task || len < 12u) return 1;
+    uint64_t length = lagfx_le64(b);
+    uint32_t index = lagfx_le32(b + 8);
+    if (index >= LAGFX_MAX_BINDING_SLOTS) return 1;
+    task->bindings.kernel_threadgroup[index] = (uint32_t)length;
+    return 0;
+}
+
+static int compute_dispatch(lagfx_protocol_t *p, uint32_t task_id, const uint8_t *b, size_t len,
+                            bool threads) {
+    lagfx_task_entry_t *task = compute_task(p, task_id);
+    if (!task || len < 48u) return 1;
+    uint32_t size[3], per_group[3];
+    for (int i = 0; i < 3; i++) {
+        size[i] = (uint32_t)lagfx_le64(b + 8u * (size_t)i);
+        per_group[i] = (uint32_t)lagfx_le64(b + 24u + 8u * (size_t)i);
+    }
+    LAGFX_LOG("compute_inner: dispatch%s t%u pipe=0x%x size %ux%ux%u per group %ux%ux%u",
+              threads ? "Threads" : "Threadgroups", task_id, task->bindings.compute_pipeline,
+              size[0], size[1], size[2], per_group[0], per_group[1], per_group[2]);
+#if defined(LAGFX_HAVE_M2V) && defined(LAGFX_HAVE_VULKAN)
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    if (getenv("LAGFX_M2V") && dev && dev->vk && dev->vk->initialized && dev->vk->m2v)
+        lagfx_m2v_dispatch(p, task, dev->vk, size, per_group, threads);
+#endif
+    return 0;
+}
+
+static int op_compute_dispatch_threadgroups(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                            const uint8_t *b, size_t len) {
+    (void)enc;
+    return compute_dispatch(p, task_id, b, len, false);
+}
+
+static int op_compute_dispatch_threads(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                       const uint8_t *b, size_t len) {
+    (void)enc;
+    return compute_dispatch(p, task_id, b, len, true);
 }
 
 /* 0x66 setColorStoreAction:atIndex: {u32 store action, u32 index}: a pass
@@ -2274,6 +2391,15 @@ static const lagfx_compute_inner_op_desc_t compute_inner_op_table[] = {
     { 0x0068, "SetDepthStencilState",            op_set_depth_stencil_state },
     { 0x0066, "SetColorStoreAction",             op_set_color_store_action },
     { 0x0077, "SetStencilReference",             op_set_stencil_reference },
+    /* compute encoder */
+    { 0x00cb, "ComputeSetBuffers",               op_compute_set_buffers },
+    { 0x00cc, "ComputeSetSamplerStates",         op_compute_set_samplers },
+    { 0x00cd, "ComputeSetSamplerStatesLOD",      op_compute_set_samplers_lod },
+    { 0x00ce, "ComputeSetTextures",              op_compute_set_textures },
+    { 0x00cf, "ComputeSetBufferOffset",          op_compute_buffer_offset },
+    { 0x00d3, "ComputeSetThreadgroupMemory",     op_compute_threadgroup_memory },
+    { 0x00c8, "DispatchThreadgroups",            op_compute_dispatch_threadgroups },
+    { 0x00ca, "DispatchThreads",                 op_compute_dispatch_threads },
 };
 
 #define LAGFX_COMPUTE_INNER_OP_COUNT \

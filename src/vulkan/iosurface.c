@@ -11,6 +11,7 @@
 #include "command.h"
 #include "common/log.h"
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -103,8 +104,14 @@ lagfx_status_t lagfx_vk_iosurface_create_vk(struct lagfx_vk_state *vk,
     lagfx_vk_iosurface_t *ios = calloc(1, sizeof(*ios));
     if (!ios) return LAGFX_ERR_OUT_OF_MEMORY;
 
+    /* Compute kernels write textures as storage images; metal2vulkan may view
+     * one in another format of the same size (mutable format). */
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(vk->phys_device, fmt, &fp);
+    bool storage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0u;
     VkImageCreateInfo ici = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .flags         = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
         .imageType     = VK_IMAGE_TYPE_2D,
         .format        = fmt,
         .extent        = { width, height, 1u },
@@ -115,7 +122,8 @@ lagfx_status_t lagfx_vk_iosurface_create_vk(struct lagfx_vk_state *vk,
         .usage         = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                        | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                       | VK_IMAGE_USAGE_SAMPLED_BIT,
+                       | VK_IMAGE_USAGE_SAMPLED_BIT
+                       | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0u),
         .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };

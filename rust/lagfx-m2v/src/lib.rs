@@ -536,6 +536,9 @@ pub struct LagfxM2vStage {
     pub textures: *const LagfxM2vTexture,
     pub n_samplers: u32,
     pub samplers: *const LagfxM2vSampler,
+    /// Kernel threadgroup memory lengths (setThreadgroupMemoryLength:atIndex:): pairs {index, length}.
+    pub n_threadgroup: u32,
+    pub threadgroup: *const [u32; 2],
 }
 
 pub const W_UNSUPPORTED: u32 = 0;
@@ -614,6 +617,7 @@ fn stage_of(s: Stage) -> u32 {
     match s {
         Stage::Vertex => 0,
         Stage::Fragment => 1,
+        Stage::Kernel => 2,
         _ => 9,
     }
 }
@@ -641,10 +645,14 @@ fn neutral(w: &mut LagfxM2vWrite, n: &NeutralResource) {
 }
 
 fn build_state(stages: &[LagfxM2vStage; 2]) -> Result<(BindState, Vec<BTreeMapSampler>), String> {
+    build_state_for(&[(Stage::Vertex, &stages[0]), (Stage::Fragment, &stages[1])])
+}
+
+fn build_state_for(list: &[(Stage, &LagfxM2vStage)]) -> Result<(BindState, Vec<BTreeMapSampler>), String> {
     let mut state = BindState::default();
     let mut samplers = Vec::new();
-    for (si, st) in stages.iter().enumerate() {
-        let stage = if si == 0 { Stage::Vertex } else { Stage::Fragment };
+    for &(stage, st) in list {
+        let si = stage_of(stage) as usize;
         let mut t = StageTable::default();
         // SAFETY: caller's arrays.
         let bufs = if st.n_buffers > 0 { unsafe { std::slice::from_raw_parts(st.buffers, st.n_buffers as usize) } } else { &[] };
@@ -693,6 +701,13 @@ fn build_state(stages: &[LagfxM2vStage; 2]) -> Result<(BindState, Vec<BTreeMapSa
             }
             samplers.push(BTreeMapSampler { stage: si as u32, index: s.index, desc: d });
             t.samplers.insert(s.index, BoundSampler::new(d));
+        }
+        if st.n_threadgroup > 0 && !st.threadgroup.is_null() {
+            // SAFETY: caller's array.
+            let tg = unsafe { std::slice::from_raw_parts(st.threadgroup, st.n_threadgroup as usize) };
+            for &[index, length] in tg {
+                t.threadgroup_lengths.insert(index, length);
+            }
         }
         state.stages.insert(stage, t);
     }
@@ -817,6 +832,56 @@ pub unsafe extern "C" fn lagfx_m2v_plan_draw(
             vertex_buffers: Vec::new(), draw: [0; 8], index_offset: 0,
             holes, root_tables,
         };
+        let (writes, blobs) = convert_writes(
+            dev, &plan, &cmds.descriptor_bytes, &cmds.descriptor_ranges, &samplers)?;
+        out.writes = writes;
+        out.blobs = blobs;
+        for pw in &cmds.push_constants {
+            out.push.push(LagfxM2vPush {
+                stages: raw!(ShaderStageFlags, pw.stages),
+                offset: pw.offset,
+                size: pw.bytes.len() as u32,
+                data_offset: out.push_data.len() as u32,
+            });
+            out.push_data.extend_from_slice(&pw.bytes);
+        }
+        for vb in &plan.vertex_buffers {
+            let off = cmds.buffer_offsets.iter().find(|(b, _)| *b == vb.binding).map_or(0, |(_, o)| *o);
+            out.vertex_buffers.push([vb.binding as u64, vb.buffer_index as u64, off]);
+        }
+        if cmds.index_overrun.is_some() {
+            return Err(format!("index overrun {:?}", cmds.index_overrun));
+        }
+        match cmds.draw {
+            metal2vulkan::vk::DrawCommand::Draw { vertex_count, instance_count, first_vertex, first_instance } => {
+                out.draw = [0, vertex_count, instance_count, first_vertex, 0, first_instance, 0, 0];
+            }
+            metal2vulkan::vk::DrawCommand::DrawIndexed {
+                index_type, index_buffer_offset, index_count, instance_count, first_index,
+                vertex_offset, first_instance,
+            } => {
+                out.draw = [1, index_count, instance_count, first_index, vertex_offset as u32,
+                            first_instance, raw!(IndexType, index_type), 0];
+                out.index_offset = index_buffer_offset;
+            }
+            _ => return Err("not a direct draw".into()),
+        }
+        Ok(Box::into_raw(Box::new(out)))
+    });
+    r.unwrap_or(std::ptr::null_mut())
+}
+
+
+/// The plan's descriptor writes in this bridge's form, for a draw or a dispatch.
+fn convert_writes(
+    dev: &M2vDevice,
+    plan: &metal2vulkan::bind::BindingPlan,
+    descriptor_bytes: &[metal2vulkan::bind::DescriptorBytes],
+    descriptor_ranges: &[metal2vulkan::bind::DescriptorRange],
+    samplers: &[BTreeMapSampler],
+) -> Result<(Vec<LagfxM2vWrite>, Vec<Vec<u8>>), String> {
+    let mut writes = Vec::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
         let find_sampler = |stage: Stage, index: u32| {
             samplers.iter().find(|s| s.stage == stage_of(stage) && s.index == index).map(|s| s.desc)
         };
@@ -867,53 +932,37 @@ pub unsafe extern "C" fn lagfx_m2v_plan_draw(
                 WriteSource::ArgumentTable { stage, .. } | WriteSource::HandleTable { stage, .. } => {
                     w.kind = W_BYTES;
                     w.stage = stage_of(*stage);
-                    if let Some(b) = cmds.descriptor_bytes.iter().find(|b| b.set == d.set && b.binding == d.binding) {
-                        w.bytes_index = out.blobs.len() as i32;
-                        out.blobs.push(b.bytes.clone());
+                    if let Some(b) = descriptor_bytes.iter().find(|b| b.set == d.set && b.binding == d.binding) {
+                        w.bytes_index = blobs.len() as i32;
+                        blobs.push(b.bytes.clone());
                     }
                 }
                 _ => return Err(format!("unsupported descriptor source at set {} binding {}", d.set, d.binding)),
             }
-            if let Some(r) = cmds.descriptor_ranges.iter().find(|r| r.set == d.set && r.binding == d.binding) {
+            if let Some(r) = descriptor_ranges.iter().find(|r| r.set == d.set && r.binding == d.binding) {
                 w.has_range = 1;
                 w.range_offset = r.range.offset;
                 w.range_size = r.range.range;
             }
-            out.writes.push(w);
+            writes.push(w);
         }
-        for pw in &cmds.push_constants {
-            out.push.push(LagfxM2vPush {
-                stages: raw!(ShaderStageFlags, pw.stages),
-                offset: pw.offset,
-                size: pw.bytes.len() as u32,
-                data_offset: out.push_data.len() as u32,
-            });
-            out.push_data.extend_from_slice(&pw.bytes);
-        }
-        for vb in &plan.vertex_buffers {
-            let off = cmds.buffer_offsets.iter().find(|(b, _)| *b == vb.binding).map_or(0, |(_, o)| *o);
-            out.vertex_buffers.push([vb.binding as u64, vb.buffer_index as u64, off]);
-        }
-        if cmds.index_overrun.is_some() {
-            return Err(format!("index overrun {:?}", cmds.index_overrun));
-        }
-        match cmds.draw {
-            metal2vulkan::vk::DrawCommand::Draw { vertex_count, instance_count, first_vertex, first_instance } => {
-                out.draw = [0, vertex_count, instance_count, first_vertex, 0, first_instance, 0, 0];
+    Ok((writes, blobs))
+}
+
+fn convert_holes(holes: &[metal2vulkan::bind::PushHole]) -> Result<Vec<[u32; 3]>, String> {
+    let mut out = Vec::new();
+    for h in holes {
+        match *h {
+            metal2vulkan::bind::PushHole::RootTableAddress { stages, offset } => {
+                out.push([1, raw!(ShaderStageFlags, stages), offset])
             }
-            metal2vulkan::vk::DrawCommand::DrawIndexed {
-                index_type, index_buffer_offset, index_count, instance_count, first_index,
-                vertex_offset, first_instance,
-            } => {
-                out.draw = [1, index_count, instance_count, first_index, vertex_offset as u32,
-                            first_instance, raw!(IndexType, index_type), 0];
-                out.index_offset = index_buffer_offset;
+            metal2vulkan::bind::PushHole::ExecutionStatusAddress { stages, offset } => {
+                out.push([2, raw!(ShaderStageFlags, stages), offset])
             }
-            _ => return Err("not a direct draw".into()),
+            _ => return Err(format!("unsupported push hole {h:?}")),
         }
-        Ok(Box::into_raw(Box::new(out)))
-    });
-    r.unwrap_or(std::ptr::null_mut())
+    }
+    Ok(out)
 }
 
 #[no_mangle]
@@ -1012,4 +1061,352 @@ pub unsafe extern "C" fn lagfx_m2v_draw_root_table(
 #[no_mangle]
 pub extern "C" fn lagfx_m2v_root_sink_offset() -> u32 {
     metal2vulkan::bind::RootTable::SINK_HOST_OFFSET
+}
+
+// ===================================================================== compute
+
+use metal2vulkan::pipeline::{ComputePipeline, ComputePipelineDescriptor};
+
+pub struct M2vCompute {
+    pipeline: ComputePipeline,
+    /// The kernel it was compiled from, for its variants.
+    kernel: FunctionDescriptor,
+    variants: std::sync::Mutex<Vec<(metal2vulkan::cache::VariantKey, Box<M2vCompute>)>>,
+}
+
+impl M2vCompute {
+    /// The pipeline of `key`: this one when the key is empty, else its compiled variant.
+    fn variant(&self, dev: &M2vDevice, key: &metal2vulkan::cache::VariantKey)
+        -> Result<*const M2vCompute, String> {
+        if key.is_empty() {
+            return Ok(self);
+        }
+        let mut vars = self.variants.lock().map_err(|_| "variant lock poisoned")?;
+        if let Some((_, v)) = vars.iter().find(|(k, _)| k == key) {
+            return Ok(&**v);
+        }
+        let inputs = key.lowering_inputs(Stage::Kernel);
+        let compiled = dev.device.compile_function(&self.kernel, &inputs, &Budget::standard())
+            .map_err(|e| format!("variant kernel: {e}"))?;
+        let desc = ComputePipelineDescriptor::new(StageSource::Compiled(compiled));
+        let pipeline = dev.device.compile_compute_pipeline(&desc, &Budget::standard())
+            .map_err(|e| format!("variant pipeline: {e}"))?;
+        vars.push((key.clone(), Box::new(M2vCompute {
+            pipeline, kernel: self.kernel.clone(), variants: std::sync::Mutex::new(Vec::new()),
+        })));
+        Ok(&*vars.last().unwrap().1)
+    }
+}
+
+/// Compile a compute pipeline from a library holding its kernel. NULL on
+/// failure (or refusal), with the reason in `err`.
+///
+/// # Safety
+/// `dev` from lagfx_m2v_device_new; `lib` points at `lib_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_compile_compute(
+    dev: *const M2vDevice, lib: *const u8, lib_len: usize, err: *mut c_char, err_len: usize,
+) -> *mut M2vCompute {
+    let r = guard(err, err_len, || {
+        let dev = unsafe { dev.as_ref() }.ok_or("no device")?;
+        if lib.is_null() {
+            return Err("no kernel library".into());
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(lib, lib_len) };
+        let kernel = FunctionDescriptor::new(only_function(bytes)?);
+        let desc = ComputePipelineDescriptor::new(StageSource::Function(kernel.clone()));
+        let pipeline = dev.device.compile_compute_pipeline(&desc, &Budget::standard())
+            .map_err(|e| e.to_string())?;
+        Ok(Box::into_raw(Box::new(M2vCompute {
+            pipeline, kernel, variants: std::sync::Mutex::new(Vec::new()),
+        })))
+    });
+    r.unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_compute_free(c: *mut M2vCompute) {
+    if !c.is_null() {
+        drop(unsafe { Box::from_raw(c) });
+    }
+}
+
+/// The kernel's SPIR-V (words), `*n_words` set.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_compute_spirv(c: *const M2vCompute, n_words: *mut usize) -> *const u32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return std::ptr::null() };
+    if !n_words.is_null() { unsafe { *n_words = c.pipeline.stage.spirv.len() } }
+    c.pipeline.stage.spirv.as_ptr()
+}
+
+/// The kernel's entry point name (NUL-terminated into `out`).
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_compute_entry(c: *const M2vCompute, out: *mut c_char, cap: usize) {
+    if let Some(c) = unsafe { c.as_ref() } {
+        set_err(out, cap, &c.pipeline.stage.entry_point);
+    }
+}
+
+/// The kernel's constant blob (its `ConstantBlob` binding's data), NULL when none.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_compute_constant_blob(c: *const M2vCompute, len: *mut usize) -> *const u8 {
+    let Some(b) = (unsafe { c.as_ref() }).and_then(|c| c.pipeline.stage.constant_blob.as_ref()) else {
+        return std::ptr::null();
+    };
+    if !len.is_null() { unsafe { *len = b.len() } }
+    b.as_ptr()
+}
+
+/// The pipeline's layout bindings (as lagfx_m2v_pipeline_layout).
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_compute_layout(
+    c: *const M2vCompute, out: *mut LagfxM2vLayoutBinding, cap: u32, push_size: *mut u32, push_stages: *mut u32,
+) -> u32 {
+    let Some(c) = (unsafe { c.as_ref() }) else { return 0 };
+    let l = &c.pipeline.layout;
+    let mut n = 0u32;
+    for set in &l.sets {
+        for b in &set.bindings {
+            if n < cap && !out.is_null() {
+                let e = LagfxM2vLayoutBinding {
+                    set: set.set,
+                    binding: b.binding,
+                    descriptor_type: raw!(DescriptorType, b.ty),
+                    count: b.count,
+                    stages: raw!(ShaderStageFlags, b.stages),
+                    flags: raw!(DescriptorBindingFlags, b.flags),
+                    has_immutable_sampler: b.immutable_sampler.is_some() as u32,
+                    immutable_sampler: b.immutable_sampler.as_ref().map(vk_sampler).unwrap_or_default(),
+                };
+                unsafe { out.add(n as usize).write(e) };
+            }
+            n += 1;
+        }
+    }
+    let (mut size, mut stages) = (0u32, 0u32);
+    for r in &l.push_constants {
+        size = size.max(r.offset + r.size);
+        stages |= raw!(ShaderStageFlags, r.stages);
+    }
+    if !push_size.is_null() { unsafe { *push_size = size } }
+    if !push_stages.is_null() { unsafe { *push_stages = stages } }
+    n
+}
+
+/// Metal's per-pipeline answers: {maxTotalThreadsPerThreadgroup,
+/// threadExecutionWidth, staticThreadgroupMemoryLength}.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_compute_info(c: *const M2vCompute, out: *mut u32) {
+    let (Some(c), false) = (unsafe { c.as_ref() }, out.is_null()) else { return };
+    let i = &c.pipeline.metal_info;
+    unsafe {
+        *out = i.max_total_threads_per_threadgroup;
+        *out.add(1) = i.thread_execution_width;
+        *out.add(2) = i.static_threadgroup_memory_length;
+    }
+}
+
+struct RegionOut {
+    groups: [u32; 3],
+    spec_data: Vec<u8>,
+    spec_entries: Vec<[u32; 3]>,
+    push: Vec<LagfxM2vPush>,
+    push_data: Vec<u8>,
+    flags: u32,
+    subgroup_size: u32,
+}
+
+pub struct M2vDispatch {
+    pipeline: *const M2vCompute,
+    writes: Vec<LagfxM2vWrite>,
+    blobs: Vec<Vec<u8>>,
+    holes: Vec<[u32; 3]>,
+    root_table: Option<Vec<u8>>,
+    regions: Vec<RegionOut>,
+}
+
+/// Plan and instantiate one dispatch. `threads` nonzero: dispatchThreads
+/// (`size` is the grid in threads), else dispatchThreadgroups (`size` is the
+/// group count). Compiles the variants the plan or dispatch asks for. NULL
+/// on failure, with the reason in `err`.
+///
+/// # Safety
+/// `dev`, `c` live handles; `stage` one table; `size` and `per_group` three u32s each.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_plan_dispatch(
+    dev: *const M2vDevice, c: *const M2vCompute, stage: *const LagfxM2vStage,
+    size: *const u32, per_group: *const u32, threads: u32, err: *mut c_char, err_len: usize,
+) -> *mut M2vDispatch {
+    let r = guard(err, err_len, || {
+        let (dev, c, st) = unsafe {
+            (dev.as_ref().ok_or("no device")?, c.as_ref().ok_or("no pipeline")?, stage.as_ref().ok_or("no stage")?)
+        };
+        let size = unsafe { [*size, *size.add(1), *size.add(2)] };
+        let per_group = unsafe { [*per_group, *per_group.add(1), *per_group.add(2)] };
+        let dispatch = if threads != 0 {
+            metal2vulkan::bind::Dispatch::Threads { threads: size, threads_per_group: per_group }
+        } else {
+            metal2vulkan::bind::Dispatch::Threadgroups { groups: size, threads_per_group: per_group }
+        };
+        let (state, samplers) = build_state_for(&[(Stage::Kernel, st)])?;
+        let shape = state.shape();
+        // The plan may ask for a variant, and so may the dispatch: follow at most two hops.
+        let mut used: *const M2vCompute = c;
+        let mut plan = c.pipeline.plan(&dev.device, &shape).map_err(|e| format!("plan: {e}"))?;
+        let mut cmds = None;
+        for _ in 0..3 {
+            let want = plan.variant.clone();
+            let p = c.variant(dev, &want)?;
+            if p != used {
+                used = p;
+                plan = unsafe { &*used }.pipeline.plan(&dev.device, &shape)
+                    .map_err(|e| format!("variant plan: {e}"))?;
+                if plan.variant != want {
+                    return Err("variant plan asks for another variant".into());
+                }
+            }
+            match plan.instantiate_dispatch(&state, &dispatch) {
+                Ok(x) => { cmds = Some(x); break; }
+                Err(metal2vulkan::error::BindError::NeedsVariant { variant }) => {
+                    let p = c.variant(dev, &variant)?;
+                    used = p;
+                    plan = unsafe { &*used }.pipeline.plan(&dev.device, &shape)
+                        .map_err(|e| format!("dispatch variant plan: {e}"))?;
+                }
+                Err(e) => return Err(format!("dispatch: {e}")),
+            }
+        }
+        let cmds = cmds.ok_or("dispatch kept asking for variants")?;
+        let (writes, blobs) = convert_writes(dev, &plan, &cmds.descriptor_bytes, &cmds.descriptor_ranges, &samplers)?;
+        let mut regions = Vec::new();
+        for r in &cmds.regions {
+            if r.indirect.is_some() {
+                return Err("indirect dispatch region".into());
+            }
+            let mut push = Vec::new();
+            let mut push_data = Vec::new();
+            for pw in &r.push_constants {
+                push.push(LagfxM2vPush {
+                    stages: raw!(ShaderStageFlags, pw.stages),
+                    offset: pw.offset,
+                    size: pw.bytes.len() as u32,
+                    data_offset: push_data.len() as u32,
+                });
+                push_data.extend_from_slice(&pw.bytes);
+            }
+            regions.push(RegionOut {
+                groups: r.group_count,
+                spec_data: r.specialization.data.clone(),
+                spec_entries: r.specialization.entries.iter().map(|e| {
+                    let a = avk::SpecializationMapEntry::from(*e);
+                    [a.constant_id, a.offset, a.size as u32]
+                }).collect(),
+                push, push_data,
+                flags: raw!(PipelineShaderStageCreateFlags, r.stage_flags),
+                subgroup_size: r.required_subgroup_size.unwrap_or(0),
+            });
+        }
+        if cmds.indirect_clamp.is_some() {
+            return Err("indirect clamp prepass".into());
+        }
+        Ok(Box::into_raw(Box::new(M2vDispatch {
+            pipeline: used,
+            writes, blobs,
+            holes: convert_holes(&cmds.push_holes)?,
+            root_table: cmds.root_table.as_ref().map(|t| t.bytes.clone()),
+            regions,
+        })))
+    });
+    r.unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_free(d: *mut M2vDispatch) {
+    if !d.is_null() {
+        drop(unsafe { Box::from_raw(d) });
+    }
+}
+
+/// The pipeline the dispatch was planned on (the one given, or a variant that
+/// lives as long as it): its SPIR-V and layout are the ones to use.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_pipeline(d: *const M2vDispatch) -> *const M2vCompute {
+    unsafe { d.as_ref() }.map_or(std::ptr::null(), |d| d.pipeline)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_writes(d: *const M2vDispatch, n: *mut u32) -> *const LagfxM2vWrite {
+    let Some(d) = (unsafe { d.as_ref() }) else { return std::ptr::null() };
+    if !n.is_null() { unsafe { *n = d.writes.len() as u32 } }
+    d.writes.as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_bytes(d: *const M2vDispatch, i: u32, len: *mut usize) -> *const u8 {
+    let Some(b) = (unsafe { d.as_ref() }).and_then(|d| d.blobs.get(i as usize)) else { return std::ptr::null() };
+    if !len.is_null() { unsafe { *len = b.len() } }
+    b.as_ptr()
+}
+
+/// Push holes {kind 1 root table / 2 execution status, VkShaderStageFlags, push offset}.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_holes(d: *const M2vDispatch, n: *mut u32) -> *const [u32; 3] {
+    let Some(d) = (unsafe { d.as_ref() }) else { return std::ptr::null() };
+    if !n.is_null() { unsafe { *n = d.holes.len() as u32 } }
+    d.holes.as_ptr()
+}
+
+/// The resident root table's bytes, NULL when the kernel reads none.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_root_table(d: *const M2vDispatch, len: *mut usize) -> *const u8 {
+    let Some(b) = (unsafe { d.as_ref() }).and_then(|d| d.root_table.as_ref()) else { return std::ptr::null() };
+    if !len.is_null() { unsafe { *len = b.len() } }
+    b.as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_region_count(d: *const M2vDispatch) -> u32 {
+    unsafe { d.as_ref() }.map_or(0, |d| d.regions.len() as u32)
+}
+
+/// Region `i`: group counts into `groups[3]`; `*flags` its
+/// VkPipelineShaderStageCreateFlags, `*subgroup_size` its required size (0 = none).
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_region(
+    d: *const M2vDispatch, i: u32, groups: *mut u32, flags: *mut u32, subgroup_size: *mut u32,
+) -> u32 {
+    let Some(r) = (unsafe { d.as_ref() }).and_then(|d| d.regions.get(i as usize)) else { return 0 };
+    unsafe {
+        if !groups.is_null() { for k in 0..3 { *groups.add(k) = r.groups[k] } }
+        if !flags.is_null() { *flags = r.flags }
+        if !subgroup_size.is_null() { *subgroup_size = r.subgroup_size }
+    }
+    1
+}
+
+/// Region `i`'s specialization: data bytes and entries {constant id, offset, size}.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_region_specialization(
+    d: *const M2vDispatch, i: u32, data: *mut *const u8, data_len: *mut usize, n_entries: *mut u32,
+) -> *const [u32; 3] {
+    let Some(r) = (unsafe { d.as_ref() }).and_then(|d| d.regions.get(i as usize)) else { return std::ptr::null() };
+    unsafe {
+        if !data.is_null() { *data = r.spec_data.as_ptr() }
+        if !data_len.is_null() { *data_len = r.spec_data.len() }
+        if !n_entries.is_null() { *n_entries = r.spec_entries.len() as u32 }
+    }
+    r.spec_entries.as_ptr()
+}
+
+/// Region `i`'s push-constant writes and their data.
+#[no_mangle]
+pub unsafe extern "C" fn lagfx_m2v_dispatch_region_push(
+    d: *const M2vDispatch, i: u32, n: *mut u32, data: *mut *const u8,
+) -> *const LagfxM2vPush {
+    let Some(r) = (unsafe { d.as_ref() }).and_then(|d| d.regions.get(i as usize)) else { return std::ptr::null() };
+    unsafe {
+        if !n.is_null() { *n = r.push.len() as u32 }
+        if !data.is_null() { *data = r.push_data.as_ptr() }
+    }
+    r.push.as_ptr()
 }

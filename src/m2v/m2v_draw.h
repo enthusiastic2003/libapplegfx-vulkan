@@ -41,6 +41,14 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
                     void *pipeline, lagfx_vk_iosurface_t *target, uint32_t *target_layout,
                     const lagfx_draw_region_t *region, uint32_t prim, uint32_t vertex_start,
                     uint32_t vertex_count, uint32_t instance_count);
+
+/* Run one dispatch of the task's bound compute pipeline (setComputePipelineState)
+ * with its compute bindings. threads: dispatchThreads (`size` in threads), else
+ * dispatchThreadgroups (`size` in groups). Buffers the kernel may write are
+ * copied back to guest memory and textures it writes are marked for
+ * write-back. False when this path can't run it. */
+bool lagfx_m2v_dispatch(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_vk_state *vk,
+                        const uint32_t size[3], const uint32_t per_group[3], bool threads);
 #endif
 
 #endif /* LAGFX_M2V_DRAW_H */

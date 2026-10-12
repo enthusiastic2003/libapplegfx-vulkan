@@ -1770,4 +1770,577 @@ out:
     return ok;
 }
 
+/* ------------------------------------------------------------------- compute */
+
+/* A compute pipeline (or one of its variants) with its Vulkan objects; one
+ * VkPipeline per region specialization. */
+typedef struct {
+    const lagfx_m2v_compute_t *c;
+    uint32_t n_sets;
+    VkDescriptorSetLayout dsl[MAX_SETS];
+    VkPipelineLayout layout;
+    lagfx_m2v_layout_binding_t b[MAX_LAYOUT];
+    uint32_t nb;
+    VkSampler immutable[MAX_LAYOUT];
+    uint32_t push_size, push_stages;
+    VkShaderModule mod;
+    char entry[128];
+    struct { uint64_t h; VkPipeline pl; } var[MAX_VARIANTS];
+    uint32_t nvar;
+} cpipe_t;
+
+static struct { uint64_t key; lagfx_m2v_compute_t *c; } g_comp[128];   /* by library; c NULL = refused */
+static uint32_t g_ncomp;
+static cpipe_t *g_cpipe[64];
+static uint32_t g_ncpipe;
+
+static cpipe_t *cpipe_for(struct lagfx_vk_state *vk, const lagfx_m2v_compute_t *c) {
+    for (uint32_t i = 0; i < g_ncpipe; i++) if (g_cpipe[i]->c == c) return g_cpipe[i];
+    if (g_ncpipe >= 64u) return NULL;
+    cpipe_t *cp = calloc(1, sizeof *cp);
+    if (!cp) return NULL;
+    cp->c = c;
+    uint32_t total = lagfx_m2v_compute_layout(c, cp->b, MAX_LAYOUT, &cp->push_size, &cp->push_stages);
+    if (total > MAX_LAYOUT) goto fail;
+    cp->nb = total;
+    for (uint32_t i = 0; i < cp->nb; i++) {
+        if (cp->b[i].set >= MAX_SETS) goto fail;
+        if (cp->b[i].set + 1u > cp->n_sets) cp->n_sets = cp->b[i].set + 1u;
+        if (cp->b[i].has_immutable_sampler) cp->immutable[i] = make_sampler(vk, &cp->b[i].immutable_sampler);
+    }
+    for (uint32_t s = 0; s < cp->n_sets; s++) {
+        VkDescriptorSetLayoutBinding lb[MAX_LAYOUT];
+        VkDescriptorBindingFlags fl[MAX_LAYOUT];
+        uint32_t n = 0;
+        bool any_flags = false;
+        for (uint32_t i = 0; i < cp->nb; i++) {
+            if (cp->b[i].set != s) continue;
+            lb[n] = (VkDescriptorSetLayoutBinding){
+                .binding = cp->b[i].binding,
+                .descriptorType = (VkDescriptorType)cp->b[i].descriptor_type,
+                .descriptorCount = cp->b[i].count,
+                .stageFlags = cp->b[i].stages,
+                .pImmutableSamplers = cp->immutable[i] ? &cp->immutable[i] : NULL,
+            };
+            fl[n] = cp->b[i].flags;
+            any_flags |= fl[n] != 0u;
+            n++;
+        }
+        VkDescriptorSetLayoutBindingFlagsCreateInfo fci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+            .bindingCount = n, .pBindingFlags = fl,
+        };
+        VkDescriptorSetLayoutCreateInfo ci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .pNext = any_flags ? &fci : NULL, .bindingCount = n, .pBindings = lb,
+        };
+        if (vkCreateDescriptorSetLayout(vk->device, &ci, NULL, &cp->dsl[s]) != VK_SUCCESS) goto fail;
+    }
+    VkPushConstantRange pr = { .stageFlags = cp->push_stages, .offset = 0, .size = cp->push_size };
+    VkPipelineLayoutCreateInfo plci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = cp->n_sets, .pSetLayouts = cp->dsl,
+        .pushConstantRangeCount = cp->push_size ? 1u : 0u, .pPushConstantRanges = &pr,
+    };
+    if (vkCreatePipelineLayout(vk->device, &plci, NULL, &cp->layout) != VK_SUCCESS) goto fail;
+    size_t nw = 0;
+    const uint32_t *w = lagfx_m2v_compute_spirv(c, &nw);
+    VkShaderModuleCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4u, .pCode = w,
+    };
+    if (!w || vkCreateShaderModule(vk->device, &sci, NULL, &cp->mod) != VK_SUCCESS) goto fail;
+    lagfx_m2v_compute_entry(c, cp->entry, sizeof cp->entry);
+    g_cpipe[g_ncpipe++] = cp;
+    return cp;
+fail:
+    LAGFX_WARN("M2V compute: Vulkan objects failed");
+    for (uint32_t s = 0; s < MAX_SETS; s++)
+        if (cp->dsl[s]) vkDestroyDescriptorSetLayout(vk->device, cp->dsl[s], NULL);
+    if (cp->layout) vkDestroyPipelineLayout(vk->device, cp->layout, NULL);
+    free(cp);
+    return NULL;
+}
+
+static VkPipeline cpipe_variant(struct lagfx_vk_state *vk, cpipe_t *cp, const uint8_t *spec,
+                                size_t spec_len, const uint32_t (*se)[3], uint32_t n_spec,
+                                uint32_t flags, uint32_t subgroup) {
+    uint64_t h = fnv(0xcbf29ce484222325ull, spec, spec_len);
+    h = fnv(h, se, sizeof se[0] * n_spec);
+    h = fnv(h, &flags, sizeof flags);
+    h = fnv(h, &subgroup, sizeof subgroup);
+    for (uint32_t i = 0; i < cp->nvar; i++) if (cp->var[i].h == h) return cp->var[i].pl;
+    VkSpecializationMapEntry me[64];
+    if (n_spec > 64u) return VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < n_spec; i++) me[i] = (VkSpecializationMapEntry){ se[i][0], se[i][1], se[i][2] };
+    VkSpecializationInfo si = { n_spec, me, spec_len, spec };
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = subgroup,
+    };
+    VkComputePipelineCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = subgroup ? &rs : NULL,
+            .flags = flags, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = cp->mod, .pName = cp->entry, .pSpecializationInfo = n_spec ? &si : NULL,
+        },
+        .layout = cp->layout,
+    };
+    VkPipeline pl = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &ci, NULL, &pl) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    uint32_t slot = cp->nvar < MAX_VARIANTS ? cp->nvar++ : (uint32_t)(h % MAX_VARIANTS);
+    if (cp->var[slot].pl && slot != cp->nvar - 1u) vkDestroyPipeline(vk->device, cp->var[slot].pl, NULL);
+    cp->var[slot].h = h;
+    cp->var[slot].pl = pl;
+    return pl;
+}
+
+/* The compute pipeline object (slot data kind 0x0b): a 16-byte header
+ * {u32 0x0b, u32 total length, u32 object id, u32 body length}, then one
+ * record (u8 field count, {u8 key, u8 size, value}): key 0 is the kernel
+ * function's object id. */
+static lagfx_m2v_compute_t *compute_get(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                        struct lagfx_vk_state *vk, uint32_t ref) {
+    uint8_t type = 0, d[64];
+    uint64_t va = 0, gpa = 0;
+    if (!lagfx_resolve_object_data(p, task, ref, &type, &va, &gpa) || va == 0u
+        || !lagfx_task_read_virtual(p, task, va, sizeof d, d) || lagfx_le32(d) != 0x0bu)
+        return NULL;
+    uint32_t fn = 0;
+    uint32_t nf = d[16];
+    size_t at = 17;
+    for (uint32_t i = 0; i < nf && at + 2u <= sizeof d; i++) {
+        uint32_t key = d[at], size = d[at + 1];
+        if (at + 2u + size > sizeof d) break;
+        uint32_t v = 0;
+        for (uint32_t k = 0; k < size && k < 4u; k++) v |= (uint32_t)d[at + 2u + k] << (8u * k);
+        if (key == 0u) fn = v;
+        at += 2u + size;
+    }
+    uint64_t mgpa = 0, mva = 0;
+    uint32_t mlen = 0;
+    if (!fn || !lagfx_lookup_function_bytes(p, task, fn, &mgpa, &mlen, &mva) || !mlen
+        || mlen > (1u << 20))
+        return NULL;
+    uint8_t *lib = malloc(mlen);
+    if (!lib) return NULL;
+    bool read_ok = true;
+    for (uint32_t done = 0; done < mlen && read_ok;) {
+        uint32_t chunk = mlen - done > 0x10000u ? 0x10000u : mlen - done;
+        read_ok = lagfx_task_read_virtual(p, task, mva + done, chunk, lib + done);
+        done += chunk;
+    }
+    if (!read_ok) { free(lib); return NULL; }
+    uint64_t key = fnv(0x9e3779b97f4a7c15ull, lib, mlen);
+    for (uint32_t i = 0; i < g_ncomp; i++)
+        if (g_comp[i].key == key) { free(lib); return g_comp[i].c; }
+    char err[512] = "";
+    lagfx_m2v_compute_t *c = lagfx_m2v_compile_compute((lagfx_m2v_device_t *)vk->m2v, lib, mlen,
+                                                       err, sizeof err);
+    free(lib);
+    if (!c) LAGFX_WARN("M2V compute pipe=0x%x (function 0x%x) refused: %s", ref, fn, err);
+    uint32_t slot = g_ncomp < 128u ? g_ncomp++ : (uint32_t)(key % 128u);
+    g_comp[slot].key = key;
+    g_comp[slot].c = c;    /* a replaced entry is leaked: dispatches may still use it */
+    return c;
+}
+
+/* Write `len` bytes at logical offset `off` of a buffer back to guest memory. */
+static bool write_buffer(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                         const placement_t *pl, uint64_t off, uint64_t len, const uint8_t *src) {
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    if (!dev || !dev->desc.shell.write_memory) return false;
+    uint64_t base = 0;
+    for (uint32_t e = 0; e < pl->n && len > 0u; e++) {
+        if (off >= base + pl->size[e]) { base += pl->size[e]; continue; }
+        uint64_t local = off - base;
+        uint64_t n = pl->size[e] - local;
+        if (n > len) n = len;
+        for (uint64_t done = 0; done < n;) {
+            uint64_t va = (pl->page[e] << 12) + local + done;
+            uint64_t chunk = 0x1000u - (va & 0xfffu);
+            if (chunk > n - done) chunk = n - done;
+            uint64_t gpa = 0;
+            if (!lagfx_task_translate(p, task, va, &gpa)
+                || !dev->desc.shell.write_memory(dev->desc.shell.opaque, gpa, chunk, src + done))
+                return false;
+            done += chunk;
+        }
+        src += n; off += n; len -= n;
+        base += pl->size[e];
+    }
+    return true;
+}
+
+#undef FAIL_AT
+#define FAIL_AT(n) do { why = #n; goto cout; } while (0)
+
+bool lagfx_m2v_dispatch(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_vk_state *vk,
+                        const uint32_t size[3], const uint32_t per_group[3], bool threads) {
+    if (!p || !task || !vk || !vk->m2v) return false;
+    lagfx_bindings_t *bd = &task->bindings;
+    if (!bd->compute_pipeline) return false;
+    lagfx_m2v_compute_t *c = compute_get(p, task, vk, bd->compute_pipeline);
+    if (!c) return false;
+
+    static stage_bind_t ks;
+    describe_stage(p, task, bd->kernel_buffers, bd->kernel_textures, bd->kernel_samplers, &ks);
+    uint32_t tg[LAGFX_MAX_BINDING_SLOTS][2];
+    uint32_t ntg = 0;
+    for (uint32_t i = 0; i < LAGFX_MAX_BINDING_SLOTS; i++)
+        if (bd->kernel_threadgroup[i]) { tg[ntg][0] = i; tg[ntg][1] = bd->kernel_threadgroup[i]; ntg++; }
+    lagfx_m2v_stage_t st = { ks.nb, ks.buffers, ks.nt, ks.textures, ks.ns, ks.samplers,
+                             ntg, (const uint32_t (*)[2])tg };
+    char err[512] = "";
+    lagfx_m2v_dispatch_t *dp = lagfx_m2v_plan_dispatch((lagfx_m2v_device_t *)vk->m2v, c, &st, size,
+                                                      per_group, threads ? 1u : 0u, err, sizeof err);
+    if (!dp) {
+        static unsigned n_warn;
+        if (n_warn++ < 50u)
+            LAGFX_WARN("M2V dispatch not planned (pipe=0x%x): %s", bd->compute_pipeline, err);
+        return false;
+    }
+    cpipe_t *cp = cpipe_for(vk, lagfx_m2v_dispatch_pipeline(dp));
+    if (!cp) { lagfx_m2v_dispatch_free(dp); return false; }
+
+    bool ok = false;
+    const char *why = "submit";
+    temps_t t = { .vk = vk };
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet sets[MAX_SETS] = { 0 };
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    /* what the kernel may write: buffers to copy back, images to mark */
+    struct { int k; uint32_t mem_index; uint64_t off, len; } outbuf[MAX_LAYOUT];
+    uint32_t nout = 0;
+    struct { lagfx_vk_iosurface_t *ios; uint32_t ref; } outimg[MAX_LAYOUT];
+    uint32_t nimg = 0;
+    uint32_t nw = 0;
+    const lagfx_m2v_write_t *w = lagfx_m2v_dispatch_writes(dp, &nw);
+
+    VkDescriptorPoolSize ps[16];
+    uint32_t nps = 0;
+    for (uint32_t i = 0; i < cp->nb; i++) {
+        uint32_t k = 0;
+        while (k < nps && ps[k].type != (VkDescriptorType)cp->b[i].descriptor_type) k++;
+        if (k == nps) { if (nps >= 16u) FAIL_AT(1); ps[nps++] = (VkDescriptorPoolSize){
+                            (VkDescriptorType)cp->b[i].descriptor_type, 0 }; }
+        ps[k].descriptorCount += cp->b[i].count;
+    }
+    if (cp->n_sets) {
+        VkDescriptorPoolCreateInfo pci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = cp->n_sets, .poolSizeCount = nps, .pPoolSizes = ps,
+        };
+        if (vkCreateDescriptorPool(vk->device, &pci, NULL, &pool) != VK_SUCCESS) FAIL_AT(2);
+        VkDescriptorSetAllocateInfo ai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = pool, .descriptorSetCount = cp->n_sets, .pSetLayouts = cp->dsl,
+        };
+        if (vkAllocateDescriptorSets(vk->device, &ai, sets) != VK_SUCCESS) FAIL_AT(3);
+    }
+
+    VkWriteDescriptorSet wr[MAX_LAYOUT * 2];
+    VkDescriptorBufferInfo bi[MAX_LAYOUT * 2];
+    VkDescriptorImageInfo ii[MAX_LAYOUT * 2];
+    uint32_t nwr = 0;
+    for (uint32_t i = 0; i < nw && nwr < MAX_LAYOUT * 2u; i++) {
+        const lagfx_m2v_write_t *x = &w[i];
+        if (x->set >= cp->n_sets) FAIL_AT(4);
+        VkWriteDescriptorSet *o = &wr[nwr];
+        *o = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[x->set],
+            .dstBinding = x->binding, .dstArrayElement = x->element, .descriptorCount = 1,
+            .descriptorType = (VkDescriptorType)x->descriptor_type,
+        };
+        bool storage = o->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                    || o->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                    || o->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        switch (x->kind) {
+        case LAGFX_M2V_W_BUFFER:
+        case LAGFX_M2V_W_INLINE_BYTES: {
+            int k = find_buffer(&ks, x->slot);
+            if (k < 0) FAIL_AT(5);
+            uint64_t off = x->has_range ? x->range_offset : ks.buffers[k].offset;
+            uint64_t len = x->has_range ? x->range_size : 0x10000u;
+            if (len == VK_WHOLE_SIZE || len > (64u << 20)) len = 64u << 20;
+            uint8_t *data = malloc((size_t)len ? (size_t)len : 16u);
+            if (!data) FAIL_AT(6);
+            read_buffer(p, task, &ks.placement[k], off, len, data);
+            VkBuffer b = temp_buffer(&t, data, len);
+            free(data);
+            if (!b) FAIL_AT(7);
+            if (storage && nout < MAX_LAYOUT) {
+                outbuf[nout].k = k;
+                outbuf[nout].mem_index = t.nbuf - 1u;
+                outbuf[nout].off = off;
+                outbuf[nout].len = len;
+                nout++;
+            }
+            bi[nwr] = (VkDescriptorBufferInfo){ b, 0, len ? len : VK_WHOLE_SIZE };
+            o->pBufferInfo = &bi[nwr];
+            break;
+        }
+        case LAGFX_M2V_W_CONSTANT_BLOB:
+        case LAGFX_M2V_W_BYTES: {
+            size_t len = 0;
+            const uint8_t *data = x->kind == LAGFX_M2V_W_BYTES
+                ? lagfx_m2v_dispatch_bytes(dp, (uint32_t)x->bytes_index, &len)
+                : lagfx_m2v_compute_constant_blob(cp->c, &len);
+            VkBuffer b = temp_buffer(&t, data, len ? len : 16u);
+            if (!b) FAIL_AT(8);
+            bi[nwr] = (VkDescriptorBufferInfo){ b, 0, x->has_range ? x->range_size : VK_WHOLE_SIZE };
+            o->pBufferInfo = &bi[nwr];
+            break;
+        }
+        case LAGFX_M2V_W_TEXTURE:
+        case LAGFX_M2V_W_COMBINED:
+        case LAGFX_M2V_W_SAMPLER:
+        case LAGFX_M2V_W_NEUTRAL: {
+            VkImageView view = VK_NULL_HANDLE;
+            VkImageLayout lay = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkSampler smp = VK_NULL_HANDLE;
+            bool want_image = x->kind == LAGFX_M2V_W_TEXTURE || x->kind == LAGFX_M2V_W_COMBINED
+                              || (x->kind == LAGFX_M2V_W_NEUTRAL && x->neutral_kind == 3u);
+            if (x->kind == LAGFX_M2V_W_NEUTRAL && (x->neutral_kind == 1u || x->neutral_kind == 2u)) {
+                VkBuffer b = neutral_buffer(vk);
+                if (!b) FAIL_AT(9);
+                bi[nwr] = (VkDescriptorBufferInfo){ b, 0, x->neutral_min_bytes ? x->neutral_min_bytes : 16u };
+                o->pBufferInfo = &bi[nwr];
+                break;
+            }
+            if (x->kind == LAGFX_M2V_W_NEUTRAL && x->neutral_kind == 4u) FAIL_AT(10);
+            if (want_image) {
+                if (x->kind == LAGFX_M2V_W_NEUTRAL || x->image_neutral) {
+                    const neutral_img_t *ni = neutral_image_any(vk, x->neutral_view_type,
+                                                                x->neutral_sampled_type,
+                                                                x->neutral_format, x->neutral_compare);
+                    if (!ni) FAIL_AT(12);
+                    view = ni->view;
+                    lay = ni->layout;
+                } else {
+                    int k = find_texture(&ks, x->slot);
+                    if (k < 0) FAIL_AT(13);
+                    if (ks.textures[k].texture_type != 2u || ks.textures[k].array_length > 1u) {
+                        if (storage) FAIL_AT(33);     /* writes to non-2D textures: not yet */
+                        const other_tex_t *ot = other_texture(p, task, vk, ks.texture_ref[k]);
+                        if (!ot || (VkFormat)x->view_format != ot->format || t.nview >= MAX_TEMP)
+                            FAIL_AT(29);
+                        uint32_t vlayers = (x->view_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY
+                                            || x->view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                            || x->view_type == VK_IMAGE_VIEW_TYPE_CUBE
+                                            || x->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
+                                           ? ot->layers : 1u;
+                        VkImageViewCreateInfo vci = {
+                            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = ot->image,
+                            .viewType = (VkImageViewType)x->view_type, .format = ot->format,
+                            .components = { x->swizzle[0], x->swizzle[1], x->swizzle[2], x->swizzle[3] },
+                            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, vlayers },
+                        };
+                        if (vkCreateImageView(vk->device, &vci, NULL, &t.view[t.nview]) != VK_SUCCESS)
+                            FAIL_AT(30);
+                        view = t.view[t.nview++];
+                        goto image_done;
+                    }
+                    lagfx_vk_iosurface_t *ios = lagfx_guest_texture_source(p, task, vk, ks.texture_ref[k]);
+                    if (!ios) FAIL_AT(14);
+                    if (x->view_type != VK_IMAGE_VIEW_TYPE_2D) FAIL_AT(16);
+                    bool identity = true;
+                    for (int cc = 0; cc < 4; cc++)
+                        identity &= x->swizzle[cc] == VK_COMPONENT_SWIZZLE_IDENTITY
+                                    || x->swizzle[cc] == (uint32_t)(VK_COMPONENT_SWIZZLE_R + cc);
+                    if ((VkFormat)x->view_format == ios->format && identity) {
+                        view = ios->view;
+                    } else if (t.nview < MAX_TEMP) {
+                        /* another format of the same size, or a swizzle: the image is
+                         * created mutable-format */
+                        VkImageViewCreateInfo vci = {
+                            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = ios->image,
+                            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = (VkFormat)x->view_format,
+                            .components = { x->swizzle[0], x->swizzle[1], x->swizzle[2], x->swizzle[3] },
+                            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+                        };
+                        if (storage) vci.components = (VkComponentMapping){ 0 };
+                        if (vkCreateImageView(vk->device, &vci, NULL, &t.view[t.nview]) != VK_SUCCESS)
+                            FAIL_AT(17);
+                        view = t.view[t.nview++];
+                    } else {
+                        FAIL_AT(18);
+                    }
+                    if (storage) {
+                        lay = VK_IMAGE_LAYOUT_GENERAL;
+                        bool seen = false;
+                        for (uint32_t m = 0; m < nimg; m++) seen |= outimg[m].ios == ios;
+                        if (!seen && nimg < MAX_LAYOUT) {
+                            outimg[nimg].ios = ios;
+                            outimg[nimg++].ref = ks.texture_ref[k];
+                        }
+                    } else {
+                        lay = ios->layout == VK_IMAGE_LAYOUT_GENERAL
+                            ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    }
+                }
+            }
+image_done:
+            if (x->kind == LAGFX_M2V_W_SAMPLER || x->kind == LAGFX_M2V_W_COMBINED
+                || (x->kind == LAGFX_M2V_W_NEUTRAL && x->neutral_kind == 5u)) {
+                if (x->kind == LAGFX_M2V_W_NEUTRAL || x->sampler_kind == 2u)
+                    smp = neutral_sampler(vk);
+                else if (x->sampler_kind == 0u)
+                    smp = make_sampler(vk, &x->sampler);
+            }
+            ii[nwr] = (VkDescriptorImageInfo){ smp, view, lay };
+            o->pImageInfo = &ii[nwr];
+            break;
+        }
+        default:
+            FAIL_AT(19);
+        }
+        nwr++;
+    }
+    if (nwr) vkUpdateDescriptorSets(vk->device, nwr, wr, 0, NULL);
+
+    /* device addresses the push constants carry */
+    uint32_t nholes = 0;
+    const uint32_t *holes = lagfx_m2v_dispatch_holes(dp, &nholes);
+    uint64_t hole_addr[8] = { 0 };
+    if (nholes > 8u) FAIL_AT(24);
+    for (uint32_t h = 0; h < nholes; h++) {
+        if (holes[h * 3] == 2u) {
+            hole_addr[h] = status_address(vk);
+        } else {
+            size_t rlen = 0;
+            const uint8_t *rt = lagfx_m2v_dispatch_root_table(dp, &rlen);
+            if (!rt) FAIL_AT(25);
+            uint8_t *copy = malloc(rlen);
+            if (!copy) FAIL_AT(25);
+            memcpy(copy, rt, rlen);
+            uint64_t sink = sink_address(vk);
+            uint32_t so = lagfx_m2v_root_sink_offset();
+            if (so + 8u <= rlen) memcpy(copy + so, &sink, 8);
+            VkBuffer rb = temp_buffer(&t, copy, rlen);
+            free(copy);
+            if (!rb) FAIL_AT(26);
+            hole_addr[h] = buffer_address(vk, rb);
+        }
+        if (!hole_addr[h]) FAIL_AT(27);
+    }
+
+    /* one pipeline per region specialization */
+    uint32_t nreg = lagfx_m2v_dispatch_region_count(dp);
+    VkPipeline rpl[16];
+    uint32_t rgroups[16][3];
+    if (nreg > 16u) FAIL_AT(34);
+    for (uint32_t r = 0; r < nreg; r++) {
+        uint32_t flags = 0, subgroup = 0;
+        lagfx_m2v_dispatch_region(dp, r, rgroups[r], &flags, &subgroup);
+        const uint8_t *spec = NULL;
+        size_t spec_len = 0;
+        uint32_t n_spec = 0;
+        const uint32_t *se = lagfx_m2v_dispatch_region_specialization(dp, r, &spec, &spec_len, &n_spec);
+        rpl[r] = cpipe_variant(vk, cp, spec, spec_len, (const uint32_t (*)[3])se, n_spec, flags, subgroup);
+        if (!rpl[r]) FAIL_AT(20);
+    }
+
+    /* record */
+    if (lagfx_vk_cmdbuf_alloc(vk, &cb) != LAGFX_OK) FAIL_AT(28);
+    VkCommandBufferBeginInfo cbi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cb, &cbi);
+    for (uint32_t m = 0; m < nimg; m++) {
+        VkImageMemoryBarrier b = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .oldLayout = outimg[m].ios->layout, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = outimg[m].ios->image,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &b);
+    }
+    if (cp->n_sets)
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->layout, 0, cp->n_sets,
+                                sets, 0, NULL);
+    for (uint32_t r = 0; r < nreg; r++) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, rpl[r]);
+        uint32_t npw = 0;
+        const uint8_t *pd = NULL;
+        const lagfx_m2v_push_t *pw = lagfx_m2v_dispatch_region_push(dp, r, &npw, &pd);
+        for (uint32_t i = 0; i < npw; i++) {
+            uint8_t bytes[256];
+            uint32_t n = pw[i].size < sizeof bytes ? pw[i].size : (uint32_t)sizeof bytes;
+            memcpy(bytes, pd + pw[i].data_offset, n);
+            for (uint32_t h = 0; h < nholes; h++) {
+                uint32_t at = holes[h * 3 + 2];
+                if (at < pw[i].offset || at + 8u > pw[i].offset + n) continue;
+                memcpy(bytes + (at - pw[i].offset), &hole_addr[h], 8);
+            }
+            vkCmdPushConstants(cb, cp->layout, cp->push_stages, pw[i].offset, n, bytes);
+        }
+        if (rgroups[r][0] && rgroups[r][1] && rgroups[r][2])
+            vkCmdDispatch(cb, rgroups[r][0], rgroups[r][1], rgroups[r][2]);
+    }
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                           .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                           .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    vkEndCommandBuffer(cb);
+
+    {
+        VkFence fence = VK_NULL_HANDLE;
+        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                            .pCommandBuffers = &cb };
+        if (vkCreateFence(vk->device, &fci, NULL, &fence) == VK_SUCCESS
+            && vkQueueSubmit(vk->graphics_queue, 1, &si, fence) == VK_SUCCESS) {
+            VkResult wr2 = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 10000000000ull);
+            if (wr2 == VK_SUCCESS) {
+                ok = true;
+            } else {
+                LAGFX_WARN("M2V dispatch: fence wait failed (%d); waiting for the device", (int)wr2);
+                vkDeviceWaitIdle(vk->device);
+            }
+        }
+        if (fence) vkDestroyFence(vk->device, fence, NULL);
+    }
+    if (ok) {
+        /* the kernel's results: buffers back to guest memory, images marked */
+        for (uint32_t m = 0; m < nout; m++) {
+            void *mapped = NULL;
+            if (vkMapMemory(vk->device, t.mem[outbuf[m].mem_index], 0, outbuf[m].len, 0, &mapped)
+                != VK_SUCCESS)
+                continue;
+            if (!write_buffer(p, task, &ks.placement[outbuf[m].k], outbuf[m].off, outbuf[m].len,
+                              mapped)) {
+                static unsigned n_wb;
+                if (n_wb++ < 20u) LAGFX_WARN("M2V dispatch: buffer write-back failed");
+            }
+            vkUnmapMemory(vk->device, t.mem[outbuf[m].mem_index]);
+        }
+        for (uint32_t m = 0; m < nimg; m++) {
+            outimg[m].ios->layout = VK_IMAGE_LAYOUT_GENERAL;
+            outimg[m].ios->gpu_drawn = 1u;
+            lagfx_guest_texture_mark_written(task, outimg[m].ref);
+        }
+    }
+cout:
+    if (!ok) {
+        static unsigned n_fail;
+        if (n_fail++ < 100u)
+            LAGFX_WARN("M2V dispatch failed at %s (pipe=0x%x, %u writes)", why, bd->compute_pipeline, nw);
+    }
+    if (cb) lagfx_vk_cmdbuf_free(vk, cb);
+    if (pool) vkDestroyDescriptorPool(vk->device, pool, NULL);
+    temps_free(&t);
+    lagfx_m2v_dispatch_free(dp);
+    return ok;
+}
+
 #endif /* LAGFX_HAVE_M2V && LAGFX_HAVE_VULKAN */

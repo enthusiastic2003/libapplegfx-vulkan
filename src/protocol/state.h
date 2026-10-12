@@ -191,6 +191,12 @@ typedef struct {
     lagfx_binding_slot_t vertex_textures[LAGFX_MAX_BINDING_SLOTS];
     lagfx_binding_slot_t fragment_textures[LAGFX_MAX_BINDING_SLOTS];
     lagfx_binding_slot_t fragment_samplers[LAGFX_MAX_BINDING_SLOTS];
+    /* compute encoder (segment type 1) */
+    lagfx_binding_slot_t kernel_buffers[LAGFX_MAX_BINDING_SLOTS];
+    lagfx_binding_slot_t kernel_textures[LAGFX_MAX_BINDING_SLOTS];
+    lagfx_binding_slot_t kernel_samplers[LAGFX_MAX_BINDING_SLOTS];
+    uint32_t kernel_threadgroup[LAGFX_MAX_BINDING_SLOTS];   /* bytes; 0 = unset */
+    uint32_t compute_pipeline;                             /* object ref; 0 = none */
 } lagfx_bindings_t;
 
 /* Stage 65d Option 3: shader modules selected for this task.
