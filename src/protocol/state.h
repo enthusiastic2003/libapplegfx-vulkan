@@ -300,6 +300,11 @@ typedef struct {
     /* Counts the task's executed command buffers (IOSurface contents are
      * re-read from guest memory once per command buffer). */
     uint32_t cmdbuf_gen;
+    /* The draw being recorded renders into this host image (an
+     * lagfx_vk_iosurface_t), currently in layout draw_target_layout (a
+     * VkImageLayout); NULL when it renders elsewhere. */
+    void    *draw_target;
+    uint32_t draw_target_layout;
 
     /* Render pass description from PGCmdDescribeRenderPass (0x1a).
      * Per-task state: each task has its own render pass descriptor. */

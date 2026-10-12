@@ -84,6 +84,14 @@ lagfx_status_t lagfx_vk_iosurface_create(struct lagfx_vk_state *vk,
                                           uint32_t width, uint32_t height,
                                           uint32_t pixel_format,
                                           lagfx_vk_iosurface_t **out) {
+    return lagfx_vk_iosurface_create_vk(vk, width, height,
+                                        metal_pixel_format_to_vk(pixel_format), out);
+}
+
+lagfx_status_t lagfx_vk_iosurface_create_vk(struct lagfx_vk_state *vk,
+                                             uint32_t width, uint32_t height,
+                                             VkFormat fmt,
+                                             lagfx_vk_iosurface_t **out) {
     if (!vk || !out || width == 0u || height == 0u) {
         return LAGFX_ERR_INVALID_ARG;
     }
@@ -94,8 +102,6 @@ lagfx_status_t lagfx_vk_iosurface_create(struct lagfx_vk_state *vk,
 
     lagfx_vk_iosurface_t *ios = calloc(1, sizeof(*ios));
     if (!ios) return LAGFX_ERR_OUT_OF_MEMORY;
-
-    VkFormat fmt = metal_pixel_format_to_vk(pixel_format);
 
     VkImageCreateInfo ici = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -412,6 +418,10 @@ void lagfx_vk_iosurface_release(struct lagfx_vk_state *vk,
 void lagfx_vk_iosurface_destroy(struct lagfx_vk_state *vk,
                                  lagfx_vk_iosurface_t *ios) {
     if (!vk || !ios) return;
+    if (ios->snapshot) {
+        lagfx_vk_iosurface_destroy(vk, ios->snapshot);
+        ios->snapshot = NULL;
+    }
     if (vk->device == VK_NULL_HANDLE) {
         free(ios);
         return;

@@ -19,7 +19,7 @@
 
 #ifdef LAGFX_HAVE_VULKAN
 
-typedef struct {
+typedef struct lagfx_vk_iosurface {
     VkImage image;
     VkImageView view;
     VkDeviceMemory memory;
@@ -49,12 +49,21 @@ typedef struct {
     /* Task command buffer (cmdbuf_gen + 1) whose start the contents were last
      * read from guest memory for; 0 = never. */
     uint32_t upload_gen;
+    /* Copy of this image taken before a draw that samples the image it
+     * renders into (same size and format; reused). */
+    struct lagfx_vk_iosurface *snapshot;
 } lagfx_vk_iosurface_t;
 
 lagfx_status_t lagfx_vk_iosurface_create(struct lagfx_vk_state *vk,
                                           uint32_t width, uint32_t height,
                                           uint32_t pixel_format,
                                           lagfx_vk_iosurface_t **out);
+
+/* Same, for a Vulkan format. */
+lagfx_status_t lagfx_vk_iosurface_create_vk(struct lagfx_vk_state *vk,
+                                             uint32_t width, uint32_t height,
+                                             VkFormat fmt,
+                                             lagfx_vk_iosurface_t **out);
 
 /* Upload CPU pixel bytes (tightly-packed BGRA8/RGBA8 at ios->width×height) into
  * an existing IOSurface VkImage via a staging buffer, then transition it to

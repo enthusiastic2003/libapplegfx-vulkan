@@ -230,6 +230,32 @@ VkDescriptorSet lagfx_build_draw_descriptor_set(
                     tex_src = "realized";
                 }
             }
+            /* Sampling the image this draw renders into: Metal reads the
+             * contents from before the draw; Vulkan can't sample an attachment
+             * being written, so bind a copy taken now. */
+            if (view != VK_NULL_HANDLE && task->draw_target
+                && ((lagfx_vk_iosurface_t *)task->draw_target)->view == view
+                && getenv("LAGFX_DISABLE_SELF_SNAPSHOT") == NULL) {
+                lagfx_vk_iosurface_t *snap = lagfx_guest_texture_snapshot(
+                    vk, (lagfx_vk_iosurface_t *)task->draw_target,
+                    (VkImageLayout)task->draw_target_layout);
+                if (snap) {
+                    view = snap->view;
+                    lay = snap->layout;
+                    tex_src = "snapshot";
+                }
+            }
+            {
+                /* LAGFX_BINDLOG=<pipeline ref>: how each texture binding of
+                 * that pipeline resolved. */
+                const char *bl = getenv("LAGFX_BINDLOG");
+                if (bl && (strcmp(bl, "all") == 0 || strtoul(bl, NULL, 0) == task->pending_pipeline.reference))
+                    LAGFX_WARN("BINDLOG pipe=0x%x tex binding %u: metal idx %d -> slot %u "
+                               "ref 0x%x via %s (ordinal %u, %u valid slots)",
+                               task->pending_pipeline.reference, binding_no[i],
+                               (int)task->pending_pipeline.spv_binding_metal[i], tex_idx,
+                               tref, tex_src, tex_ord - 1u, n_valid_tex);
+            }
             if (view == VK_NULL_HANDLE) {
                 /* M2 UIRENDER: rather than SKIP a loginwindow UI draw whose sampled
                  * texture is unresolved (→ black screen, the whole UI vanishes),
@@ -389,6 +415,7 @@ VkDescriptorSet lagfx_build_draw_descriptor_set(
         if (binding_kind[i] != (uint8_t)LAGFX_SPV_BINDING_STORAGE_BUFFER) continue;
         uint8_t data[LAGFX_DRAW_DS_BUF_SZ];
         bool have = false;
+        uint32_t bound_ref = 0; uint64_t bound_off = 0;   /* LAGFX_BINDLOG */
         /* M2: the bound buffer's DECLARED size (from the placement descriptor's
          * matched range). The VkBuffer is sized to this so a shader's dynamic
          * index stays in bounds (no lavapipe OOB). Default to the read size. */
@@ -506,6 +533,7 @@ VkDescriptorSet lagfx_build_draw_descriptor_set(
                     && lagfx_read_virtual_besteffort(p, task, va + bs->offset,
                                                      LAGFX_DRAW_DS_BUF_SZ, data)) {
                     have = true;
+                    bound_ref = bs->ref; bound_off = bs->offset;
                     /* M2: `va` points to the placement DESCRIPTOR ((size,PFN)
                      * range pairs), not the buffer content — binding it gives
                      * the shader garbage. The real data lives at PFN<<12 read
@@ -751,6 +779,19 @@ VkDescriptorSet lagfx_build_draw_descriptor_set(
             }
         } else {
             LAGFX_LOG("P6b bind#%u slot=%u NO guest data (zero buffer)", binding_no[i], slot);
+        }
+        {
+            const char *bl = getenv("LAGFX_BINDLOG");
+            if (bl && (strcmp(bl, "all") == 0 || strtoul(bl, NULL, 0) == task->pending_pipeline.reference)) {
+                char hx[3 * 32 + 1] = "-"; size_t hn = 0;
+                for (uint32_t k = 0; have && k < 32u; k++)
+                    hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", data[k]);
+                LAGFX_WARN("BINDLOG pipe=0x%x buf binding %u: metal idx %d slot %u ref 0x%x "
+                           "off %llu have=%d data: %s", task->pending_pipeline.reference,
+                           binding_no[i], (int)task->pending_pipeline.spv_binding_metal[i], slot,
+                           bound_ref, (unsigned long long)bound_off,
+                           have, hx);
+            }
         }
         VkBuffer vb = VK_NULL_HANDLE; VkDeviceMemory vm = VK_NULL_HANDLE;
         /* Buffer sized to the declared range (bind_alloc_sz, ≥ BUF_SZ): real

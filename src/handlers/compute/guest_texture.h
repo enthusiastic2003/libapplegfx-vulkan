@@ -47,6 +47,14 @@ lagfx_vk_iosurface_t *lagfx_guest_texture_source(lagfx_protocol_t *p,
                                                  struct lagfx_vk_state *vk,
                                                  uint32_t ref);
 
+/* Copy `ios` (currently in `layout`, which it is left in) into its reused
+ * snapshot image and return the snapshot, ready to sample: for a draw that
+ * samples the image it renders into, which Vulkan can't do in place. NULL on
+ * failure. */
+lagfx_vk_iosurface_t *lagfx_guest_texture_snapshot(struct lagfx_vk_state *vk,
+                                                   lagfx_vk_iosurface_t *ios,
+                                                   VkImageLayout layout);
+
 /* Clear the whole image to rgba (one-shot submit, waits). */
 bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                                const double rgba[4]);

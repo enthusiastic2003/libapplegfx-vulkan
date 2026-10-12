@@ -375,6 +375,86 @@ static bool submit_wait(struct lagfx_vk_state *vk, VkCommandBuffer cb) {
     return ok;
 }
 
+lagfx_vk_iosurface_t *lagfx_guest_texture_snapshot(struct lagfx_vk_state *vk,
+                                                   lagfx_vk_iosurface_t *ios,
+                                                   VkImageLayout layout) {
+    if (!vk || !ios || ios->image == VK_NULL_HANDLE || layout == VK_IMAGE_LAYOUT_UNDEFINED)
+        return NULL;
+    lagfx_vk_iosurface_t *snap = ios->snapshot;
+    if (snap && (snap->width != ios->width || snap->height != ios->height
+                 || snap->format != ios->format)) {
+        lagfx_vk_iosurface_destroy(vk, snap);
+        snap = ios->snapshot = NULL;
+    }
+    if (!snap) {
+        if (lagfx_vk_iosurface_create_vk(vk, ios->width, ios->height, ios->format, &snap)
+                != LAGFX_OK || !snap)
+            return NULL;
+        ios->snapshot = snap;
+    }
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (lagfx_vk_cmdbuf_alloc(vk, &cb) != LAGFX_OK) return NULL;
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cb, &bi);
+    VkImageSubresourceRange range = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1,
+    };
+    VkImageMemoryBarrier pre[2] = {
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = layout,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = ios->image,
+            .subresourceRange = range,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            /* fully overwritten */
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = snap->image,
+            .subresourceRange = range,
+        },
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 2, pre);
+    VkImageCopy region = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .extent = { ios->width, ios->height, 1 },
+    };
+    vkCmdCopyImage(cb, ios->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snap->image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    VkImageMemoryBarrier post[2] = { pre[0], pre[1] };
+    post[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    post[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    post[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    post[0].newLayout = layout;
+    post[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    post[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    post[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    post[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 0, NULL, 0, NULL, 2, post);
+    vkEndCommandBuffer(cb);
+    bool ok = submit_wait(vk, cb);
+    lagfx_vk_cmdbuf_free(vk, cb);
+    if (!ok) return NULL;
+    snap->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    return snap;
+}
+
 bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                                const double rgba[4]) {
     if (!vk || !ios || ios->image == VK_NULL_HANDLE) return false;

@@ -973,7 +973,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
      * under target_ref so the texture-bind path finds it when sampled. The
      * scanout (target_ref==0) keeps using display->rt. Gated; on any failure,
      * fall back to display->rt (never crash). */
-    lagfx_vk_render_target_t perpass_rt;
+    lagfx_vk_render_target_t perpass_rt = {0};
     lagfx_vk_render_target_t *active_rt = &display->rt;
     /* M2a SCANOUT-ASSEMBLY (LAGFX_M2_ASMBLIT): track the per-pass surface this
      * draw renders into, so that after a successful per-pass draw we can blit it
@@ -1113,6 +1113,8 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
             perpass_tref = tref;
         }
     }
+    task->draw_target = (active_rt == &perpass_rt) ? (void *)perpass_ios : NULL;
+    task->draw_target_layout = (uint32_t)perpass_rt.layout;
     bool resource_using = task->pending_pipeline.translated
                           && task->pending_pipeline.descriptor_set_layout != 0
                           && task->pending_pipeline.pipeline_layout != 0;
@@ -1403,6 +1405,35 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
         LAGFX_WARN("DRAWRES t%u tgt=0x%x pipe=0x%x path=%s st=%d", task->id,
                    task->render_pass_desc.target_ref, task->pending_pipeline.reference,
                    drawpath, (int)st);
+
+    /* LAGFX_DRAWCHECK: read the target back after each draw and log how much
+     * of it is non-black, plus the centre pixel (slow; diagnosis only). */
+    if (getenv("LAGFX_DRAWCHECK") && active_rt == &perpass_rt && perpass_ios
+        && lagfx_metal_pixel_format_bytes(80u) == 4u) {
+        size_t bytes = (size_t)perpass_rt.width * perpass_rt.height * 4u, stride = 0;
+        uint8_t *px = malloc(bytes);
+        if (px && lagfx_vk_render_target_readback(dev_with_vk->vk, &perpass_rt, px, bytes,
+                                                  &stride) == LAGFX_OK) {
+            perpass_ios->layout = perpass_rt.layout;
+            if (stride == 0u) stride = (size_t)perpass_rt.width * 4u;
+            unsigned nz = 0, n = 0, nza = 0;
+            for (uint32_t y = 0; y < perpass_rt.height; y += 8u)
+                for (uint32_t x = 0; x < perpass_rt.width; x += 8u) {
+                    const uint8_t *q = px + (size_t)y * stride + (size_t)x * 4u;
+                    n++;
+                    nz += (q[0] | q[1] | q[2]) != 0u;
+                    nza += q[3] != 0u;
+                }
+            const uint8_t *c = px + (size_t)(perpass_rt.height / 2u) * stride
+                               + (size_t)(perpass_rt.width / 2u) * 4u;
+            LAGFX_WARN("DRAWCHECK t%u tgt=0x%x pipe=0x%x %ux%u fmt=%d nonblack=%u%% alpha=%u%% "
+                       "centre=%02x%02x%02x%02x", task->id, task->render_pass_desc.target_ref,
+                       task->pending_pipeline.reference, perpass_rt.width, perpass_rt.height,
+                       (int)perpass_rt.format, n ? 100u * nz / n : 0u, n ? 100u * nza / n : 0u,
+                       c[0], c[1], c[2], c[3]);
+        }
+        free(px);
+    }
 
     /* POOR-MAN'S TILE COMPOSITOR (KICKOFF-scanout-composite-reliability).
      *
