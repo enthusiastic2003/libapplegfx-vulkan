@@ -27,6 +27,7 @@
  */
 
 #include "blit_inner_ops.h"
+#include "guest_texture.h"
 
 #include "common/le.h"
 #include "common/log.h"
@@ -338,3 +339,35 @@ int lagfx_blit_inner_dispatch(lagfx_protocol_t *p,
 }
 
 
+
+int lagfx_blit_inner_dispatch_task(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                   uint32_t opcode, const uint8_t *payload, size_t len) {
+    if (getenv("LAGFX_DUMP_BLIT")) {
+        char hx[3 * 96 + 1];
+        size_t hn = 0;
+        for (size_t k = 0; k < len && k < 96u; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", payload[k]);
+        LAGFX_WARN("BLIT task=%u op=0x%03x len=%zu: %s", task ? task->id : 0u,
+                   (unsigned)opcode, len, hx);
+    }
+#ifdef LAGFX_HAVE_VULKAN
+    if (opcode == 0x12cu && task && len >= 0x58u) {
+        /* copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:
+         * sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:
+         * fields matched against kat blit-probe's distinct values. */
+        lagfx_blit_buffer_to_texture_t c = {
+            .buffer_ref = lagfx_le32(payload + 0x00), .texture_ref = lagfx_le32(payload + 0x04),
+            .offset = lagfx_le64(payload + 0x08), .bytes_per_row = lagfx_le64(payload + 0x10),
+            .bytes_per_image = lagfx_le64(payload + 0x18),
+            .width = (uint32_t)lagfx_le64(payload + 0x20), .height = (uint32_t)lagfx_le64(payload + 0x28),
+            .depth = (uint32_t)lagfx_le64(payload + 0x30),
+            .origin_x = (uint32_t)lagfx_le64(payload + 0x38), .origin_y = (uint32_t)lagfx_le64(payload + 0x40),
+            .origin_z = (uint32_t)lagfx_le64(payload + 0x48),
+            .slice = lagfx_le16(payload + 0x50), .level = lagfx_le16(payload + 0x52),
+        };
+        (void)lagfx_guest_texture_copy_from_buffer(p, task, &c);
+        return 0;
+    }
+#endif
+    return lagfx_blit_inner_dispatch(p, opcode, payload, len);
+}

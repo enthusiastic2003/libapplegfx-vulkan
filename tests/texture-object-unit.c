@@ -33,6 +33,9 @@ static void make(uint8_t *b, uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
     put32(b, 0x44, 1);
     b[0x54] = 0x42;
     b[0x55] = (uint8_t)usage;
+    put16(b, 0x64, 1);
+    put16(b, 0x66, 1);
+    put16(b, 0x68, 1);
     put16(b, 0x56, fmt);
     put32(b, 0x58, w);
     put32(b, 0x5c, h);
@@ -111,6 +114,15 @@ int main(void) {
     CHECK(t.bytes_per_row == 256 && t.pixel_format == 80 && t.usage == 5);
     CHECK(t.storage == LAGFX_STORAGE_MANAGED);
     CHECK(t.n_place == 1 && t.place[0].size == 0x4000 && t.place[0].page == 0x101);
+
+    CHECK(t.texture_type == 2 && t.array_length == 1 && t.mip_levels == 1 && t.sample_count == 1);
+
+    /* a 1D array of 3 layers (WindowServer's colour lookup table shape) */
+    make(b, 16384, 1, 65536, 55, 1, 0, 0x30000, 0x1a9a);
+    b[0x54] = 0x41;
+    put16(b, 0x68, 3);
+    CHECK(lagfx_parse_texture_object(b, sizeof b, &t));
+    CHECK(t.texture_type == 1 && t.array_length == 3 && t.pixel_format == 55 && t.width == 16384);
 
     make(b, 48, 32, 192, 70, 4, 2, 0x2000, 0x2a0);
     CHECK(lagfx_parse_texture_object(b, sizeof b, &t));

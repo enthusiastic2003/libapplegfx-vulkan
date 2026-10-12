@@ -26,6 +26,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "protocol/state.h"
+
 typedef struct lagfx_protocol lagfx_protocol_t;
 
 int lagfx_blit_inner_dispatch(lagfx_protocol_t *p,
@@ -33,5 +35,10 @@ int lagfx_blit_inner_dispatch(lagfx_protocol_t *p,
                               const uint8_t    *payload,
                               size_t            len);
 
+
+/* Same, with the task whose command buffer carries the command (blit
+ * commands in encoder-type-2 segments). */
+int lagfx_blit_inner_dispatch_task(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                   uint32_t opcode, const uint8_t *payload, size_t len);
 
 #endif /* LAGFX_HANDLERS_COMPUTE_BLIT_INNER_OPS_H */

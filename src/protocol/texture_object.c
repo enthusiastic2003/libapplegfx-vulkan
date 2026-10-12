@@ -26,6 +26,10 @@ bool lagfx_parse_texture_object(const uint8_t *b, size_t len, lagfx_texture_obje
     out->usage         = b[0x55];
     out->pixel_format  = rd16(b + 0x56);
     out->storage       = (rd16(b + 0x6a) >> 4) & 0xfu;
+    out->texture_type  = b[0x54] >= 0x40u ? b[0x54] - 0x40u : 2u;
+    out->mip_levels    = rd16(b + 0x64);
+    out->sample_count  = rd16(b + 0x66);
+    out->array_length  = rd16(b + 0x68);
 
     /* The dimensions are stored twice; disagreement means this isn't the
      * layout we know. */
@@ -57,7 +61,11 @@ bool lagfx_parse_iosurface_texture_object(const uint8_t *b, size_t len,
     out->height       = rd32(b + 0x1c);
     out->depth        = rd32(b + 0x20);
     out->storage      = (rd16(b + 0x2a) >> 4) & 0xfu;
-    if (out->surface_id == 0u || b[0x14] != 0x42u) return false;
+    out->texture_type = b[0x14] >= 0x40u ? b[0x14] - 0x40u : 2u;
+    out->mip_levels   = rd16(b + 0x24);
+    out->sample_count = rd16(b + 0x26);
+    out->array_length = rd16(b + 0x28);
+    if (out->surface_id == 0u || (b[0x14] & 0xf0u) != 0x40u) return false;
     if (out->width == 0u || out->height == 0u || out->width > 16384u || out->height > 16384u)
         return false;
     if (out->pixel_format == 0u || out->storage > LAGFX_STORAGE_PRIVATE) return false;

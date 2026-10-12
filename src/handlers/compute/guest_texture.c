@@ -603,6 +603,54 @@ static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                    ref, task->id);
 }
 
+bool lagfx_guest_texture_copy_from_buffer(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                          const lagfx_blit_buffer_to_texture_t *c) {
+    lagfx_texture_object_t obj;
+    const lagfx_task_entry_t *mem_task;
+    if (!p || !task || !c || !read_texture_object(p, task, c->texture_ref, &obj, &mem_task))
+        return false;
+    if (c->level != 0u) {
+        LAGFX_WARN("guest_texture: copy into level %u of texture 0x%x not supported", c->level,
+                   c->texture_ref);
+        return false;
+    }
+    uint32_t bpp = lagfx_metal_pixel_format_bytes(obj.pixel_format);
+    if (!bpp) return false;
+    /* the source buffer: one {size, page} entry (m2v/m2v_draw.c) */
+    uint8_t type = 0, d[16];
+    uint64_t va = 0, gpa = 0;
+    if (!lagfx_resolve_object_data(p, task, c->buffer_ref, &type, &va, &gpa) || va == 0u
+        || !lagfx_task_read_virtual(p, task, va, sizeof d, d))
+        return false;
+    uint64_t bsize = lagfx_le64(d), bva = (uint64_t)lagfx_le32(d + 8) << 12;
+    uint64_t row = (uint64_t)c->width * bpp;
+    uint64_t slice_stride = (uint64_t)obj.bytes_per_row * obj.height;   /* level 0 image */
+    uint8_t *tmp = malloc((size_t)row);
+    if (!tmp) return false;
+    bool ok = true;
+    for (uint32_t z = 0; z < c->depth && ok; z++)
+        for (uint32_t y = 0; y < c->height && ok; y++) {
+            uint64_t so = c->offset + (uint64_t)z * c->bytes_per_image + (uint64_t)y * c->bytes_per_row;
+            if (so + row > bsize) { ok = false; break; }
+            uint64_t layer = obj.texture_type == 7u ? c->origin_z + z : c->slice + z;
+            uint64_t to = layer * slice_stride + (uint64_t)(c->origin_y + y) * obj.bytes_per_row
+                        + (uint64_t)c->origin_x * bpp;
+            ok = lagfx_task_read_virtual(p, task, bva + so, (uint32_t)row, tmp)
+                 && write_texture_memory(p, mem_task, &obj, to, tmp, row);
+        }
+    free(tmp);
+    /* the host image is stale now */
+    lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, c->texture_ref, task->id);
+    if (e) {
+        e->backing_dirty = 1u;
+        if (e->host_handle) ((lagfx_vk_iosurface_t *)e->host_handle)->gpu_drawn = 0u;
+    }
+    if (!ok)
+        LAGFX_WARN("guest_texture: copy from buffer 0x%x into texture 0x%x failed", c->buffer_ref,
+                   c->texture_ref);
+    return ok;
+}
+
 void lagfx_guest_texture_writeback(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                                    struct lagfx_vk_state *vk) {
     if (!p || !task || !vk) return;

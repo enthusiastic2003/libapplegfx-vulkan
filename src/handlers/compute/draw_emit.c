@@ -899,8 +899,10 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                 tgt->layout = (VkImageLayout)lay;
                 tgt->gpu_drawn = 1u;
                 if (getenv("LAGFX_DRAWMAP"))
-                    LAGFX_WARN("DRAWRES t%u tgt=0x%x pipe=0x%x path=m2v st=0", task->id,
-                               task->render_pass_desc.target_ref, task->pending_pipeline.reference);
+                    LAGFX_WARN("DRAWRES t%u tgt=0x%x pipe=0x%x path=m2v st=0 prim=%u start=%d count=%u inst=%u",
+                               task->id, task->render_pass_desc.target_ref,
+                               task->pending_pipeline.reference, task->pending_draw.primitive_type,
+                               task->pending_draw.base_vertex, count, task->pending_draw.instance_count);
                 if (getenv("LAGFX_DRAWCHECK")) {
                     lagfx_vk_render_target_t crt;
                     size_t bytes = (size_t)tgt->width * tgt->height * 4u, stride = 0;

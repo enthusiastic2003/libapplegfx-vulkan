@@ -225,7 +225,13 @@ static size_t inner_walk_segment(lagfx_protocol_t *p,
                 /* Render — dispatch into the 96-entry render inner-op
                  * table (render_inner_ops.c). opcode 0x1a emits the
                  * canonical Stage 20% sighting line. */
-                lagfx_render_inner_dispatch(p, opcode_full & 0xffffu, body, body_len);
+                /* Blit encoder commands (0x12c..0x143) arrive in these
+                 * segments too (kat blit-copy's copyFromBuffer:toTexture: is
+                 * 0x12c here); the render table doesn't know them. */
+                if ((opcode_full & 0xffffu) >= 0x12cu && (opcode_full & 0xffffu) <= 0x143u)
+                    lagfx_blit_inner_dispatch_task(p, task, opcode_full & 0xffffu, body, body_len);
+                else
+                    lagfx_render_inner_dispatch(p, opcode_full & 0xffffu, body, body_len);
                 break;
 
             case 4u: {

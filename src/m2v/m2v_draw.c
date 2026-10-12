@@ -31,6 +31,7 @@
 #include "protocol/vertex_descriptor.h"
 #include "vulkan/command.h"
 #include "vulkan/instance.h"
+#include "vulkan/render_target.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -369,6 +370,144 @@ static const neutral_img_t *neutral_image_any(struct lagfx_vk_state *vk, uint32_
     if (vkCreateImageView(vk->device, &vci, NULL, &n.view) != VK_SUCCESS) return NULL;
     g_nimg[g_nnimg] = n;
     return &g_nimg[g_nnimg++];
+}
+
+/* Textures that aren't single-layer 2D (1D, arrays, 3D, cubes): an image of
+ * their own type and layers, contents uploaded once from guest memory (all
+ * layers, back to back), cached by (task, object, memory). */
+typedef struct {
+    uint32_t task, ref;
+    uint64_t page;
+    VkImage image;
+    VkDeviceMemory mem;
+    VkFormat format;
+    uint32_t layers;
+    uint32_t gen;            /* task command buffer the contents were read for */
+} other_tex_t;
+
+static other_tex_t g_other[64];
+static uint32_t g_nother;
+
+static const other_tex_t *other_texture(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                        struct lagfx_vk_state *vk, uint32_t ref) {
+    lagfx_texture_object_t o;
+    if (!lagfx_guest_texture_info(p, task, ref, &o) || !o.n_place || o.surface_id) return NULL;
+    other_tex_t *cached = NULL;
+    for (uint32_t i = 0; i < g_nother; i++)
+        if (g_other[i].task == task->id && g_other[i].ref == ref && g_other[i].page == o.place[0].page)
+            cached = &g_other[i];
+    /* contents are re-read once per command buffer: the guest may fill the
+     * texture after creating it */
+    if (cached && cached->gen == task->cmdbuf_gen + 1u) return cached;
+    if (!cached && g_nother >= 64u) return NULL;
+    uint32_t bpp = lagfx_metal_pixel_format_bytes(o.pixel_format);
+    VkFormat fmt = lagfx_metal_pixel_format_to_vk(o.pixel_format);
+    if (!bpp || fmt == VK_FORMAT_UNDEFINED) return NULL;
+    VkImageType itype = VK_IMAGE_TYPE_2D;
+    VkImageCreateFlags flags = 0;
+    uint32_t layers = o.array_length ? o.array_length : 1u;
+    uint32_t depth = 1u;
+    switch (o.texture_type) {
+    case 0: case 1: itype = VK_IMAGE_TYPE_1D; break;                       /* 1D, 1D array */
+    case 5: case 6: flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT; layers *= 6u; break;
+    case 7: itype = VK_IMAGE_TYPE_3D; depth = o.depth ? o.depth : 1u; break;
+    default: break;
+    }
+    uint64_t row = (uint64_t)o.width * bpp;
+    if (o.bytes_per_row < row) return NULL;
+    uint64_t slice = (uint64_t)o.bytes_per_row * o.height;          /* one layer / depth slice */
+    uint32_t nslices = itype == VK_IMAGE_TYPE_3D ? depth : layers;
+    uint64_t total = row * o.height * nslices;
+    if (total > (64u << 20)) return NULL;
+    uint8_t *px = malloc((size_t)total);
+    if (!px) return NULL;
+    placement_t pl = { .n = 1, .size = { o.place[0].size }, .page = { o.place[0].page },
+                       .length = o.place[0].size };
+    for (uint32_t z = 0; z < nslices; z++)
+        for (uint32_t y = 0; y < o.height; y++)
+            read_buffer(p, task, &pl, z * slice + (uint64_t)y * o.bytes_per_row, row,
+                        px + ((size_t)z * o.height + y) * row);
+    if (getenv("LAGFX_SRCCHECK")) {
+        size_t nz = 0;
+        for (size_t k = 0; k < total; k++) nz += px[k] != 0u;
+        LAGFX_WARN("SRCCHECK other texture 0x%x type %u %ux%u layers %u: %zu/%llu bytes non-zero",
+                   ref, o.texture_type, o.width, o.height, layers, nz, (unsigned long long)total);
+    }
+    if (cached) {
+        /* replace the old image (no draw is in flight: draws are synchronous) */
+        vkDestroyImage(vk->device, cached->image, NULL);
+        vkFreeMemory(vk->device, cached->mem, NULL);
+        cached->image = VK_NULL_HANDLE;
+        cached->mem = VK_NULL_HANDLE;
+    }
+    other_tex_t t = { task->id, ref, o.place[0].page, VK_NULL_HANDLE, VK_NULL_HANDLE, fmt, layers,
+                      task->cmdbuf_gen + 1u };
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = itype,
+        .format = fmt, .extent = { o.width, itype == VK_IMAGE_TYPE_1D ? 1u : o.height, depth },
+        .mipLevels = 1, .arrayLayers = itype == VK_IMAGE_TYPE_3D ? 1u : layers,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    };
+    VkBuffer sb = VK_NULL_HANDLE;
+    VkDeviceMemory sm = VK_NULL_HANDLE;
+    bool ok = vkCreateImage(vk->device, &ici, NULL, &t.image) == VK_SUCCESS;
+    if (ok) {
+        VkMemoryRequirements mr;
+        vkGetImageMemoryRequirements(vk->device, t.image, &mr);
+        VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                    .allocationSize = mr.size,
+                                    .memoryTypeIndex = find_mem(vk, mr.memoryTypeBits, 0) };
+        ok = vkAllocateMemory(vk->device, &ai, NULL, &t.mem) == VK_SUCCESS
+             && vkBindImageMemory(vk->device, t.image, t.mem, 0) == VK_SUCCESS
+             && make_buffer(vk, px, total, &sb, &sm);
+    }
+    free(px);
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (ok) ok = lagfx_vk_cmdbuf_alloc(vk, &cb) == LAGFX_OK;
+    if (ok) {
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        vkBeginCommandBuffer(cb, &bi);
+        VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ici.arrayLayers };
+        VkImageMemoryBarrier b = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = t.image, .subresourceRange = range,
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &b);
+        VkBufferImageCopy c = {
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, ici.arrayLayers },
+            .imageExtent = ici.extent,
+        };
+        vkCmdCopyBufferToImage(cb, sb, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 0, NULL, 1, &b);
+        vkEndCommandBuffer(cb);
+        ok = submit_once(vk, cb);
+        lagfx_vk_cmdbuf_free(vk, cb);
+    }
+    if (sb) { vkDestroyBuffer(vk->device, sb, NULL); vkFreeMemory(vk->device, sm, NULL); }
+    if (!ok) {
+        if (t.image) vkDestroyImage(vk->device, t.image, NULL);
+        if (t.mem) vkFreeMemory(vk->device, t.mem, NULL);
+        if (cached) *cached = (other_tex_t){ 0 };
+        return NULL;
+    }
+    LAGFX_LOG("M2V: texture 0x%x (task %u) type %u %ux%ux%u layers %u uploaded", ref, task->id,
+              o.texture_type, o.width, o.height, depth, layers);
+    if (cached) {
+        *cached = t;
+        return cached;
+    }
+    g_other[g_nother] = t;
+    return &g_other[g_nother++];
 }
 
 static VkSampler neutral_sampler(struct lagfx_vk_state *vk) {
@@ -722,9 +861,11 @@ static void describe_stage(lagfx_protocol_t *p, lagfx_task_entry_t *task,
         if (!lagfx_guest_texture_info(p, task, texs[i].ref, &obj)) continue;
         s->texture_ref[s->nt] = texs[i].ref;
         s->textures[s->nt++] = (lagfx_m2v_texture_t){
-            .index = i, .texture_type = 2u /* MTLTextureType2D */, .pixel_format = obj.pixel_format,
-            .usage = obj.usage ? obj.usage : 1u, .mip_levels = 1u, .array_length = 1u,
-            .sample_count = 1u,
+            .index = i, .texture_type = obj.texture_type, .pixel_format = obj.pixel_format,
+            .usage = obj.usage ? obj.usage : 1u,
+            .mip_levels = obj.mip_levels ? obj.mip_levels : 1u,
+            .array_length = obj.array_length ? obj.array_length : 1u,
+            .sample_count = obj.sample_count ? obj.sample_count : 1u,
         };
     }
     for (uint32_t i = 0; sams && i < LAGFX_MAX_BINDING_SLOTS; i++) {
@@ -757,6 +898,34 @@ static int find_buffer(const stage_bind_t *s, uint32_t index) {
 static int find_texture(const stage_bind_t *s, uint32_t index) {
     for (uint32_t i = 0; i < s->nt; i++) if (s->textures[i].index == index) return (int)i;
     return -1;
+}
+
+/* LAGFX_SRCCHECK: read back a large texture a draw samples and log how much of
+ * it is non-black (diagnosis). */
+static void src_check(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                      lagfx_task_entry_t *task, uint32_t ref, uint32_t slot) {
+    lagfx_vk_render_target_t rt;
+    size_t bytes = (size_t)ios->width * ios->height * 4u, stride = 0;
+    uint8_t *px = malloc(bytes);
+    if (!px) return;
+    if (lagfx_vk_render_target_wrap(ios->image, ios->view, ios->memory, ios->width, ios->height,
+                                    ios->format, &rt) == LAGFX_OK) {
+        rt.layout = ios->layout;
+        if (lagfx_vk_render_target_readback(vk, &rt, px, bytes, &stride) == LAGFX_OK) {
+            ios->layout = rt.layout;
+            if (!stride) stride = (size_t)ios->width * 4u;
+            unsigned nz = 0, n = 0;
+            for (uint32_t y = 0; y < ios->height; y += 8u)
+                for (uint32_t xx = 0; xx < ios->width; xx += 8u) {
+                    const uint8_t *q = px + (size_t)y * stride + (size_t)xx * 4u;
+                    n++; nz += (q[0] | q[1] | q[2]) != 0u;
+                }
+            LAGFX_WARN("SRCCHECK pipe=0x%x slot %u ref 0x%x %ux%u nonblack=%u%% drawn=%u gen=%u/%u",
+                       task->pending_pipeline.reference, slot, ref, ios->width, ios->height,
+                       n ? 100u * nz / n : 0u, ios->gpu_drawn, ios->upload_gen, task->cmdbuf_gen);
+        }
+    }
+    free(px);
 }
 
 #define FAIL_AT(n) do { why = #n; goto out; } while (0)
@@ -865,12 +1034,31 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
         if (bl && (strcmp(bl, "all") == 0
                    || strtoul(bl, NULL, 0) == task->pending_pipeline.reference)) {
             for (int si = 0; si < 2; si++) {
-                for (uint32_t k = 0; k < sb[si].nb; k++)
-                    LAGFX_WARN("M2VBIND pipe=0x%x stage%d buffer[%u] ref=0x%x len=%llu off=%llu dev=%llx",
+                for (uint32_t k = 0; k < sb[si].nb; k++) {
+                    uint8_t head[64];
+                    read_buffer(p, task, &sb[si].placement[k], sb[si].buffers[k].offset, sizeof head, head);
+                    char hx[3 * 64 + 1];
+                    size_t hn = 0;
+                    for (uint32_t q = 0; q < 64u; q += 4u) {
+                        float f; memcpy(&f, head + q, 4);
+                        hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%g ", f);
+                        if (hn > sizeof hx - 16) break;
+                    }
+                    LAGFX_WARN("M2VBIND pipe=0x%x stage%d buffer[%u] ref=0x%x len=%llu off=%llu dev=%llx f32: %s",
                                task->pending_pipeline.reference, si, sb[si].buffers[k].index,
                                sb[si].buffer_ref[k], (unsigned long long)sb[si].buffers[k].length,
                                (unsigned long long)sb[si].buffers[k].offset,
-                               (unsigned long long)sb[si].buffers[k].device_address);
+                               (unsigned long long)sb[si].buffers[k].device_address, hx);
+                }
+                for (uint32_t k = 0; k < sb[si].ns; k++)
+                    LAGFX_WARN("M2VBIND pipe=0x%x stage%d sampler[%u] min=%u mag=%u mip=%u addr=%u/%u/%u "
+                               "normalized=%u border=%u lod=%g..%g",
+                               task->pending_pipeline.reference, si, sb[si].samplers[k].index,
+                               sb[si].samplers[k].min_filter, sb[si].samplers[k].mag_filter,
+                               sb[si].samplers[k].mip_filter, sb[si].samplers[k].s_address,
+                               sb[si].samplers[k].t_address, sb[si].samplers[k].r_address,
+                               sb[si].samplers[k].normalized, sb[si].samplers[k].border_color,
+                               (double)sb[si].samplers[k].lod_min, (double)sb[si].samplers[k].lod_max);
                 for (uint32_t k = 0; k < sb[si].nt; k++)
                     LAGFX_WARN("M2VBIND pipe=0x%x stage%d texture[%u] ref=0x%x fmt=%u",
                                task->pending_pipeline.reference, si, sb[si].textures[k].index,
@@ -963,8 +1151,31 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
                     const stage_bind_t *s = g_stage[x->stage < 2u ? x->stage : 0u];
                     int k = find_texture(s, x->slot);
                     if (k < 0) FAIL_AT(13);
+                    if (s->textures[k].texture_type != 2u || s->textures[k].array_length > 1u) {
+                        const other_tex_t *ot = other_texture(p, task, vk, s->texture_ref[k]);
+                        if (!ot || (VkFormat)x->view_format != ot->format || t.nview >= MAX_TEMP)
+                            FAIL_AT(29);
+                        uint32_t vlayers = (x->view_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY
+                                            || x->view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                            || x->view_type == VK_IMAGE_VIEW_TYPE_CUBE
+                                            || x->view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY)
+                                           ? ot->layers : 1u;
+                        VkImageViewCreateInfo vci = {
+                            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = ot->image,
+                            .viewType = (VkImageViewType)x->view_type, .format = ot->format,
+                            .components = { x->swizzle[0], x->swizzle[1], x->swizzle[2], x->swizzle[3] },
+                            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, vlayers },
+                        };
+                        if (vkCreateImageView(vk->device, &vci, NULL, &t.view[t.nview]) != VK_SUCCESS)
+                            FAIL_AT(30);
+                        view = t.view[t.nview++];
+                        lay = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        goto image_done;
+                    }
                     lagfx_vk_iosurface_t *ios = lagfx_guest_texture_source(p, task, vk, s->texture_ref[k]);
                     if (!ios) FAIL_AT(14);
+                    if (getenv("LAGFX_SRCCHECK") && ios->width >= 1024u)
+                        src_check(vk, ios, task, s->texture_ref[k], x->slot);
                     if (ios == target) {
                         ios = lagfx_guest_texture_snapshot(vk, target, (VkImageLayout)*target_layout);
                         if (!ios) FAIL_AT(15);
@@ -997,6 +1208,7 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
                                                                   : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 }
             }
+image_done:
             if (x->kind == LAGFX_M2V_W_SAMPLER || x->kind == LAGFX_M2V_W_COMBINED
                 || (x->kind == LAGFX_M2V_W_NEUTRAL && x->neutral_kind == 5u)) {
                 if (x->kind == LAGFX_M2V_W_NEUTRAL || x->sampler_kind == 2u)

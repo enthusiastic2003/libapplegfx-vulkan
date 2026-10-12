@@ -15,8 +15,12 @@
  *   +0x3c  u32  width            (repeated at +0x58)
  *   +0x40  u32  height           (repeated at +0x5c)
  *   +0x44  u32  depth
+ *   +0x54  u8   0x40 + MTLTextureType (0x41 1D array, 0x42 2D, 0x47 3D, ...)
  *   +0x55  u8   MTLTextureUsage
  *   +0x56  u16  MTLPixelFormat
+ *   +0x64  u16  mipmap level count (unconfirmed: it and +0x66 have only been 1)
+ *   +0x66  u16  sample count (unconfirmed)
+ *   +0x68  u16  array length (3 for WindowServer's 1D-array colour lookup table)
  *   +0x6a  u16  MTLResourceOptions (storage mode in bits 4..7)
  *
  * A texture made from an IOSurface (slot type 0x05) has no placement of its
@@ -58,6 +62,8 @@
 #define LAGFX_STORAGE_PRIVATE  2u
 
 typedef struct {
+    uint32_t texture_type;    /* MTLTextureType */
+    uint32_t array_length, mip_levels, sample_count;
     uint32_t width, height, depth;
     uint32_t bytes_per_row;
     uint32_t pixel_format;    /* MTLPixelFormat */

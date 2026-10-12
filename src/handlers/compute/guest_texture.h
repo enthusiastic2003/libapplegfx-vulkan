@@ -59,6 +59,20 @@ lagfx_vk_iosurface_t *lagfx_guest_texture_snapshot(struct lagfx_vk_state *vk,
 bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                                const double rgba[4]);
 
+/* A blit encoder's copyFromBuffer:...toTexture: (blit op 0x12c). */
+typedef struct {
+    uint32_t buffer_ref, texture_ref;
+    uint64_t offset, bytes_per_row, bytes_per_image;
+    uint32_t width, height, depth;
+    uint32_t origin_x, origin_y, origin_z;
+    uint32_t slice, level;
+} lagfx_blit_buffer_to_texture_t;
+
+/* Do the copy in guest memory (the texture's memory, from the buffer's) and
+ * mark the texture's host image stale. Level 0 only for now. */
+bool lagfx_guest_texture_copy_from_buffer(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                          const lagfx_blit_buffer_to_texture_t *c);
+
 /* Copy every texture marked written in this task back to guest memory
  * (CPU-visible storage modes only) and clear the marks. */
 void lagfx_guest_texture_writeback(lagfx_protocol_t *p, lagfx_task_entry_t *task,

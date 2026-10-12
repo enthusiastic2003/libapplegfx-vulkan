@@ -97,6 +97,11 @@ static NSString *const kShaderSrc =
      "    constexpr sampler s(filter::nearest, address::clamp_to_edge);\n"
      "    return t.sample(s, in.uv);\n"
      "}\n"
+     // pixel coordinates through a sampler object (as WindowServer's final pass)
+     "fragment float4 fs_tex_pixel(QOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
+     "                             sampler s [[sampler(0)]]) {\n"
+     "    return t.sample(s, in.uv * float2(t.get_width(), t.get_height()));\n"
+     "}\n"
      "fragment float4 fs_tex_sampler(QOut in [[stage_in]], texture2d<float> t [[texture(0)]],\n"
      "                               sampler s [[sampler(0)]]) {\n"
      "    return t.sample(s, in.uv);\n"
@@ -431,6 +436,31 @@ static BOOL case_tex_nearest(void) {
     return compare(px, pattern_blocks, nil);
 }
 
+// Pixel coordinates (normalizedCoordinates = NO, ClampToZero) through a sampler
+// state object, as WindowServer's final full-screen pass samples its composite.
+static BOOL case_tex_pixel(void) {
+    id<MTLTexture> src = make_texture(kPat, kPat, MTLTextureUsageShaderRead);
+    static uint8_t texels[kPat * kPat * 4];
+    fill_pattern(texels, kPat * 4);
+    [src replaceRegion:MTLRegionMake2D(0, 0, kPat, kPat) mipmapLevel:0 withBytes:texels
+           bytesPerRow:kPat * 4];
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+    sd.normalizedCoordinates = NO;
+    sd.sAddressMode = MTLSamplerAddressModeClampToZero;
+    sd.tAddressMode = MTLSamplerAddressModeClampToZero;
+    id<MTLSamplerState> ss = [gDevice newSamplerStateWithDescriptor:sd];
+    static bgra_t px[kSize * kSize];
+    if (!draw_quad(make_pipeline(@"vs_quad", @"fs_tex_pixel", nil, nil),
+                   MTLClearColorMake(0, 0, 0, 1),
+                   ^(id<MTLRenderCommandEncoder> e) {
+                       [e setFragmentTexture:src atIndex:0];
+                       [e setFragmentSamplerState:ss atIndex:0];
+                   },
+                   px))
+        return NO;
+    return compare(px, pattern_blocks, nil);
+}
+
 // Bilinear filtering through a sampler state object: a 2x2 texture (black,
 // red / green, blue) stretched over the target, clamp-to-edge.
 static BOOL case_tex_linear(void) {
@@ -761,6 +791,59 @@ static BOOL case_iosurface_probe(void) {
     return YES;
 }
 
+// Name-only probe: one texture of each MTLTextureType (distinct sizes), each
+// bound as fragment texture 0 of a draw, so the host can dump their objects
+// (LAGFX_DUMP_OBJ=1) and locate the texture-type field.
+static BOOL case_type_probe(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_tri", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    static const struct { MTLTextureType type; NSUInteger w, h, d, layers; } kT[] = {
+        { MTLTextureType1D, 33, 1, 1, 1 },        { MTLTextureType1DArray, 35, 1, 1, 3 },
+        { MTLTextureType2D, 37, 5, 1, 1 },        { MTLTextureType2DArray, 39, 7, 1, 4 },
+        { MTLTextureTypeCube, 16, 16, 1, 1 },     { MTLTextureType3D, 41, 9, 6, 1 },
+    };
+    NSMutableArray *keep = [NSMutableArray array];   /* distinct object ids */
+    for (size_t i = 0; i < sizeof kT / sizeof kT[0]; i++) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+        td.textureType = kT[i].type;
+        td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        td.width = kT[i].w; td.height = kT[i].h; td.depth = kT[i].d;
+        td.arrayLength = kT[i].layers;
+        td.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> t = [gDevice newTextureWithDescriptor:td];
+        [keep addObject:t];
+        static bgra_t px[kSize * kSize];
+        draw_quad(ps, MTLClearColorMake(0, 0, 0, 1),
+                  ^(id<MTLRenderCommandEncoder> e) { [e setFragmentTexture:t atIndex:0]; }, px);
+        printf("  type %lu: %lux%lux%lu layers %lu\n", (unsigned long)kT[i].type,
+               (unsigned long)kT[i].w, (unsigned long)kT[i].h, (unsigned long)kT[i].d,
+               (unsigned long)kT[i].layers);
+    }
+    return YES;
+}
+
+// Name-only probe: blit copies with distinct non-zero fields, to decode the
+// copy commands (LAGFX_DUMP_BLIT=1 on the host).
+static BOOL case_blit_probe(void) {
+    id<MTLBuffer> b = [gDevice newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
+    memset(b.contents, 0x5a, 0x10000);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = 64; td.height = 32; td.arrayLength = 4;
+    td.mipmapLevelCount = 3;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [gDevice newTextureWithDescriptor:td];
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    // offset 16, 512 B/row, 0x1400 B/image, 20x10, slice 2, level 1, origin (3,5)
+    [blit copyFromBuffer:b sourceOffset:16 sourceBytesPerRow:512 sourceBytesPerImage:0x1400
+              sourceSize:MTLSizeMake(20, 10, 1) toTexture:t destinationSlice:2 destinationLevel:1
+       destinationOrigin:MTLOriginMake(3, 5, 0)];
+    [blit endEncoding];
+    return run_cb(cb);
+}
+
 static BOOL case_probe(void) {
     struct { NSUInteger w, h; MTLPixelFormat fmt; MTLStorageMode sm; MTLTextureUsage use; } t[] = {
         {48, 32, MTLPixelFormatRGBA8Unorm, MTLStorageModePrivate, MTLTextureUsageRenderTarget},
@@ -799,6 +882,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"blit-copy", case_blit_copy, YES},
     {"tex-nearest", case_tex_nearest, YES},
     {"tex-linear", case_tex_linear, YES},
+    {"tex-pixel", case_tex_pixel, YES},
     {"blend-alpha", case_blend_alpha, YES},
     {"blend-premul", case_blend_premul, YES},
     {"iosurface-sample", case_iosurface_sample, YES},
@@ -808,6 +892,8 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"sampler-probe", case_sampler_probe, NO},
     {"blend-probe", case_blend_probe, NO},
     {"iosurface-probe", case_iosurface_probe, NO},
+    {"type-probe", case_type_probe, NO},
+    {"blit-probe", case_blit_probe, NO},
 };
 #define kNumCases (sizeof kCases / sizeof kCases[0])
 
