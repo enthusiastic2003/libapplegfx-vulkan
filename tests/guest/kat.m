@@ -1273,6 +1273,63 @@ static BOOL case_compute(void) {
     return bad == 0;
 }
 
+// Name-only probe: the compute pipeline and device limits the driver reports
+// (Metal Performance Shaders divides by these).
+static BOOL case_compute_props(void) {
+    NSError *err = nil;
+    printf("  create[1] basic render pipeline\n"); fflush(stdout);
+    id<MTLRenderPipelineState> rps = make_pipeline(@"vs_tri", @"fs_red", nil, nil);
+    if (rps)
+        printf("  render maxTotalThreadsPerThreadgroup %lu\n",
+               (unsigned long)rps.maxTotalThreadsPerThreadgroup);
+    printf("  create[2] basic compute pipeline\n"); fflush(stdout);
+    id<MTLComputePipelineState> ps =
+        [gDevice newComputePipelineStateWithFunction:[gLib newFunctionWithName:@"k_fill"] error:&err];
+    if (!ps) { printf("  pipeline: %s\n", err.localizedDescription.UTF8String); return NO; }
+    MTLSize m = gDevice.maxThreadsPerThreadgroup;
+    printf("  threadExecutionWidth %lu, maxTotalThreadsPerThreadgroup %lu, "
+           "staticThreadgroupMemoryLength %lu\n", (unsigned long)ps.threadExecutionWidth,
+           (unsigned long)ps.maxTotalThreadsPerThreadgroup,
+           (unsigned long)ps.staticThreadgroupMemoryLength);
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ps];
+    [enc endEncoding];
+    run_cb(cb);
+    printf("  after a command buffer: threadExecutionWidth %lu, maxTotalThreadsPerThreadgroup %lu\n",
+           (unsigned long)ps.threadExecutionWidth, (unsigned long)ps.maxTotalThreadsPerThreadgroup);
+    printf("  create[3] reflected compute pipeline\n"); fflush(stdout);
+    MTLComputePipelineReflection *reflection = nil;
+    id<MTLComputePipelineState> reflected =
+        [gDevice newComputePipelineStateWithFunction:[gLib newFunctionWithName:@"k_fill"]
+                                             options:MTLPipelineOptionArgumentInfo
+                                          reflection:&reflection error:&err];
+    if (reflected)
+        printf("  reflected pipeline: threadExecutionWidth %lu, maxTotalThreadsPerThreadgroup %lu, reflection %s\n",
+               (unsigned long)reflected.threadExecutionWidth,
+               (unsigned long)reflected.maxTotalThreadsPerThreadgroup,
+               reflection ? "yes" : "no");
+    else
+        printf("  reflected pipeline: %s\n", err.localizedDescription.UTF8String);
+    printf("  create[4] descriptor-hinted compute pipeline (max=256)\n"); fflush(stdout);
+    MTLComputePipelineDescriptor *cpd = [MTLComputePipelineDescriptor new];
+    cpd.computeFunction = [gLib newFunctionWithName:@"k_fill"];
+    cpd.maxTotalThreadsPerThreadgroup = 256;
+    id<MTLComputePipelineState> described =
+        [gDevice newComputePipelineStateWithDescriptor:cpd options:MTLPipelineOptionNone
+                                             reflection:nil error:&err];
+    if (described)
+        printf("  descriptor max=256: threadExecutionWidth %lu, maxTotalThreadsPerThreadgroup %lu\n",
+               (unsigned long)described.threadExecutionWidth,
+               (unsigned long)described.maxTotalThreadsPerThreadgroup);
+    else
+        printf("  descriptor max=256: %s\n", err.localizedDescription.UTF8String);
+    printf("  device maxThreadsPerThreadgroup %lux%lux%lu, maxThreadgroupMemoryLength %lu\n",
+           (unsigned long)m.width, (unsigned long)m.height, (unsigned long)m.depth,
+           (unsigned long)gDevice.maxThreadgroupMemoryLength);
+    return YES;
+}
+
 // Not a pass/fail case: draws with known samplers so the host-side dumps
 // (LAGFX_DUMP_AIR_GLOBALS=1 for constexpr samplers, LAGFX_DUMP_OBJ=1 for
 // sampler state objects) can be matched to the settings.
@@ -1510,6 +1567,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"tex-update", case_tex_update, YES},
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
+    {"compute-props", case_compute_props, NO},
     {"sampler-probe", case_sampler_probe, NO},
     {"blend-probe", case_blend_probe, NO},
     {"iosurface-probe", case_iosurface_probe, NO},

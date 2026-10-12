@@ -34,6 +34,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* Sanity cap matches the legacy drainer. 4 KiB per command is well
  * above any single legitimate macOS command we've seen. */
@@ -67,6 +68,15 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
     LAGFX_TRACE("ch0 dispatch: opcode=0x%04x len=%u stamp=0x%08x",
                 hdr->opcode, hdr->length, hdr->stamp);
 
+    if (getenv("LAGFX_DUMP_ALLCMD") && hdr->opcode != 0x37u) {
+        char hx[3 * 32 + 1];
+        size_t hn = 0;
+        for (uint32_t k = 0; hdr->payload && k < hdr->payload_size && k < 32u; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", hdr->payload[k]);
+        hx[hn] = 0;
+        LAGFX_WARN("ALLCMD ch0 op=0x%02x ch=%u len=%u: %s", (unsigned)hdr->opcode,
+                   (unsigned)p->current_chan_id, (unsigned)hdr->payload_size, hx);
+    }
     switch (hdr->opcode) {
         /* Task management */
         case LAGFX_OP_DEFINE_TASK2:
@@ -488,7 +498,9 @@ size_t channel_0_dispatcher_drain(lagfx_protocol_t *p) {
             LAGFX_TRACE("ch0 drain: bytes[%u] %s", dump_len, hexline);
         }
 
+        p->current_cmd_header_gpa = hdr_gpa;
         dispatch_command(p, &hdr);
+        p->current_cmd_header_gpa = 0u;
 
         /* Every root-channel command unconditionally signals its
          * stamp on completion (see paravirt-re

@@ -520,6 +520,8 @@ lagfx_handler_status_t lagfx_compute_exec_cmdbuf(lagfx_protocol_t *p, const lagf
     if (hdr->payload_size == 8) {
         uint32_t task_id = lagfx_le32(hdr->payload);
         LAGFX_TRACE("CmdExecIndirect2: minimal query payload taskID=%u", task_id);
+        if (getenv("LAGFX_DUMP_ALLCMD"))
+            LAGFX_WARN("ALLCMD exec8 task=%u word1=0x%08x", task_id, lagfx_le32(hdr->payload + 4));
         return LAGFX_HANDLER_OK;
     }
 

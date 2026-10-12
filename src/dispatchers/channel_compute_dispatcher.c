@@ -33,12 +33,77 @@
 #include "protocol/object_resolver.h"
 #include "handlers/handlers.h"
 #include "handlers/iosurface/iosurface.h"
+#include "handlers/compute/task_translate.h"
 
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 
-/* Phase 6b: Wire data captured 2026-05-28 showed 0x25
- * CmdSetObjectAndPlacementList payload is `{count: u32, objectId: u32}`
+/* LAGFX_DUMP_CHEV=1: hex-dump channel events (0x34..0x36) and object lists
+ * (0x25) at warn level. */
+static void dump_chev(const lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr, const char *what) {
+    if (!getenv("LAGFX_DUMP_CHEV") || !hdr->payload) return;
+    char hx[3 * 48 + 1];
+    size_t hn = 0;
+    for (uint32_t k = 0; k < hdr->payload_size && k < 48u; k++)
+        hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", hdr->payload[k]);
+    hx[hn] = 0;
+    LAGFX_WARN("CHEV %s op=0x%02x ch=%u stamp=0x%08x len=%u: %s", what, (unsigned)hdr->opcode,
+               (unsigned)p->current_chan_id, hdr->stamp, (unsigned)hdr->payload_size, hx);
+}
+
+/* Resolve only the object named by 0x25 and dump its declared bytes.  This is
+ * a bounded object-table lookup, not a guest-memory scan. */
+static void dump_registered_pipeline(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                     uint32_t object_id, const lagfx_cmd_header_t *hdr) {
+    if (!getenv("LAGFX_PIPE_CREATE_TRACE") || !task) return;
+
+    uint8_t type = 0;
+    uint64_t va = 0, gpa = 0;
+    if (!lagfx_resolve_object_data(p, task, object_id, &type, &va, &gpa) || !va) {
+        LAGFX_WARN("PSOREG unresolved t%u obj=0x%x stamp=0x%08x ch=%u",
+                   task->id, object_id, hdr->stamp, (unsigned)p->current_chan_id);
+        return;
+    }
+    LAGFX_WARN("PSOREG slot t%u obj=0x%x type=0x%02x va=0x%llx gpa=0x%llx "
+               "stamp=0x%08x ch=%u",
+               task->id, object_id, type, (unsigned long long)va,
+               (unsigned long long)gpa, hdr->stamp, (unsigned)p->current_chan_id);
+    if (type != LAGFX_APV_TYPE_PIPELINE) return;
+
+    uint8_t head[16] = {0};
+    if (!lagfx_task_read_virtual(p, task, va, sizeof head, head)) {
+        LAGFX_WARN("PSOREG unreadable t%u obj=0x%x va=0x%llx",
+                   task->id, object_id, (unsigned long long)va);
+        return;
+    }
+    uint32_t declared = lagfx_le32(head + 4);
+    if (declared < 16u || declared > 512u) declared = 16u;
+    uint8_t blob[512] = {0};
+    if (!lagfx_task_read_virtual(p, task, va, declared, blob)) return;
+
+    p->diag.pso_reg_serial++;
+    p->diag.pso_reg_task = task->id;
+    p->diag.pso_reg_object = object_id;
+    p->diag.pso_reg_stamp = hdr->stamp;
+    p->diag.pso_reg_channel = p->current_chan_id;
+    LAGFX_WARN("PSOREG #%u t%u obj=0x%x slotType=0x%02x objKind=0x%x declared=%u "
+               "va=0x%llx gpa=0x%llx stamp=0x%08x ch=%u",
+               p->diag.pso_reg_serial, task->id, object_id, type,
+               lagfx_le32(blob), declared, (unsigned long long)va,
+               (unsigned long long)gpa, hdr->stamp, (unsigned)p->current_chan_id);
+    for (uint32_t off = 0; off < declared; off += 32u) {
+        uint32_t row = declared - off < 32u ? declared - off : 32u;
+        char hx[3 * 32 + 1]; size_t hn = 0;
+        for (uint32_t k = 0; k < row; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", blob[off + k]);
+        hx[hn] = 0;
+        LAGFX_WARN("PSOREG #%u +%03x: %s", p->diag.pso_reg_serial, off, hx);
+    }
+}
+
+/* Phase 6b: 0x25 CmdSetObjectAndPlacementList payload is
+ * `{taskId: u32, objectId: u32}`
  * (see paravirt-re/library/apv-object-entry-parser-scoping-2026-05-17.md).
  * Insert the objectId into the per-task active-objects registry so
  * op_0x74 SetRenderPipelineState can query it before falling back to
@@ -71,6 +136,84 @@ register_active_object(lagfx_task_entry_t *task, uint32_t object_id) {
  */
 #define LAGFX_COMPUTE_RING_SIZE  0x10000u
 
+/* CmdGetComputeInfo (child opcode 0x3b) writes keyed u32 pairs into a
+ * task-virtual reply buffer.  The request's count is capacity, not the number
+ * of keys the host must invent; terminate the three known Tahoe keys with a
+ * zero pair when there is room. */
+static bool
+write_task_virtual(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                   uint64_t va, const uint8_t *src, uint32_t len) {
+    if (!p || !task || !src || !p->dev) return false;
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    if (!dev->desc.shell.write_memory) return false;
+
+    uint32_t done = 0;
+    while (done < len) {
+        uint64_t cur = va + done;
+        uint32_t chunk = 0x1000u - (uint32_t)(cur & 0xfffu);
+        if (chunk > len - done) chunk = len - done;
+        uint64_t gpa = 0;
+        if (!lagfx_task_translate(p, task, cur, &gpa)
+            || !dev->desc.shell.write_memory(dev->desc.shell.opaque, gpa,
+                                              chunk, src + done))
+            return false;
+        done += chunk;
+    }
+    return true;
+}
+
+static void
+reply_compute_info(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
+    if (!hdr->payload || hdr->payload_size < 24u) {
+        LAGFX_WARN("compute: CmdGetComputeInfo short payload=%u",
+                   (unsigned)hdr->payload_size);
+        return;
+    }
+
+    const uint32_t task_id = lagfx_le32(hdr->payload + 0);
+    const uint32_t pipeline_ref = lagfx_le32(hdr->payload + 4);
+    const uint32_t key_table_len = lagfx_le32(hdr->payload + 8);
+    const uint32_t capacity = lagfx_le32(hdr->payload + 12);
+    const uint64_t reply_va = lagfx_le64(hdr->payload + 16);
+    lagfx_task_entry_t *task = lagfx_protocol_find_task(p, task_id);
+    if (!task || reply_va == 0u || capacity == 0u) {
+        LAGFX_WARN("compute: CmdGetComputeInfo invalid task=%u pipe=0x%x "
+                   "keys=%u capacity=%u reply=0x%llx",
+                   task_id, pipeline_ref, key_table_len, capacity,
+                   (unsigned long long)reply_va);
+        return;
+    }
+
+    /* Metal pipeline properties.  Width 32 is the virtual Apple SIMD ABI.
+     * 512 is conservative until per-kernel reflection supplies an exact
+     * maximum; zero static memory is valid for the currently observed MPS
+     * kernels and is preferable to leaving the property undefined. */
+    static const struct { uint32_t key, value; } caps[] = {
+        { 1u, 512u }, /* maxTotalThreadsPerThreadgroup */
+        { 3u,  32u }, /* threadExecutionWidth */
+        { 4u,   0u }, /* staticThreadgroupMemoryLength */
+    };
+    uint8_t reply[32] = {0}; /* three pairs plus terminating zero pair */
+    uint32_t wrote = 0;
+    for (uint32_t i = 0; i < sizeof caps / sizeof caps[0]; i++) {
+        if (caps[i].key >= key_table_len || wrote >= capacity) continue;
+        lagfx_put_le32(reply + wrote * 8u, caps[i].key);
+        lagfx_put_le32(reply + wrote * 8u + 4u, caps[i].value);
+        wrote++;
+    }
+    uint32_t pairs = wrote + (wrote < capacity ? 1u : 0u);
+    if (!write_task_virtual(p, task, reply_va, reply, pairs * 8u)) {
+        LAGFX_WARN("compute: CmdGetComputeInfo write failed task=%u "
+                   "pipe=0x%x reply=0x%llx", task_id, pipeline_ref,
+                   (unsigned long long)reply_va);
+        return;
+    }
+    LAGFX_LOG("compute: CmdGetComputeInfo task=%u pipe=0x%x keys=%u "
+              "capacity=%u wrote=%u reply=0x%llx max=512 width=32",
+              task_id, pipeline_ref, key_table_len, capacity, wrote,
+              (unsigned long long)reply_va);
+}
+
 /* Dispatch a single command to appropriate handler. */
 static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
     if (!p || !hdr) {
@@ -79,6 +222,15 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
 
     LAGFX_TRACE("compute dispatch: opcode=0x%04x stamp=0x%08x", hdr->opcode, hdr->stamp);
 
+    if (getenv("LAGFX_DUMP_ALLCMD") && hdr->opcode != 0x37u) {
+        char hx[3 * 32 + 1];
+        size_t hn = 0;
+        for (uint32_t k = 0; hdr->payload && k < hdr->payload_size && k < 32u; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", hdr->payload[k]);
+        hx[hn] = 0;
+        LAGFX_WARN("ALLCMD compute op=0x%02x ch=%u len=%u: %s", (unsigned)hdr->opcode,
+                   (unsigned)p->current_chan_id, (unsigned)hdr->payload_size, hx);
+    }
     switch (hdr->opcode) {
         /* CmdExecIndirect2 on a compute channel — the inner stream is
          * where Metal commands live. See render-decoder-handlers.md. */
@@ -125,7 +277,7 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
             break;
         case LAGFX_OP_SET_OBJECT_PLACEMENT:   /* 0x25 CmdSetObjectAndPlacementList */
             /* Phase 6b — wire data captured 2026-05-28 confirmed
-             * payload = `{count: u32, objectId: u32}` (NOT the dual-
+             * payload = `{taskId: u32, objectId: u32}` (NOT the dual-
              * array TLV ENTRY-007 anticipated). Decode the objectId
              * and register it in the per-task active-objects set so
              * op_0x74 can query active membership before doing the
@@ -137,25 +289,20 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
             LAGFX_LOG("compute: 0x25 CmdSetObjectAndPlacementList ch=%u stamp=0x%08x payload_size=%u",
                       (unsigned)p->current_chan_id, hdr->stamp,
                       (unsigned)hdr->payload_size);
+            dump_chev(p, hdr, "objects");
             if (hdr->payload && hdr->payload_size >= 8u) {
-                uint32_t count     = lagfx_le32(hdr->payload + 0);
+                uint32_t task_id   = lagfx_le32(hdr->payload + 0);
                 uint32_t object_id = lagfx_le32(hdr->payload + 4);
-                /* Channel ID was set when the dispatcher entered the
-                 * per-channel drain; we resolve task via the current
-                 * task association on the channel (or fall back to
-                 * task[0] if not yet bound, which matches the
-                 * observed early-boot pattern). */
-                lagfx_task_entry_t *task = NULL;
-                for (uint32_t ti = 0; ti < LAGFX_MAX_TASKS; ti++) {
-                    if (p->tasks[ti].live) { task = &p->tasks[ti]; break; }
-                }
+                lagfx_task_entry_t *task = lagfx_protocol_find_task(p, task_id);
                 if (task) {
                     register_active_object(task, object_id);
-                    LAGFX_LOG("compute: 0x25 registered objectId=0x%x (count=%u) in task=%u (active=%u)",
-                              object_id, count, task->id,
+                    dump_registered_pipeline(p, task, object_id, hdr);
+                    LAGFX_LOG("compute: 0x25 registered objectId=0x%x in task=%u (active=%u)",
+                              object_id, task->id,
                               task->active_objects.count);
                 } else {
-                    LAGFX_WARN("compute: 0x25 no live task to register objectId=0x%x", object_id);
+                    LAGFX_WARN("compute: 0x25 no live task=%u for objectId=0x%x",
+                               task_id, object_id);
                 }
             }
             break;
@@ -174,6 +321,15 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
             LAGFX_LOG("compute: channel_event 0x%02x ch=%u stamp=0x%08x payload_size=%u",
                       (unsigned)hdr->opcode, (unsigned)p->current_chan_id,
                       hdr->stamp, (unsigned)hdr->payload_size);
+            dump_chev(p, hdr, "event");
+            if (getenv("LAGFX_PIPE_CREATE_TRACE") && p->diag.pso_reg_serial) {
+                LAGFX_WARN("PSOEV after=#%u reg=t%u/obj=0x%x/regstamp=0x%08x/regch=%u "
+                           "event=0x%02x stamp=0x%08x ch=%u",
+                           p->diag.pso_reg_serial, p->diag.pso_reg_task,
+                           p->diag.pso_reg_object, p->diag.pso_reg_stamp,
+                           (unsigned)p->diag.pso_reg_channel, (unsigned)hdr->opcode,
+                           hdr->stamp, (unsigned)p->current_chan_id);
+            }
             break;
         case LAGFX_OP_MAP_MEMORY_IMMEDIATE:   /* 0x39 — CmdMapMemoryImmediate */
             /* 20 B: {flag u32, gpa=PFN<<12 u64, size u64}. These establish the
@@ -259,39 +415,12 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
         }
 
         case 0x3b: {
-            /* M2c wire RE (2026-07-19): per-ref BACKING/RESIDENCY UPDATE.
-             * Payload {u32 seq, u32 ref, u32 =5, u32 =6, u64 addr} (24 B).
-             * Live refs 0x13/0x8/0xa/0xc/0xe with addr ~0x226e14. Was dropped
-             * entirely before the ring-wrap fix; store latest addr per ref so
-             * the resolve paths (gated LAGFX_M2_BACKUPD) can prefer it over
-             * the stale placement-table PFN walk. */
-            if (hdr->payload && hdr->payload_size >= 24u) {
-                uint32_t bseq = lagfx_le32(hdr->payload + 0);
-                uint32_t bref = lagfx_le32(hdr->payload + 4);
-                uint64_t baddr = lagfx_le64(hdr->payload + 16);
-                uint32_t sl = 0; bool found = false;
-                for (; sl < p->backing_update_n && sl < 64u; sl++)
-                    if (p->backing_update[sl].valid
-                        && p->backing_update[sl].ref == bref) { found = true; break; }
-                if (!found && p->backing_update_n < 64u)
-                    sl = p->backing_update_n++;
-                if (sl < 64u) {
-                    p->backing_update[sl].ref = bref;
-                    p->backing_update[sl].addr = baddr;
-                    p->backing_update[sl].valid = 1u;
-                }
-                /* M2q: the guest announced a CPU write of this ref's backing —
-                 * mark the realized texture dirty so the sample-bind refresh
-                 * re-reads it even over GPU-rendered content. */
-                {
-                    lagfx_resource_entry_t *bte =
-                        lagfx_resource_lookup_texture(&p->resources, bref);
-                    if (bte) bte->backing_dirty = 1u;
-                }
-                LAGFX_LOG("compute: 0x3b BackingUpdate ch=%u seq=%u ref=0x%x addr=0x%llx",
-                          (unsigned)p->current_chan_id, bseq, bref,
-                          (unsigned long long)baddr);
-            }
+            /* Child CmdGetComputeInfo:
+             * {u32 task, u32 pipeline_ref, u32 key_table_len, u32 capacity,
+             *  u64 reply_task_va}.  The old "BackingUpdate" interpretation
+             * happened to label the characteristic 5/6 words as constants
+             * and therefore never populated the pipeline-state properties. */
+            reply_compute_info(p, hdr);
             break;
         }
 

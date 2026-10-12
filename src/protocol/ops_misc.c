@@ -31,6 +31,7 @@
  * guest as soon as it services the IRQ.
  */
 
+#include <stdlib.h>
 #include "handlers/handlers.h"
 #include "opcodes.h"
 #include "protocol.h"
@@ -289,7 +290,38 @@ lagfx_handler_status_t lagfx_op_get_device_info_2(lagfx_protocol_t *p,
         { 0x29, 0          }, /* SupportedTextureWriteRoundingModes */
         { 0x00, 0          }, /* end-of-stream sentinel */
     };
-    const size_t n_pairs = sizeof(pairs) / sizeof(pairs[0]);
+    size_t n_pairs = sizeof(pairs) / sizeof(pairs[0]);
+
+    /* Diagnostic: LAGFX_DEVINFO_EXTRA="key=value,..." (C number syntax).
+     * Replace an existing key, or append a new one before the sentinel.  The
+     * old append-only behavior produced duplicate keys, so experiments could
+     * not actually override values when the guest retained the first pair. */
+    struct { uint32_t key; uint32_t value; } all[128];
+    const char *extra = getenv("LAGFX_DEVINFO_EXTRA");
+    if (extra) {
+        memcpy(all, pairs, sizeof pairs - sizeof pairs[0]);
+        size_t n = n_pairs - 1u;
+        for (const char *q = extra; *q && n < 127u;) {
+            char *end;
+            unsigned long k = strtoul(q, &end, 0);
+            if (*end != '=') break;
+            unsigned long v = strtoul(end + 1, &end, 0);
+            size_t at = n;
+            bool replaced = false;
+            for (size_t i = 0; i < n; i++) {
+                if (all[i].key == (uint32_t)k) { at = i; replaced = true; break; }
+            }
+            all[at].key = (uint32_t)k;
+            all[at].value = (uint32_t)v;
+            if (at == n) n++;
+            LAGFX_WARN("CmdGetDeviceInfo2: %s key 0x%lx = 0x%lx",
+                       replaced ? "override" : "set", k, v);
+            q = *end == ',' ? end + 1 : end;
+        }
+        all[n].key = 0u;
+        all[n].value = 0u;
+        n_pairs = n + 1u;
+    }
 
     /* resp_qwords is in 8-byte units; each pair is 8 bytes, so the
      * capacity in pairs is resp_qwords (one qword == one pair). Clamp
@@ -300,7 +332,7 @@ lagfx_handler_status_t lagfx_op_get_device_info_2(lagfx_protocol_t *p,
     if (!dev->desc.shell.write_memory(dev->desc.shell.opaque,
                                        resp_gpa,
                                        emit_pairs * sizeof(pairs[0]),
-                                       pairs)) {
+                                       extra ? (const void *)all : (const void *)pairs)) {
         LAGFX_WARN("CmdGetDeviceInfo2: DMA writeback failed to gpa=0x%llx",
                    (unsigned long long)resp_gpa);
         return LAGFX_HANDLER_ERR_INTERNAL;
@@ -309,5 +341,21 @@ lagfx_handler_status_t lagfx_op_get_device_info_2(lagfx_protocol_t *p,
     LAGFX_LOG("CmdGetDeviceInfo2: wrote %zu TLV pairs to resp page "
               "(MSAA=4, MaxMetalShaderVersion=0x20008, HostGPUFamily=0x10005)",
               emit_pairs);
+
+    /* The guest reloads the command header's +4 slot after the completion
+     * stamp and treats it as the number of returned pairs.  This writeback
+     * existed before the dispatcher refactor and was accidentally lost. */
+    if (p->current_cmd_header_gpa != 0u) {
+        uint32_t actual_count = (uint32_t)emit_pairs;
+        uint64_t count_gpa = p->current_cmd_header_gpa + 4u;
+        if (!dev->desc.shell.write_memory(dev->desc.shell.opaque, count_gpa,
+                                           sizeof actual_count, &actual_count)) {
+            LAGFX_WARN("CmdGetDeviceInfo2: actual-count writeback failed at gpa=0x%llx",
+                       (unsigned long long)count_gpa);
+        } else {
+            LAGFX_LOG("CmdGetDeviceInfo2: wrote actual_count=%u to command +4",
+                      actual_count);
+        }
+    }
     return LAGFX_HANDLER_OK;
 }

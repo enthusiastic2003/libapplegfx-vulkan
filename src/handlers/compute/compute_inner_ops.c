@@ -165,6 +165,48 @@ static int op_set_stencil_reference(lagfx_protocol_t *p, uint32_t enc, uint32_t 
     return 0;
 }
 
+/* Tahoe compute encoder: setComputePipelineState:.  The four-byte body is the
+ * task-local pipeline object reference.  Keep this handler observational for
+ * now, but resolve that exact object when object diagnostics are enabled. */
+static int op_set_compute_pipeline_state(lagfx_protocol_t *p, uint32_t enc,
+                                         uint32_t task_id, const uint8_t *b,
+                                         size_t len) {
+    (void)enc;
+    if (len < 4u || task_id >= LAGFX_MAX_TASKS || !p->tasks[task_id].live)
+        return 1;
+
+    uint32_t ref = lagfx_le32(b);
+    LAGFX_LOG("compute_inner: 0xd0 SetComputePipelineState t%u ref=0x%x",
+              task_id, ref);
+
+    if (getenv("LAGFX_DUMP_OBJ")) {
+        lagfx_task_entry_t *task = &p->tasks[task_id];
+        uint8_t type = 0;
+        uint64_t va = 0, gpa = 0;
+        if (lagfx_resolve_object_data(p, task, ref, &type, &va, &gpa) && gpa) {
+            uint8_t obj[256] = {0};
+            lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+            if (dev->desc.shell.read_memory(dev->desc.shell.opaque, gpa,
+                                            sizeof obj, obj)) {
+                for (size_t off = 0; off < sizeof obj; off += 32u) {
+                    char hx[3 * 32 + 1];
+                    size_t hn = 0;
+                    for (size_t k = 0; k < 32u; k++)
+                        hn += (size_t)snprintf(hx + hn, sizeof hx - hn,
+                                               "%02x ", obj[off + k]);
+                    hx[hn] = 0;
+                    LAGFX_WARN("COMPUTE-PSO t%u ref=0x%x type=0x%02x va=0x%llx +%03zx: %s",
+                               task_id, ref, type, (unsigned long long)va, off, hx);
+                }
+            }
+        } else {
+            LAGFX_WARN("COMPUTE-PSO t%u ref=0x%x: object resolution failed",
+                       task_id, ref);
+        }
+    }
+    return 0;
+}
+
 /* Encodings decoded with kat draw-probe (distinct values per field):
  *   0x02 drawPrimitives:vertexStart:vertexCount:instanceCount: (wide)
  *        {u64 start, u64 count, u64 instances, u32 prim}
@@ -2187,6 +2229,7 @@ static int op_set_viewport(lagfx_protocol_t *p,
  * All entries validated against observed payload sizes in /tmp/lagfx.log.
  */
 static const lagfx_compute_inner_op_desc_t compute_inner_op_table[] = {
+    { 0x00d0, "SetComputePipelineState",         op_set_compute_pipeline_state },
     { 0x007e, "SetVertexBufferOffset",           op_set_vertex_buffer_offset },
     { 0x0074, "SetRenderPipelineState",          op_set_render_pipeline_state },
     { 0x007d, "SetVertexBuffers",                op_set_vertex_buffers },

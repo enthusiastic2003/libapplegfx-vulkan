@@ -384,7 +384,7 @@ typedef struct {
      * CmdSetObjectAndPlacementList. Per the live wire data captured
      * 2026-05-28 (see paravirt-re/library/apv-object-entry-parser-
      * scoping-2026-05-17.md), 0x25's payload is 8 bytes:
-     * `{count: u32, objectId: u32}`. The kext publishes which
+     * `{taskId: u32, objectId: u32}`. The kext publishes which
      * objectIds are in the active set; op_0x74 SetRenderPipelineState
      * later resolves these IDs to pipeline-state metallib bytes via
      * the existing Phase B heap-VA resolver.
@@ -441,6 +441,9 @@ typedef struct lagfx_protocol {
     /* Ring geometry (set by MMIO, preserved across resets) */
     uint64_t ring_base_pfn;     // Command ring base PFN (from BAR0+0x1030)
     uint64_t ring_base_gpa;     // Computed: (pfn << 12) + start_offset
+    /* Root-ring command currently being dispatched.  GetDeviceInfo2 updates
+     * its +4 count/length slot before completion, as required by the guest. */
+    uint64_t current_cmd_header_gpa;
     uint32_t ring_size;         // Ring size in bytes (BAR0+0x1004)
     uint32_t ring_start_offset; // Offset within base page (BAR0+0x1010)
     uint64_t ring_shared_page_pfn;  // Shared page PFN for descriptors
@@ -555,6 +558,12 @@ typedef struct lagfx_protocol {
         uint8_t  desc_table_dumped;
         uint32_t submit_probe_count;
         uint8_t  bench_done;
+        /* Pipeline-registration correlation for the controlled Tahoe probe. */
+        uint32_t pso_reg_serial;
+        uint32_t pso_reg_task;
+        uint32_t pso_reg_object;
+        uint32_t pso_reg_stamp;
+        uint8_t  pso_reg_channel;
     } diag;
 
     /* Command counters (for diagnostics) */
