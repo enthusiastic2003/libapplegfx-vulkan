@@ -8,7 +8,7 @@
  * === Scope =====================================================
  *
  * Minimum-viable Vulkan init path: VkInstance, VkPhysicalDevice
- * selection (preferring lavapipe — VK_PHYSICAL_DEVICE_TYPE_CPU),
+ * selection (LAGFX_VK_DEVICE, else lavapipe — VK_PHYSICAL_DEVICE_TYPE_CPU),
  * VkDevice with the feature set libapplegfx-vulkan relies on
  * (dynamicRendering, synchronization2, timelineSemaphore, descriptor
  * indexing), and retrieval of one graphics+compute+transfer queue.
@@ -142,9 +142,30 @@ static VkBool32 VKAPI_PTR lagfx_debug_callback(
     return VK_FALSE;
 }
 
-/* Choose physical device: prefer CPU-type (lavapipe) for our use
- * case — we're targeting headless-CPU rendering. Fall back to the
- * first device with a graphics queue family. */
+/* Whether device `p` (enumeration index `i`) is the one LAGFX_VK_DEVICE asks
+ * for: "cpu"/"lavapipe", "intel", "nvidia", "amd", "integrated", "discrete",
+ * "gpu" (any hardware GPU), or an enumeration index. */
+static bool device_matches(const char *want, uint32_t i, const VkPhysicalDeviceProperties *p) {
+    char *end = NULL;
+    unsigned long idx = strtoul(want, &end, 10);
+    if (end != want && *end == '\0') return idx == i;
+    if (!strcmp(want, "cpu") || !strcmp(want, "lavapipe"))
+        return p->deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    if (!strcmp(want, "intel"))  return p->vendorID == 0x8086u;
+    if (!strcmp(want, "nvidia")) return p->vendorID == 0x10deu;
+    if (!strcmp(want, "amd"))    return p->vendorID == 0x1002u;
+    if (!strcmp(want, "integrated")) return p->deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    if (!strcmp(want, "discrete"))   return p->deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    if (!strcmp(want, "gpu"))
+        return p->deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+               || p->deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    return false;
+}
+
+/* Choose the physical device: LAGFX_VK_DEVICE when set (see device_matches;
+ * "gpu" prefers a discrete GPU), else lavapipe (CPU type), the default until
+ * the hardware drivers pass the suite. Fall back to the first device with a
+ * graphics queue family. */
 static VkPhysicalDevice pick_phys_device(VkInstance inst,
                                           uint32_t *qfam_out) {
     uint32_t n = 0;
@@ -158,14 +179,18 @@ static VkPhysicalDevice pick_phys_device(VkInstance inst,
     }
     vkEnumeratePhysicalDevices(inst, &n, devs);
 
+    const char *want = getenv("LAGFX_VK_DEVICE");
+    if (!want || !*want) want = "cpu";
     VkPhysicalDevice chosen = VK_NULL_HANDLE;
     uint32_t         chosen_qf = UINT32_MAX;
 
-    /* Pass 1: CPU-type. */
-    for (uint32_t i = 0; i < n; ++i) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(devs[i], &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+    /* "gpu" takes a discrete GPU first. */
+    const char *passes[2] = { !strcmp(want, "gpu") ? "discrete" : want, want };
+    for (int pass = 0; pass < 2 && chosen == VK_NULL_HANDLE; ++pass) {
+        for (uint32_t i = 0; i < n; ++i) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(devs[i], &p);
+            if (!device_matches(passes[pass], i, &p)) continue;
             uint32_t qf = pick_queue_family(devs[i]);
             if (qf != UINT32_MAX) {
                 chosen = devs[i];
@@ -174,8 +199,10 @@ static VkPhysicalDevice pick_phys_device(VkInstance inst,
             }
         }
     }
+    if (chosen == VK_NULL_HANDLE)
+        LAGFX_WARN("vk_init: no device matches LAGFX_VK_DEVICE=%s; using the first usable one", want);
 
-    /* Pass 2: any device with a graphics queue. */
+    /* Fallback: any device with a graphics queue. */
     if (chosen == VK_NULL_HANDLE) {
         for (uint32_t i = 0; i < n; ++i) {
             uint32_t qf = pick_queue_family(devs[i]);
@@ -363,7 +390,7 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
         return LAGFX_ERR_VULKAN_INIT;
     }
     vkGetPhysicalDeviceProperties(s->phys_device, &s->phys_props);
-    LAGFX_LOG("vk_init: phys device '%s' type=%s api=%u.%u.%u qf=%u",
+    LAGFX_WARN("vk_init: phys device '%s' type=%s api=%u.%u.%u qf=%u",
               s->phys_props.deviceName,
               phys_type_str(s->phys_props.deviceType),
               VK_VERSION_MAJOR(s->phys_props.apiVersion),

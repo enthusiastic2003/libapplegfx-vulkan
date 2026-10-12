@@ -114,7 +114,8 @@ static bool make_buffer(struct lagfx_vk_state *vk, const void *data, VkDeviceSiz
         .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
                | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
                | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
-               | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+               | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+               | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     if (vkCreateBuffer(vk->device, &bci, NULL, buf) != VK_SUCCESS) return false;
@@ -980,6 +981,38 @@ static void bound_depth_stencil(lagfx_protocol_t *p, const lagfx_task_entry_t *t
 
 /* ---------------------------------------------------------------------- draw */
 
+/* Sampled images a command reads, moved to SHADER_READ_ONLY_OPTIMAL at the
+ * start of its command buffer when they are in another layout (an image
+ * nothing has written yet is UNDEFINED). lavapipe ignores layouts; real
+ * GPUs don't. */
+typedef struct { lagfx_vk_iosurface_t *ios[MAX_LAYOUT]; uint32_t n; } sampled_t;
+
+static void sampled_add(sampled_t *s, lagfx_vk_iosurface_t *ios) {
+    if (ios->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        || ios->layout == VK_IMAGE_LAYOUT_GENERAL)
+        return;
+    for (uint32_t i = 0; i < s->n; i++)
+        if (s->ios[i] == ios) return;
+    if (s->n < MAX_LAYOUT) s->ios[s->n++] = ios;
+}
+
+static void sampled_ready(VkCommandBuffer cb, sampled_t *s) {
+    VkImageMemoryBarrier b[MAX_LAYOUT];
+    for (uint32_t i = 0; i < s->n; i++) {
+        b[i] = (VkImageMemoryBarrier){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = s->ios[i]->layout, .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = s->ios[i]->image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        };
+        s->ios[i]->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    if (s->n)
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, NULL, 0, NULL, s->n, b);
+}
+
 #define MAX_TEMP 128u
 
 typedef struct {
@@ -1132,6 +1165,7 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
     m2v_pipe_t *mp = pipeline;
     if (!p || !task || !vk || !mp || !target || !target_layout) return false;
     static stage_bind_t sb[2];
+    sampled_t sampled = { 0 };
     describe_stage(p, task, task->bindings.vertex_buffers, task->bindings.vertex_textures, NULL, &sb[0]);
     describe_stage(p, task, task->bindings.fragment_buffers, task->bindings.fragment_textures,
                    task->bindings.fragment_samplers, &sb[1]);
@@ -1503,6 +1537,7 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
                     }
                     lay = ios->layout == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL
                                                                   : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    sampled_add(&sampled, ios);
                 }
             }
 image_done:
@@ -1632,6 +1667,7 @@ image_done:
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     vkBeginCommandBuffer(cb, &cbi);
+    sampled_ready(cb, &sampled);
     VkImageMemoryBarrier bar = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -2033,6 +2069,7 @@ bool lagfx_m2v_dispatch(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct la
     struct { int k; uint32_t mem_index; uint64_t off, len; } outbuf[MAX_LAYOUT];
     uint32_t nout = 0;
     struct { lagfx_vk_iosurface_t *ios; uint32_t ref; } outimg[MAX_LAYOUT];
+    sampled_t sampled = { 0 };
     uint32_t nimg = 0;
     uint32_t nw = 0;
     const lagfx_m2v_write_t *w = lagfx_m2v_dispatch_writes(dp, &nw);
@@ -2212,6 +2249,7 @@ bool lagfx_m2v_dispatch(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct la
                     } else {
                         lay = ios->layout == VK_IMAGE_LAYOUT_GENERAL
                             ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        sampled_add(&sampled, ios);
                     }
                 }
             }
@@ -2283,6 +2321,7 @@ image_done:
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     vkBeginCommandBuffer(cb, &cbi);
+    sampled_ready(cb, &sampled);
     for (uint32_t m = 0; m < nimg; m++) {
         VkImageMemoryBarrier b = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
