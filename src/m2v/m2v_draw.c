@@ -842,7 +842,7 @@ static VkPipeline variant(struct lagfx_vk_state *vk, m2v_pipe_t *mp, VkFormat fm
 /* ------------------------------------------------------------------- stencil */
 
 /* Live tracing (diagnostic): /tmp/lagfx_trace.txt holds pipeline refs in the
- * LAGFX_SKIP_PIPES format; draws with those pipelines log their bindings as
+ * LAGFX_SKIP_PIPES format, or "*" for all; draws with those pipelines log their bindings as
  * LAGFX_BINDLOG does, plus each texture object. Re-read every draw, since
  * pipeline refs differ per boot. */
 static bool traced_pipeline(uint32_t ref) {
@@ -852,6 +852,7 @@ static bool traced_pipeline(uint32_t ref) {
     size_t got = fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
     buf[got] = '\0';
+    if (buf[0] == '*') return true;     /* every pipeline */
     snprintf(pref, sizeof pref, "0x%x", ref);
     size_t pl = strlen(pref);
     for (const char *h = strstr(buf, pref); h; h = strstr(h + 1, pref))

@@ -1704,15 +1704,20 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                 size_t mlib_buf_len = 0;
                 lagfx_metallib_function_t fns[8] = {0};
                 const lagfx_metallib_function_t *fn = NULL;
-                uint8_t stage_cand[16];
+                /* 32-bit: once a long session's object ids pass 0xff, an
+                 * 8-bit copy of a named function ref (or the 8-bit scan
+                 * below) names an unrelated older object, e.g. WindowServer's
+                 * GPUPass, and metal2vulkan refuses the mismatched pair
+                 * (UnmatchedVarying), so the draw was lost. */
+                uint32_t stage_cand[16];
                 size_t n_stage_cand = 0;
-                if (named_fn[stage] != 0u && named_fn[stage] <= 0xffu)
-                    stage_cand[n_stage_cand++] = (uint8_t)named_fn[stage];
+                if (named_fn[stage] != 0u)
+                    stage_cand[n_stage_cand++] = named_fn[stage];
                 else
                     for (size_t ci = 0; ci < n_cand && n_stage_cand < 16u; ci++)
                         stage_cand[n_stage_cand++] = cand_list[ci];
                 for (size_t ci = 0; ci < n_stage_cand && !fn; ci++) {
-                    uint8_t fn_ref = stage_cand[ci];
+                    uint32_t fn_ref = stage_cand[ci];
                     if (fn_ref == 0u) continue;
                     uint64_t mlib_gpa = 0; uint32_t mlib_len = 0; uint64_t mlib_va = 0;
                     if (!lagfx_lookup_function_bytes(p, task, fn_ref, &mlib_gpa, &mlib_len, &mlib_va))
