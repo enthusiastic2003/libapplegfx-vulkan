@@ -336,7 +336,10 @@ static int op_draw_indexed_primitives_16(lagfx_protocol_t *p,
     uint32_t index_type        = lagfx_le16(body + 2);
     uint32_t index_buffer_ref  = lagfx_le32(body + 4);
     uint32_t index_count       = lagfx_le16(body + 8);
-    uint32_t index_buffer_offset = lagfx_le16(body + 10);
+    /* The compact form stores a little-endian byte offset.  A controlled KAT
+     * using indexBufferOffset=0x220 produced trailing bytes 20 02. */
+    uint32_t encoded_index_offset = lagfx_le16(body + 10);
+    uint32_t index_buffer_offset = encoded_index_offset;
     if (getenv("LAGFX_DUMP_DRAW")) {
         char hx[3 * 32 + 1];
         size_t hn = 0;
@@ -367,8 +370,9 @@ static int op_draw_indexed_primitives_16(lagfx_protocol_t *p,
     task->pending_draw.instance_count = 1u;         /* Default for non-instanced variant */
     task->pending_draw.first_instance = 0u;
 
-    LAGFX_LOG("compute_inner: 0x07 DrawIndexedPrimitives16 prim=%u idxType=%u count=%u bufRef=0x%x offset=%u",
-              prim, index_type, index_count, index_buffer_ref, index_buffer_offset);
+    LAGFX_LOG("compute_inner: 0x07 DrawIndexedPrimitives16 prim=%u idxType=%u count=%u bufRef=0x%x encodedOffset=0x%x byteOffset=%u",
+              prim, index_type, index_count, index_buffer_ref,
+              encoded_index_offset, index_buffer_offset);
 
     /* M1 (a): resource-aware draw via the shared helper. 0x07 is the DOMINANT
      * draw (~22439) and was substitute-only (with mislabeled op_0x82 logs) —

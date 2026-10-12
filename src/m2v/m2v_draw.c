@@ -181,10 +181,10 @@ static VkSampler make_sampler(struct lagfx_vk_state *vk, const lagfx_m2v_vk_samp
     return out;
 }
 
-/* A buffer object's placement. Its data is one {u64 size, u32 page, u32 flags}
- * entry: the buffer is that many bytes from page << 12 in the task's address
- * space. Buffer objects are packed back to back, so the bytes after the entry
- * are the next object's (seen as object 0x17 followed by 0x18's entry). */
+/* A buffer placement is a four-entry scatter/gather table of
+ * {u64 size, u32 page, u32 flags}.  Object references may point at successive
+ * rows (a controlled guest KAT saw ref 4 at row 0 and ref 5 at row 1).  Flag
+ * bit 16 marks the final range; bytes after it belong to another object. */
 typedef struct {
     uint32_t n;
     uint64_t size[4], page[4];
@@ -195,7 +195,7 @@ static bool buffer_placement(lagfx_protocol_t *p, const lagfx_task_entry_t *task
                              placement_t *out) {
     uint8_t type = 0;
     uint64_t va = 0, gpa = 0;
-    uint8_t d[64];
+    uint8_t d[4u * 16u];
     memset(out, 0, sizeof *out);
     if (!lagfx_resolve_object_data(p, task, ref, &type, &va, &gpa) || va == 0u
         || !lagfx_task_read_virtual(p, task, va, sizeof d, d))
@@ -209,19 +209,24 @@ static bool buffer_placement(lagfx_protocol_t *p, const lagfx_task_entry_t *task
             dumped[nd++ % 64u] = ref;
             char hx[3 * 64 + 1];
             size_t hn = 0;
-            for (uint32_t k = 0; k < sizeof d; k++)
+            for (uint32_t k = 0; k < 64u; k++)
                 hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", d[k]);
             LAGFX_WARN("M2VBUF task=%u ref=0x%x type=0x%02x: %s", task->id, ref, type, hx);
         }
     }
-    uint64_t size = lagfx_le64(d);
-    uint64_t page = lagfx_le32(d + 8u);
-    if (size == 0u || size > (1ull << 32) || page < 0x10u) return false;
-    out->size[0] = size;
-    out->page[0] = page;
-    out->n = 1;
-    out->length = size;
-    return true;
+    for (uint32_t i = 0; i < 4u; i++) {
+        const uint8_t *e = d + i * 16u;
+        uint64_t size = lagfx_le64(e);
+        uint64_t page = lagfx_le32(e + 8u);
+        uint32_t flags = lagfx_le32(e + 12u);
+        if (size == 0u || size > (1ull << 32) || page < 0x10u) continue;
+        out->size[out->n] = size;
+        out->page[out->n] = page;
+        out->n++;
+        out->length += size;
+        if (flags & 0x00010000u) break;
+    }
+    return out->n != 0u;
 }
 
 /* Read `len` bytes at logical offset `off` of the buffer; past the end reads zeros. */
@@ -956,7 +961,12 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
         if (!buffer_placement(p, task, task->pending_draw.index_buffer_ref, &ipl)) return false;
         ix.index_type = task->pending_draw.index_type;
         ix.buffer_length = ipl.length;
-        ix.offset = task->pending_draw.index_buffer_offset;
+        /* The compact command's u16 offset is a monotonically advancing ring
+         * cursor.  WindowServer lets it pass the allocation length before the
+         * 16-bit cursor wraps (for example 0xfb00 in a 0x8000 buffer). */
+        ix.offset = ipl.length
+                        ? task->pending_draw.index_buffer_offset % ipl.length
+                        : task->pending_draw.index_buffer_offset;
         ix.base_vertex = task->pending_draw.base_vertex;
         ixp = &ix;
         vertex_start = 0;

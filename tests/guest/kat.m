@@ -395,6 +395,39 @@ static BOOL case_triangle_vbuf(void) {
                    tri_edge);
 }
 
+// Controlled wire-format probe for DrawIndexedPrimitives16.  The distinctive
+// byte offset (0x220), six UInt16 indices and 0x1000-byte allocation let the
+// host correlate every field without searching guest memory.
+static BOOL case_indexed_probe(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_vid_mat", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    const float k = (float)kSize;
+    const float pos[8] = { 0, 0, k, 0, 0, k, k, k };
+    const float m[16] = { 2 / k, 0, 0, 0,   0, 2 / k, 0, 0,
+                          0, 0, 1, 0,       -1, -1, 0, 1 };
+    id<MTLBuffer> vb = [gDevice newBufferWithBytes:pos length:sizeof pos
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mb = [gDevice newBufferWithBytes:m length:sizeof m
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ib = [gDevice newBufferWithLength:0x1000
+                                           options:MTLResourceStorageModeShared];
+    const uint16_t idx[6] = {0, 1, 2, 2, 1, 3};
+    memcpy((uint8_t *)ib.contents + 0x220, idx, sizeof idx);
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setVertexBuffer:vb offset:0 atIndex:1];
+    [enc setVertexBuffer:mb offset:0 atIndex:2];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6
+                    indexType:MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:0x220];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return kRed; }, nil);
+}
+
 // Fragment constant from setFragmentBytes (inline data in the command stream).
 static BOOL case_frag_bytes(void) {
     static bgra_t px[kSize * kSize];
@@ -875,6 +908,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"clear", case_clear, YES},
     {"triangle", case_triangle, YES},
     {"triangle-vbuf", case_triangle_vbuf, YES},
+    {"indexed-probe", case_indexed_probe, NO},
     {"vid-matrix", case_vid_matrix, YES},
     {"frag-bytes", case_frag_bytes, YES},
     {"frag-buffer", case_frag_buffer, YES},
