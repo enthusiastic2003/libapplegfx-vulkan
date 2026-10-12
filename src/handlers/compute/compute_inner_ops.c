@@ -2266,6 +2266,35 @@ find_compute_inner_op_desc(uint32_t opcode) {
     return NULL;
 }
 
+/* Diagnostic: /tmp/lagfx_skip_ops lists inner opcodes to drop ("0x09,0x08"),
+ * re-read at most four times a second, so draw families can be switched off
+ * and on within one session (A/B a suspected regression). */
+static bool op_skipped(uint32_t opcode) {
+    static uint8_t skip[0x200];
+    static struct timespec last;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if ((now.tv_sec - last.tv_sec) * 1000000000L + (now.tv_nsec - last.tv_nsec) > 250000000L) {
+        last = now;
+        memset(skip, 0, sizeof skip);
+        FILE *f = fopen("/tmp/lagfx_skip_ops", "r");
+        if (f) {
+            char buf[256];
+            size_t got = fread(buf, 1, sizeof buf - 1, f);
+            fclose(f);
+            buf[got] = '\0';
+            for (char *q = buf; *q;) {
+                char *end;
+                unsigned long op = strtoul(q, &end, 0);
+                if (end == q) { q++; continue; }
+                if (op < sizeof skip) skip[op] = 1;
+                q = end;
+            }
+        }
+    }
+    return opcode < sizeof skip && skip[opcode];
+}
+
 int lagfx_compute_inner_dispatch(lagfx_protocol_t *p,
                                   uint32_t          encoder_type,
                                   uint32_t          task_id,
@@ -2290,6 +2319,7 @@ int lagfx_compute_inner_dispatch(lagfx_protocol_t *p,
         }
         return 1;
     }
+    if (op_skipped(opcode)) return 0;
     return desc->handler(p, encoder_type, task_id, body, body_len);
 }
 
