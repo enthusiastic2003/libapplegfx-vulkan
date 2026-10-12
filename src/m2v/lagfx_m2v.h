@@ -177,11 +177,20 @@ typedef struct {
 
 typedef struct M2vDraw lagfx_m2v_draw_t;
 
+/* An indexed draw's index buffer (MTLIndexType 0 UInt16 / 1 UInt32). */
+typedef struct {
+    uint32_t index_type;
+    uint64_t buffer_length;
+    uint64_t offset;          /* bytes */
+    int32_t base_vertex;
+} lagfx_m2v_indexed_t;
+
 /* Plan one drawPrimitives; NULL (reason in err) when it can't (yet). */
 lagfx_m2v_draw_t *lagfx_m2v_plan_draw(const lagfx_m2v_device_t *dev, const lagfx_m2v_pipeline_t *p,
                                       const lagfx_m2v_stage_t stages[2], uint32_t vertex_start,
                                       uint32_t vertex_count, uint32_t instance_count,
-                                      uint32_t base_instance, char *err, size_t err_len);
+                                      uint32_t base_instance, const lagfx_m2v_indexed_t *indexed,
+                                      char *err, size_t err_len);
 const lagfx_m2v_write_t *lagfx_m2v_draw_writes(const lagfx_m2v_draw_t *d, uint32_t *n);
 const uint8_t *lagfx_m2v_draw_bytes(const lagfx_m2v_draw_t *d, uint32_t i, size_t *len);
 const lagfx_m2v_push_t *lagfx_m2v_draw_push(const lagfx_m2v_draw_t *d, uint32_t *n,
@@ -189,7 +198,9 @@ const lagfx_m2v_push_t *lagfx_m2v_draw_push(const lagfx_m2v_draw_t *d, uint32_t 
 const uint32_t *lagfx_m2v_draw_specialization(const lagfx_m2v_draw_t *d, const uint8_t **data,
                                               size_t *data_len, uint32_t *n_entries);
 const uint64_t *lagfx_m2v_draw_vertex_buffers(const lagfx_m2v_draw_t *d, uint32_t *n);
-const uint32_t *lagfx_m2v_draw_call(const lagfx_m2v_draw_t *d);
+/* {kind 0 draw / 1 indexed, count, instance_count, first vertex or index,
+ * vertex offset, first_instance, VkIndexType, 0}; *index_offset for indexed. */
+const uint32_t *lagfx_m2v_draw_call(const lagfx_m2v_draw_t *d, uint64_t *index_offset);
 void lagfx_m2v_draw_free(lagfx_m2v_draw_t *d);
 /* The pipeline the draw was planned on: the one given or a variant of it
  * (owned by that one); use its SPIR-V and layout. */

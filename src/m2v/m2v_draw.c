@@ -948,9 +948,22 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
                                      sb[i].ns, sb[i].samplers };
     char err[512] = "";
     temps_t t = { .vk = vk };
+    /* an indexed draw's index buffer */
+    lagfx_m2v_indexed_t ix = { 0 };
+    placement_t ipl;
+    const lagfx_m2v_indexed_t *ixp = NULL;
+    if (task->pending_draw.indexed) {
+        if (!buffer_placement(p, task, task->pending_draw.index_buffer_ref, &ipl)) return false;
+        ix.index_type = task->pending_draw.index_type;
+        ix.buffer_length = ipl.length;
+        ix.offset = task->pending_draw.index_buffer_offset;
+        ix.base_vertex = task->pending_draw.base_vertex;
+        ixp = &ix;
+        vertex_start = 0;
+    }
     lagfx_m2v_draw_t *dr = lagfx_m2v_plan_draw((lagfx_m2v_device_t *)vk->m2v, mp->pipe, st,
                                                vertex_start, vertex_count,
-                                               instance_count ? instance_count : 1u, 0u,
+                                               instance_count ? instance_count : 1u, 0u, ixp,
                                                err, sizeof err);
     if (!dr && strstr(err, "MissingDeviceAddress")) {
         /* the shader reads buffers by address: give every bound buffer a host
@@ -968,13 +981,17 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
             }
         err[0] = 0;
         dr = lagfx_m2v_plan_draw((lagfx_m2v_device_t *)vk->m2v, mp->pipe, st, vertex_start,
-                                 vertex_count, instance_count ? instance_count : 1u, 0u,
+                                 vertex_count, instance_count ? instance_count : 1u, 0u, ixp,
                                  err, sizeof err);
     }
     if (!dr) {
         temps_free(&t);
         static unsigned n_warn;
-        if (n_warn++ < 50u) LAGFX_WARN("M2V draw not planned: %s", err);
+        if (n_warn++ < 50u)
+            LAGFX_WARN("M2V draw not planned: %s (indexed=%d ref=0x%x len=%llu off=%llu count=%u type=%u)",
+                       err, ixp != NULL, task->pending_draw.index_buffer_ref,
+                       (unsigned long long)ix.buffer_length, (unsigned long long)ix.offset,
+                       vertex_count, ix.index_type);
         return false;
     }
     const lagfx_m2v_pipeline_t *used = lagfx_m2v_draw_pipeline(dr);
@@ -1035,11 +1052,11 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
                    || strtoul(bl, NULL, 0) == task->pending_pipeline.reference)) {
             for (int si = 0; si < 2; si++) {
                 for (uint32_t k = 0; k < sb[si].nb; k++) {
-                    uint8_t head[64];
+                    uint8_t head[384];
                     read_buffer(p, task, &sb[si].placement[k], sb[si].buffers[k].offset, sizeof head, head);
-                    char hx[3 * 64 + 1];
+                    char hx[2048];
                     size_t hn = 0;
-                    for (uint32_t q = 0; q < 64u; q += 4u) {
+                    for (uint32_t q = 0; q < sizeof head; q += 4u) {
                         float f; memcpy(&f, head + q, 4);
                         hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%g ", f);
                         if (hn > sizeof hx - 16) break;
@@ -1260,6 +1277,18 @@ image_done:
         vbind[i] = (uint32_t)vbs[i * 3];
     }
 
+    /* the index buffer: the whole allocation, bound from its start */
+    VkBuffer ibuf = VK_NULL_HANDLE;
+    if (ixp) {
+        uint64_t len = ipl.length > (16u << 20) ? (16u << 20) : ipl.length;
+        uint8_t *data = malloc((size_t)len ? (size_t)len : 16u);
+        if (!data) FAIL_AT(31);
+        read_buffer(p, task, &ipl, 0u, len, data);
+        ibuf = temp_buffer(&t, data, len);
+        free(data);
+        if (!ibuf) FAIL_AT(32);
+    }
+
     /* device addresses the push constants carry */
     uint32_t nholes = 0;
     const uint32_t *holes = lagfx_m2v_draw_holes(dr, &nholes);
@@ -1365,8 +1394,14 @@ image_done:
     }
     for (uint32_t i = 0; i < nvbuf && i < 16u; i++)
         vkCmdBindVertexBuffers(cb, vbind[i], 1, &vbuf[i], &voff[i]);
-    const uint32_t *dc = lagfx_m2v_draw_call(dr);
-    vkCmdDraw(cb, dc[0], dc[1], dc[2], dc[3]);
+    uint64_t ioff = 0;
+    const uint32_t *dc = lagfx_m2v_draw_call(dr, &ioff);
+    if (dc[0] == 1u) {
+        vkCmdBindIndexBuffer(cb, ibuf, ioff, (VkIndexType)dc[6]);
+        vkCmdDrawIndexed(cb, dc[1], dc[2], dc[3], (int32_t)dc[4], dc[5]);
+    } else {
+        vkCmdDraw(cb, dc[1], dc[2], dc[3], dc[5]);
+    }
     vkCmdEndRendering(cb);
     /* back to sampleable, as the rest of the host expects */
     VkImageMemoryBarrier post = bar;

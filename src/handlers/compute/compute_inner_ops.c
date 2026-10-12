@@ -337,6 +337,13 @@ static int op_draw_indexed_primitives_16(lagfx_protocol_t *p,
     uint32_t index_buffer_ref  = lagfx_le32(body + 4);
     uint32_t index_count       = lagfx_le16(body + 8);
     uint32_t index_buffer_offset = lagfx_le16(body + 10);
+    if (getenv("LAGFX_DUMP_DRAW")) {
+        char hx[3 * 32 + 1];
+        size_t hn = 0;
+        for (size_t k = 0; k < body_len && k < 32u; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", body[k]);
+        LAGFX_WARN("DRAW07 t%u len=%zu: %s", task_id, body_len, hx);
+    }
 
     if (task_id >= LAGFX_MAX_TASKS) {
         LAGFX_WARN("compute_inner: 0x07 DrawIndexedPrimitives16 task_id=%u out of range", task_id);

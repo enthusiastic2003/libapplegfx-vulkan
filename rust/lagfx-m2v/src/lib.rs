@@ -602,7 +602,10 @@ pub struct M2vDraw {
     spec_data: Vec<u8>,
     spec_entries: Vec<[u32; 3]>, // constant id, offset, size
     vertex_buffers: Vec<[u64; 3]>, // binding, Metal buffer index, offset
-    draw: [u32; 4],               // vertex_count, instance_count, first_vertex, first_instance
+    /// [kind 0 draw / 1 indexed, count, instance_count, first (vertex or index),
+    ///  vertex offset (indexed), first_instance, index type (VkIndexType), unused]
+    draw: [u32; 8],
+    index_offset: u64,            // indexed: the index buffer's bind offset
     holes: Vec<[u32; 3]>,          // kind (1 root table, 2 execution status), stages, offset
     root_tables: Vec<(u32, Vec<u8>)>, // stages, bytes
 }
@@ -714,6 +717,16 @@ fn view_into(w: &mut LagfxM2vWrite, v: &metal2vulkan::bind::ImageViewDesc) {
 /// Plan and instantiate one non-indexed draw (`drawPrimitives`). NULL on
 /// failure or when the draw needs something this bridge doesn't do yet (a
 /// pipeline variant, argument buffers): the caller falls back.
+/// An indexed draw's index buffer: its type (MTLIndexType: 0 UInt16, 1 UInt32),
+/// allocation length, the draw's index offset in bytes, and base vertex.
+#[repr(C)]
+pub struct LagfxM2vIndexed {
+    pub index_type: u32,
+    pub buffer_length: u64,
+    pub offset: u64,
+    pub base_vertex: i32,
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lagfx_m2v_plan_draw(
     dev: *const M2vDevice,
@@ -723,6 +736,7 @@ pub unsafe extern "C" fn lagfx_m2v_plan_draw(
     vertex_count: u32,
     instance_count: u32,
     base_instance: u32,
+    indexed: *const LagfxM2vIndexed, // NULL: drawPrimitives
     err: *mut c_char,
     err_len: usize,
 ) -> *mut M2vDraw {
@@ -758,7 +772,22 @@ pub unsafe extern "C" fn lagfx_m2v_plan_draw(
                 return Err("variant plan asks for another variant".into());
             }
         }
-        let draw = DrawCall::Primitives { vertex_start, vertex_count, instance_count, base_instance };
+        let draw = match unsafe { indexed.as_ref() } {
+            None => DrawCall::Primitives { vertex_start, vertex_count, instance_count, base_instance },
+            Some(ix) => DrawCall::Indexed {
+                index_type: metal2vulkan::vk::IndexType::from(if ix.index_type == 1 {
+                    avk::IndexType::UINT32
+                } else {
+                    avk::IndexType::UINT16
+                }),
+                index_buffer: metal2vulkan::bind::IndexBufferRef::new(0, ix.buffer_length),
+                index_count: vertex_count,
+                index_offset: ix.offset,
+                instance_count,
+                base_vertex: ix.base_vertex,
+                base_instance,
+            },
+        };
         let cmds: DrawCommands = plan.instantiate_draw(&state, &draw).map_err(|e| format!("draw: {e}"))?;
         let mut holes = Vec::new();
         for h in &cmds.push_holes {
@@ -785,7 +814,7 @@ pub unsafe extern "C" fn lagfx_m2v_plan_draw(
                 let a = avk::SpecializationMapEntry::from(*e);
                 [a.constant_id, a.offset, a.size as u32]
             }).collect(),
-            vertex_buffers: Vec::new(), draw: [0; 4],
+            vertex_buffers: Vec::new(), draw: [0; 8], index_offset: 0,
             holes, root_tables,
         };
         let find_sampler = |stage: Stage, index: u32| {
@@ -865,9 +894,20 @@ pub unsafe extern "C" fn lagfx_m2v_plan_draw(
             let off = cmds.buffer_offsets.iter().find(|(b, _)| *b == vb.binding).map_or(0, |(_, o)| *o);
             out.vertex_buffers.push([vb.binding as u64, vb.buffer_index as u64, off]);
         }
+        if cmds.index_overrun.is_some() {
+            return Err(format!("index overrun {:?}", cmds.index_overrun));
+        }
         match cmds.draw {
             metal2vulkan::vk::DrawCommand::Draw { vertex_count, instance_count, first_vertex, first_instance } => {
-                out.draw = [vertex_count, instance_count, first_vertex, first_instance];
+                out.draw = [0, vertex_count, instance_count, first_vertex, 0, first_instance, 0, 0];
+            }
+            metal2vulkan::vk::DrawCommand::DrawIndexed {
+                index_type, index_buffer_offset, index_count, instance_count, first_index,
+                vertex_offset, first_instance,
+            } => {
+                out.draw = [1, index_count, instance_count, first_index, vertex_offset as u32,
+                            first_instance, raw!(IndexType, index_type), 0];
+                out.index_offset = index_buffer_offset;
             }
             _ => return Err("not a direct draw".into()),
         }
@@ -922,10 +962,13 @@ pub unsafe extern "C" fn lagfx_m2v_draw_vertex_buffers(d: *const M2vDraw, n: *mu
     d.vertex_buffers.as_ptr()
 }
 
-/// The draw: {vertex_count, instance_count, first_vertex, first_instance}.
+/// The draw: {kind 0 draw / 1 indexed, count, instance_count, first vertex or index,
+/// vertex offset, first_instance, VkIndexType, 0}; *index_offset set for indexed.
 #[no_mangle]
-pub unsafe extern "C" fn lagfx_m2v_draw_call(d: *const M2vDraw) -> *const u32 {
-    unsafe { d.as_ref() }.map_or(std::ptr::null(), |d| d.draw.as_ptr())
+pub unsafe extern "C" fn lagfx_m2v_draw_call(d: *const M2vDraw, index_offset: *mut u64) -> *const u32 {
+    let Some(d) = (unsafe { d.as_ref() }) else { return std::ptr::null() };
+    if !index_offset.is_null() { unsafe { *index_offset = d.index_offset } }
+    d.draw.as_ptr()
 }
 
 #[no_mangle]
