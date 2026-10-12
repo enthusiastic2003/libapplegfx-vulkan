@@ -52,6 +52,9 @@ typedef struct {
 #endif
     uint64_t gpu_addr;
     uint64_t size;
+    /* IOSurface id named by a task-local texture object.  Rendering is keyed
+     * by (task, ref), while display present is keyed by this global id. */
+    uint32_t surface_id;
     /* Realized-texture content tracking: richness score (distinct color
      * buckets, 64 = photo-grade) of the last backing read, plus a call
      * counter that rate-limits refresh re-reads. A texture realized BEFORE

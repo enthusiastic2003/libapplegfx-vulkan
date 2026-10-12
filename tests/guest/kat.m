@@ -428,6 +428,40 @@ static BOOL case_indexed_probe(void) {
     return compare(px, ^bgra_t(int x, int y) { return kRed; }, nil);
 }
 
+// Name-only probe: an indexed draw that can't use the compact 16-bit form
+// (UInt32 indices, offset above 64 KiB), with distinct field values to decode
+// it (LAGFX_DUMP_DRAW=1): triangle strip (4), UInt32 (1), 5 indices, offset
+// 0x12344. The fifth index repeats the fourth (a degenerate triangle).
+static BOOL case_indexed32_probe(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_vid_mat", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    const float k = (float)kSize;
+    const float pos[8] = { 0, 0, k, 0, 0, k, k, k };
+    const float m[16] = { 2 / k, 0, 0, 0,   0, 2 / k, 0, 0,
+                          0, 0, 1, 0,       -1, -1, 0, 1 };
+    id<MTLBuffer> vb = [gDevice newBufferWithBytes:pos length:sizeof pos
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mb = [gDevice newBufferWithBytes:m length:sizeof m
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ib = [gDevice newBufferWithLength:0x20000
+                                           options:MTLResourceStorageModeShared];
+    const uint32_t idx[5] = {0, 1, 2, 3, 3};
+    memcpy((uint8_t *)ib.contents + 0x12344, idx, sizeof idx);
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setVertexBuffer:vb offset:0 atIndex:1];
+    [enc setVertexBuffer:mb offset:0 atIndex:2];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip indexCount:5
+                    indexType:MTLIndexTypeUInt32 indexBuffer:ib indexBufferOffset:0x12344];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return kRed; }, nil);
+}
+
 // Fragment constant from setFragmentBytes (inline data in the command stream).
 static BOOL case_frag_bytes(void) {
     static bgra_t px[kSize * kSize];
@@ -909,6 +943,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"triangle", case_triangle, YES},
     {"triangle-vbuf", case_triangle_vbuf, YES},
     {"indexed-probe", case_indexed_probe, NO},
+    {"indexed32-probe", case_indexed32_probe, NO},
     {"vid-matrix", case_vid_matrix, YES},
     {"frag-bytes", case_frag_bytes, YES},
     {"frag-buffer", case_frag_buffer, YES},

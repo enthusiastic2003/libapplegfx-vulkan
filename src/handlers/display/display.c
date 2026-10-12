@@ -178,6 +178,76 @@ static void lagfx_display_present_surface_by_id(lagfx_protocol_t *p,
 #endif
 }
 
+/* Read the surface the renderer actually wrote.  IOSurface guest memory is a
+ * useful early-boot fallback, but GPU draws update the registered VkImage and
+ * need not be written back to task-0 RAM before display opcode 0x06 arrives. */
+static uint8_t *lagfx_display_read_host_surface(lagfx_protocol_t *p,
+                                               uint32_t surface_id,
+                                               uint32_t *out_w,
+                                               uint32_t *out_h) {
+#ifdef LAGFX_HAVE_VULKAN
+    if (!p || !p->dev) return NULL;
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    if (!dev->vk) return NULL;
+    lagfx_resource_entry_t *re = NULL;
+    /* Prefer the task-local image that was actually rendered into.  The
+     * task-0 entry keyed directly by surface id is merely the global backing
+     * allocation and can remain black while WindowServer renders through a
+     * texture-object ref in task 1. */
+    for (uint32_t i = p->resources.count; i > 0u; i--) {
+        lagfx_resource_entry_t *candidate = &p->resources.entries[i - 1u];
+        if (candidate->type != LAGFX_RESOURCE_TYPE_TEXTURE
+            || candidate->surface_id != surface_id || !candidate->host_handle)
+            continue;
+        lagfx_vk_iosurface_t *ci = (lagfx_vk_iosurface_t *)candidate->host_handle;
+        if (ci->gpu_drawn) { re = candidate; break; }
+        if (!re) re = candidate;
+    }
+    if (!re) re = lagfx_resource_lookup(&p->resources, surface_id, 0u);
+    if (!re || !re->host_handle) return NULL;
+    lagfx_vk_iosurface_t *ios = (lagfx_vk_iosurface_t *)re->host_handle;
+    if (ios->image == VK_NULL_HANDLE || ios->width == 0u || ios->height == 0u)
+        return NULL;
+    /* QEMU's display consumer expects tightly packed BGRA8.  Keep unusual
+     * formats on the existing guest-memory fallback until conversion exists. */
+    if (ios->format != VK_FORMAT_B8G8R8A8_UNORM
+        && ios->format != VK_FORMAT_B8G8R8A8_SRGB)
+        return NULL;
+    size_t row = (size_t)ios->width * 4u;
+    size_t need = row * ios->height;
+    uint8_t *px = malloc(need);
+    if (!px) return NULL;
+    lagfx_vk_render_target_t rt;
+    if (lagfx_vk_render_target_wrap(ios->image, ios->view, ios->memory,
+                                    ios->width, ios->height, ios->format,
+                                    &rt) != LAGFX_OK) {
+        free(px);
+        return NULL;
+    }
+    rt.layout = ios->layout;
+    size_t stride = 0;
+    if (lagfx_vk_render_target_readback(dev->vk, &rt, px, need, &stride) != LAGFX_OK) {
+        free(px);
+        return NULL;
+    }
+    ios->layout = rt.layout;
+    if (stride != row) {
+        uint8_t *tight = malloc(need);
+        if (!tight) { free(px); return NULL; }
+        for (uint32_t y = 0; y < ios->height; y++)
+            memcpy(tight + (size_t)y * row, px + (size_t)y * stride, row);
+        free(px);
+        px = tight;
+    }
+    *out_w = ios->width;
+    *out_h = ios->height;
+    return px;
+#else
+    (void)p; (void)surface_id; (void)out_w; (void)out_h;
+    return NULL;
+#endif
+}
+
 lagfx_handler_status_t lagfx_display_ack(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
     if (!p || !hdr) {
         return LAGFX_HANDLER_ERR_INTERNAL;
@@ -779,7 +849,52 @@ lagfx_handler_status_t lagfx_display_vchan_present(
      * back after each command buffer): show it. */
     lagfx_device_t *dev = (lagfx_device_t *)p->dev;
     uint32_t w = 0, h = 0;
+    /* A surface the GPU drew into (a task's texture object naming this
+     * IOSurface): copy its image into the display image on the GPU, with no
+     * readback. The guest-memory read below is for surfaces only the CPU
+     * wrote (the boot frame). LAGFX_PRESENT_ASSEMBLED=1 shows draw_emit's
+     * scanout assembly instead (the older heuristic). */
+    for (uint32_t i = p->resources.count; i > 0u; i--) {
+        lagfx_resource_entry_t *candidate = &p->resources.entries[i - 1u];
+        if (candidate->type != LAGFX_RESOURCE_TYPE_TEXTURE
+            || candidate->surface_id != surface_id || !candidate->host_handle)
+            continue;
+        lagfx_vk_iosurface_t *ci = (lagfx_vk_iosurface_t *)candidate->host_handle;
+        if (!ci->gpu_drawn) continue;
+        if (!dev || display_index >= LAGFX_MAX_DISPLAYS || !dev->displays[display_index])
+            break;
+        lagfx_display_t *d = dev->displays[display_index];
+        if (getenv("LAGFX_PRESENT_ASSEMBLED")) {
+            lagfx_display_signal_frame_ready(d);
+            return LAGFX_HANDLER_OK;
+        }
+        if (!dev->vk || !d->rt_ready || d->rt.image == VK_NULL_HANDLE
+            || ci->image == VK_NULL_HANDLE)
+            break;
+        if (lagfx_vk_display_present_surface(dev->vk, &d->rt, ci->image, &ci->layout,
+                                             ci->width, ci->height, d->rt.width, d->rt.height,
+                                             0u, 0u, NULL, NULL,
+                                             0u, 0u, ci->width, ci->height) != LAGFX_OK) {
+            LAGFX_WARN("vchan_present: GPU copy of surface %u failed", surface_id);
+            break;
+        }
+        (void)lagfx_display_overlay_cursor(d);
+        lagfx_display_signal_frame_ready(d);
+        static unsigned n_gpu;
+        if (n_gpu++ % 100u < 3u)
+            LAGFX_WARN("PRESENT gpu #%u: display[%u] surface %u (%ux%u fmt %d) from task %u ref 0x%x",
+                       n_gpu, display_index, surface_id, ci->width, ci->height, (int)ci->format,
+                       candidate->task_id, candidate->ref);
+        return LAGFX_HANDLER_OK;
+    }
+    {
+        static unsigned n_mem;
+        if (n_mem++ % 100u < 3u)
+            LAGFX_WARN("PRESENT mem #%u: display[%u] surface %u (no GPU-drawn image)", n_mem,
+                       display_index, surface_id);
+    }
     uint8_t *px = lagfx_iosurface_read_pixels(p, surface_id, &w, &h);
+    const char *present_source = "guest-memory";
     const char *dd = getenv("LAGFX_DUMP_WB");
     if (px && dd) {
         /* debug: the presented frame, as <dir>/present-s<surface>.ppm */
@@ -797,8 +912,8 @@ lagfx_handler_status_t lagfx_display_vchan_present(
     }
     if (px && dev && display_index < LAGFX_MAX_DISPLAYS && dev->displays[display_index]) {
         lagfx_display_set_presented(dev->displays[display_index], px, w, h);
-        LAGFX_LOG("vchan_present: display[%u] showing surface %u (%ux%u)",
-                  display_index, surface_id, w, h);
+        LAGFX_LOG("vchan_present: display[%u] showing surface %u (%ux%u) from %s",
+                  display_index, surface_id, w, h, present_source);
         return LAGFX_HANDLER_OK;
     }
     free(px);

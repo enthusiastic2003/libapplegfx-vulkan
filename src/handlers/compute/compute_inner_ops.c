@@ -278,10 +278,22 @@ static int op_draw_indexed_primitives_64(lagfx_protocol_t *p,
                    body_len);
         return 1;
     }
-    uint32_t index_count      = lagfx_le32(body + 0);
-    uint32_t index_type       = lagfx_le32(body + 4);  /* MTLIndexType UInt16/UInt32 */
-    uint32_t index_buffer_ref = lagfx_le32(body + 8);
-    uint64_t index_buffer_offset = lagfx_le64(body + 12);
+    /* {prim:u16 @0, indexType:u16 @2, bufRef:u32 @4, indexCount:u32 @8,
+     * u32 @12 (zero so far), indexBufferOffset:u64 @16}: decoded with kat
+     * indexed32-probe (strip, UInt32, 5 indices, offset 0x12344). The guest
+     * uses it when an indexed draw's fields don't fit the compact 0x07. */
+    uint32_t prim             = lagfx_le16(body + 0);
+    uint32_t index_type       = lagfx_le16(body + 2);
+    uint32_t index_buffer_ref = lagfx_le32(body + 4);
+    uint32_t index_count      = lagfx_le32(body + 8);
+    uint64_t index_buffer_offset = lagfx_le64(body + 16);
+    if (getenv("LAGFX_DUMP_DRAW")) {
+        char hx[3 * 48 + 1];
+        size_t hn = 0;
+        for (size_t k = 0; k < body_len && k < 48u; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", body[k]);
+        LAGFX_WARN("DRAW06 t%u len=%zu: %s", task_id, body_len, hx);
+    }
 
     if (task_id >= LAGFX_MAX_TASKS) {
         LAGFX_WARN("compute_inner: 0x06 DrawIndexedPrimitives64 task_id=%u out of range", task_id);
@@ -296,8 +308,11 @@ static int op_draw_indexed_primitives_64(lagfx_protocol_t *p,
     /* Populate per-task pending draw state. */
     task->pending_draw.valid = true;
     task->pending_draw.indexed = true;              /* Indexed draw */
+    task->pending_draw.primitive_type = prim;
+    task->pending_draw.index_type = index_type;
     task->pending_draw.index_count = index_count;
     task->pending_draw.index_buffer_ref = index_buffer_ref;
+    task->pending_draw.index_buffer_offset = (uint32_t)index_buffer_offset;
     task->pending_draw.base_vertex = 0;             /* Not specified in 0x06 variant */
     task->pending_draw.instance_count = 1u;         /* Default for non-instanced variant */
     task->pending_draw.first_instance = 0u;

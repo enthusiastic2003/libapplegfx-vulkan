@@ -27,6 +27,7 @@ void lagfx_resource_register(lagfx_resource_registry_t *reg,
             reg->entries[i].type     = type;
             reg->entries[i].gpu_addr = gpu_addr;
             reg->entries[i].size     = size;
+            reg->entries[i].surface_id = 0u;
             LAGFX_TRACE("resource_register: updated ref=0x%x task=%u "
                          "type=%u gpu_addr=0x%llx size=%llu",
                          ref, task_id, (unsigned)type,
@@ -56,6 +57,7 @@ void lagfx_resource_register(lagfx_resource_registry_t *reg,
 #endif
     e->gpu_addr    = gpu_addr;
     e->size        = size;
+    e->surface_id  = 0u;
 
     LAGFX_TRACE("resource_register: inserted ref=0x%x task=%u type=%u "
                   "gpu_addr=0x%llx size=%llu (total=%u)",

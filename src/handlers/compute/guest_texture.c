@@ -210,6 +210,7 @@ static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_
     e->view = ios->view;
     e->size = (uint64_t)obj->bytes_per_row * obj->height;
     e->gpu_addr = where;
+    e->surface_id = obj->surface_id;
     e->backing_dirty = 0u;
     *created = true;
     LAGFX_LOG("guest_texture: task %u ref 0x%x -> %ux%u fmt %u storage %u bpr %u",

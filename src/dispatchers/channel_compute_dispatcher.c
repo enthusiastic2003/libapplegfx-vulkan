@@ -51,9 +51,11 @@ register_active_object(lagfx_task_entry_t *task, uint32_t object_id) {
     for (uint32_t i = 0; i < task->active_objects.count; i++) {
         if (task->active_objects.object_ids[i] == object_id) return;
     }
-    if (task->active_objects.count >= 64u) {
-        LAGFX_WARN("register_active_object: task=%u registry full (64); dropping objectId=0x%x",
-                   task->id, object_id);
+    uint32_t capacity = (uint32_t)(sizeof task->active_objects.object_ids
+                                   / sizeof task->active_objects.object_ids[0]);
+    if (task->active_objects.count >= capacity) {
+        LAGFX_WARN("register_active_object: task=%u registry full (%u); dropping objectId=0x%x",
+                   task->id, capacity, object_id);
         return;
     }
     task->active_objects.object_ids[task->active_objects.count++] = object_id;

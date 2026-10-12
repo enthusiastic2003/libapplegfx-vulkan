@@ -384,7 +384,7 @@ typedef struct {
      * Small bounded array — Apple boot path publishes ~10s of unique
      * objectIds total per task in observed traffic. */
     struct {
-        uint32_t object_ids[64];   /* dedup'd set of active objectIds */
+        uint32_t object_ids[512];  /* dedup'd set; WindowServer exceeds 64 during login */
         uint32_t count;
     } active_objects;
 

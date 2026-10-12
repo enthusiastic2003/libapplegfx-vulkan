@@ -22,6 +22,7 @@
 #include "common/le.h"
 #include "common/log.h"
 #include "device.h"
+#include "handlers/compute/compute_draw_internal.h"
 #include "handlers/compute/guest_texture.h"
 #include "handlers/compute/task_translate.h"
 #include "protocol/object_resolver.h"
@@ -956,19 +957,93 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
     /* an indexed draw's index buffer */
     lagfx_m2v_indexed_t ix = { 0 };
     placement_t ipl;
+    uint64_t index_source_offset = 0;
+    uint32_t index_source_length = 0;
     const lagfx_m2v_indexed_t *ixp = NULL;
-    if (task->pending_draw.indexed) {
+    if (task->pending_draw.indexed && getenv("LAGFX_DISABLE_M2V_INDEXED") == NULL) {
         if (!buffer_placement(p, task, task->pending_draw.index_buffer_ref, &ipl)) return false;
         ix.index_type = task->pending_draw.index_type;
-        ix.buffer_length = ipl.length;
-        /* The compact command's u16 offset is a monotonically advancing ring
-         * cursor.  WindowServer lets it pass the allocation length before the
-         * 16-bit cursor wraps (for example 0xfb00 in a 0x8000 buffer). */
-        ix.offset = ipl.length
-                        ? task->pending_draw.index_buffer_offset % ipl.length
-                        : task->pending_draw.index_buffer_offset;
+        uint64_t index_bytes = (uint64_t)task->pending_draw.index_count
+                             * (ix.index_type == 1u ? 4u : 2u);
+        if (index_bytes == 0u || index_bytes > (16u << 20)) return false;
+        /* Snapshot precisely the range named by the draw.  In WindowServer's
+         * pooled buffers the object placement can be stale/smaller than the
+         * command offset while opcode 0x3b supplies the current backing VA.
+         * lagfx_read_vtx_source() knows that override.  Binding the snapshot
+         * from offset zero also avoids inventing ring/modulo semantics. */
+        index_source_offset = task->pending_draw.index_buffer_offset;
+        index_source_length = (uint32_t)index_bytes;
+        ix.buffer_length = index_source_length;
+        ix.offset = 0;
         ix.base_vertex = task->pending_draw.base_vertex;
-        ixp = &ix;
+        /* Some late WindowServer commands retain an object whose placement no
+         * longer contains the named slice.  Do not turn zero/obvious garbage
+         * indices into a degenerate or wild native draw.  The old unindexed
+         * interpretation is a useful per-draw fallback for these three-vertex
+         * screen triangles, while valid pooled quads remain indexed. */
+        uint8_t probe[24] = {0};
+        uint32_t probe_len = index_source_length < sizeof probe
+                           ? index_source_length : (uint32_t)sizeof probe;
+        const char *probe_how = NULL;
+        uint32_t probe_got = lagfx_read_vtx_source(p, task,
+                                                   task->pending_draw.index_buffer_ref,
+                                                   index_source_offset, probe_len, probe,
+                                                   &probe_how, 0);
+        bool plausible = probe_got == probe_len;
+        uint32_t distinct = 0, max_index = 0;
+        uint32_t probe_count = task->pending_draw.index_count;
+        uint32_t max_probe_count = probe_len / (ix.index_type == 1u ? 4u : 2u);
+        if (probe_count > max_probe_count) probe_count = max_probe_count;
+        for (uint32_t i = 0; i < probe_count; i++) {
+            uint32_t v = ix.index_type == 1u
+                       ? lagfx_le32(probe + i * 4u)
+                       : lagfx_le16(probe + i * 2u);
+            bool seen = false;
+            for (uint32_t j = 0; j < i; j++) {
+                uint32_t old = ix.index_type == 1u
+                             ? lagfx_le32(probe + j * 4u)
+                             : lagfx_le16(probe + j * 2u);
+                seen |= old == v;
+            }
+            distinct += !seen;
+            if (v > max_index) max_index = v;
+        }
+        if (probe_count >= 3u && distinct < 3u) plausible = false;
+        if (task->pending_draw.index_count <= 64u && max_index > 4096u) plausible = false;
+        if (plausible) {
+            ixp = &ix;
+        } else {
+            static unsigned n_bad;
+            if (n_bad < 40u && getenv("LAGFX_INDEXLOG")) {
+                /* lookup: the same offset read flat from the first entry's page */
+                uint8_t flat[12] = { 0 };
+                bool fok = ipl.n && lagfx_task_read_virtual(p, task, (ipl.page[0] << 12)
+                                                            + index_source_offset, sizeof flat, flat);
+                LAGFX_WARN("INDEXFLAT ref=0x%x n=%u e0=%llx@%llx e1=%llx@%llx len=%llx off=0x%llx ok=%d "
+                           "[%u %u %u %u %u %u]", task->pending_draw.index_buffer_ref, ipl.n,
+                           (unsigned long long)ipl.size[0], (unsigned long long)ipl.page[0],
+                           (unsigned long long)ipl.size[1], (unsigned long long)ipl.page[1],
+                           (unsigned long long)ipl.length, (unsigned long long)index_source_offset,
+                           fok, lagfx_le16(flat), lagfx_le16(flat + 2), lagfx_le16(flat + 4),
+                           lagfx_le16(flat + 6), lagfx_le16(flat + 8), lagfx_le16(flat + 10));
+            }
+            if (n_bad++ < 40u)
+                LAGFX_WARN("INDEXSRC stale t%u ref=0x%x off=0x%llx got=%u/%u distinct=%u max=%u via=%s; unindexed fallback",
+                           task->id, task->pending_draw.index_buffer_ref,
+                           (unsigned long long)index_source_offset, probe_got, probe_len,
+                           distinct, max_index, probe_how ? probe_how : "?");
+        }
+        vertex_start = 0;
+    } else if (task->pending_draw.indexed) {
+        /* A/B diagnostic: reproduce the pre-indexed M2V behavior exactly by
+         * issuing this as an unindexed draw.  This is intentionally wrong
+         * geometry, but establishes whether native indexed handling causes a
+         * WindowServer regression. */
+        static bool warned;
+        if (!warned) {
+            LAGFX_WARN("M2V indexed draws disabled; using legacy unindexed fallback");
+            warned = true;
+        }
         vertex_start = 0;
     }
     lagfx_m2v_draw_t *dr = lagfx_m2v_plan_draw((lagfx_m2v_device_t *)vk->m2v, mp->pipe, st,
@@ -1287,13 +1362,30 @@ image_done:
         vbind[i] = (uint32_t)vbs[i * 3];
     }
 
-    /* the index buffer: the whole allocation, bound from its start */
+    /* The exact index slice, preferably from the latest BackingUpdate VA. */
     VkBuffer ibuf = VK_NULL_HANDLE;
     if (ixp) {
-        uint64_t len = ipl.length > (16u << 20) ? (16u << 20) : ipl.length;
-        uint8_t *data = malloc((size_t)len ? (size_t)len : 16u);
+        uint32_t len = index_source_length;
+        uint8_t *data = malloc(len);
         if (!data) FAIL_AT(31);
-        read_buffer(p, task, &ipl, 0u, len, data);
+        const char *how = NULL;
+        uint32_t got = lagfx_read_vtx_source(p, task,
+                                             task->pending_draw.index_buffer_ref,
+                                             index_source_offset, len, data, &how, 0);
+        if (got != len) {
+            free(data);
+            FAIL_AT(31);
+        }
+        if (getenv("LAGFX_INDEXLOG")) {
+            static unsigned n;
+            if (n++ < 160u)
+                LAGFX_WARN("INDEXSRC t%u ref=0x%x off=0x%llx len=%u via=%s head=[%u,%u,%u]",
+                           task->id, task->pending_draw.index_buffer_ref,
+                           (unsigned long long)index_source_offset, len, how ? how : "?",
+                           len >= 2u ? (unsigned)lagfx_le16(data) : 0u,
+                           len >= 4u ? (unsigned)lagfx_le16(data + 2u) : 0u,
+                           len >= 6u ? (unsigned)lagfx_le16(data + 4u) : 0u);
+        }
         ibuf = temp_buffer(&t, data, len);
         free(data);
         if (!ibuf) FAIL_AT(32);
