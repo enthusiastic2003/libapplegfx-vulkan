@@ -43,6 +43,7 @@
 
 #include "render_target.h"
 #include "instance.h"
+#include "iosurface.h"
 #include "command.h"
 #include "common/log.h"
 #include "common/perf.h"
@@ -399,11 +400,10 @@ lagfx_status_t lagfx_vk_render_target_readback(struct lagfx_vk_state *vk,
      * staging buffer as 4 Bpp for an RGBA16F (8 Bpp) image overflows it by
      * w*h*4 bytes (lavapipe runs in-process: heap corruption killed two
      * containers minutes after a `passes` dump of the 66 MB backdrop). */
-    size_t bpp = 4u;
-    switch (rt->format) {
-    case VK_FORMAT_R16G16B16A16_SFLOAT: bpp = 8u; break;
-    case VK_FORMAT_R8_UNORM:            bpp = 1u; break;
-    default:                            bpp = 4u; break;
+    const size_t bpp = lagfx_vk_format_texel_bytes(rt->format);
+    if (bpp == 0u) {
+        LAGFX_ERR("render_target_readback: unknown texel size of format %d", (int)rt->format);
+        return LAGFX_ERR_INVALID_ARG;
     }
     const size_t stride = (size_t)rt->width * bpp;
     const size_t need   = stride * (size_t)rt->height;

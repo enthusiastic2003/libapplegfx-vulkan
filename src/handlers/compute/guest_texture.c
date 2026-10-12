@@ -599,8 +599,8 @@ bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *
 }
 
 static uint32_t bytes_per_pixel(uint32_t metal_format) {
-    /* the readback helper is 4-byte only */
-    return lagfx_metal_pixel_format_bytes(metal_format) == 4u ? 4u : 0u;
+    /* the readback helper sizes every format in the table */
+    return lagfx_metal_pixel_format_bytes(metal_format);
 }
 
 /* Write `len` bytes at texture-memory offset `off` through the placement

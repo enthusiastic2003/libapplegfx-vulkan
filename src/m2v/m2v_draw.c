@@ -2152,6 +2152,21 @@ bool lagfx_m2v_dispatch(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct la
                                     || x->swizzle[cc] == (uint32_t)(VK_COMPONENT_SWIZZLE_R + cc);
                     if ((VkFormat)x->view_format == ios->format && identity) {
                         view = ios->view;
+                    } else if ((VkFormat)x->view_format != ios->format
+                               && (lagfx_vk_format_texel_bytes((VkFormat)x->view_format) == 0u
+                                   || lagfx_vk_format_texel_bytes((VkFormat)x->view_format)
+                                      != lagfx_vk_format_texel_bytes(ios->format))) {
+                        /* a view with another texel size (e.g. a quarter-width
+                         * RGBA32Uint view of a BGRA8 surface) is invalid Vulkan;
+                         * lavapipe would run past the image */
+                        static unsigned n_size;
+                        if (n_size++ < 20u)
+                            LAGFX_WARN("M2V: dispatch view format %u (%u B) over image format %u (%u B) %ux%u, dropped",
+                                       x->view_format,
+                                       lagfx_vk_format_texel_bytes((VkFormat)x->view_format),
+                                       (unsigned)ios->format, lagfx_vk_format_texel_bytes(ios->format),
+                                       ios->width, ios->height);
+                        FAIL_AT(35);
                     } else if (t.nview < MAX_TEMP) {
                         /* another format of the same size, or a swizzle: the image is
                          * created mutable-format */

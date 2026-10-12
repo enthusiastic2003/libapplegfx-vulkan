@@ -103,6 +103,9 @@ VkFormat lagfx_metal_pixel_format_to_vk(uint32_t pixel_format);
  * module creates (4 if unknown). */
 uint32_t lagfx_metal_pixel_format_bytes(uint32_t pixel_format);
 uint32_t lagfx_vk_format_bytes(VkFormat format);
+/* Bytes per texel of any uncompressed color/depth VkFormat (0 if unknown):
+ * a view of a mutable-format image must have the image's texel size. */
+uint32_t lagfx_vk_format_texel_bytes(VkFormat format);
 
 #else
 

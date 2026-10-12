@@ -306,7 +306,10 @@ static int compute_dispatch(lagfx_protocol_t *p, uint32_t task_id, const uint8_t
               size[0], size[1], size[2], per_group[0], per_group[1], per_group[2]);
 #if defined(LAGFX_HAVE_M2V) && defined(LAGFX_HAVE_VULKAN)
     lagfx_device_t *dev = (lagfx_device_t *)p->dev;
-    if (getenv("LAGFX_M2V") && dev && dev->vk && dev->vk->initialized && dev->vk->m2v)
+    /* LAGFX_DISABLE_COMPUTE=1 drops every dispatch (a bad kernel can't take
+     * the session down while debugging) */
+    if (getenv("LAGFX_M2V") && !getenv("LAGFX_DISABLE_COMPUTE") && dev && dev->vk
+        && dev->vk->initialized && dev->vk->m2v)
         lagfx_m2v_dispatch(p, task, dev->vk, size, per_group, threads);
 #endif
     return 0;
