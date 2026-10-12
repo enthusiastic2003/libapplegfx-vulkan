@@ -43,7 +43,8 @@
  *   +0x10  u32  the object's own id
  *   +0x14  descriptor, as at +0x54 above (usage +0x15, format +0x16,
  *          width +0x18, height +0x1c, depth +0x20, options +0x2a)
- *   +0x34  u32  plane (newTextureWithDescriptor:iosurface:plane:)
+ *   +0x34  u16  plane (newTextureWithDescriptor:iosurface:plane:); the
+ *               upper two bytes are never written
  *
  * The surface itself is object <IOSurface id> of task 0, which holds every
  * surface's memory; its object data (slot type 0x04, 0x24 bytes) is

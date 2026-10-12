@@ -66,7 +66,10 @@ bool lagfx_parse_iosurface_texture_object(const uint8_t *b, size_t len,
     out->mip_levels   = rd16(b + 0x24);
     out->sample_count = rd16(b + 0x26);
     out->array_length = rd16(b + 0x28);
-    out->plane        = rd32(b + 0x34);
+    /* a u16: the serializer leaves the slot's upper half unwritten, so it
+     * holds whatever was in the ring before (public PVG implementation,
+     * ops/backed_texture.rs; the wide descriptor form writes all four) */
+    out->plane        = rd16(b + 0x34);
     if (out->surface_id == 0u || (b[0x14] & 0xf0u) != 0x40u) return false;
     if (out->width == 0u || out->height == 0u || out->width > 16384u || out->height > 16384u)
         return false;

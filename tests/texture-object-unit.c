@@ -126,6 +126,9 @@ static void test_iosurface(void) {
         CHECK(lagfx_texture_object_attach_surface(&t, &s));
         CHECK(t.plane == 0 && t.bytes_per_row == 192 && t.base_offset == 0);
 
+        put32(tb, 0x34, 0xaaaa0001u);               /* stale upper half: plane 1 */
+        CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+        CHECK(t.plane == 1);
         put32(tb, 0x34, 2);                         /* no such plane */
         CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
         CHECK(!lagfx_texture_object_attach_surface(&t, &s));
