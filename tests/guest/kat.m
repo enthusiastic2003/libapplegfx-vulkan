@@ -1243,6 +1243,96 @@ static BOOL case_tex_update(void) {
     return compare(px, pattern_blocks, nil);
 }
 
+// A two-plane IOSurface (8-bit Y, then interleaved CbCr at half size), each
+// plane read through its own texture, as the desktop wallpaper is (there 16-bit,
+// 3840x2160). The planes hold different patterns, so reading the wrong plane or
+// offset shows.
+#define kPlW 128
+#define kPlH 96
+static uint8_t plane0_texel(int x, int y) { return (uint8_t)(x * 2 + y * 3); }
+static void plane1_texel(int x, int y, uint8_t *cb, uint8_t *cr) {
+    *cb = (uint8_t)(200 - x * 3);
+    *cr = (uint8_t)(17 + y * 5);
+}
+static BOOL case_iosurface_planes(void) {
+    size_t bpr0 = 192, bpr1 = 160;               // padded past the tight 128 bytes
+    size_t size0 = bpr0 * kPlH, off1 = (size0 + 0xfff) & ~(size_t)0xfff;
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth: @(kPlW), (id)kIOSurfaceHeight: @(kPlH),
+        (id)kIOSurfacePixelFormat: @((uint32_t)'420v'),
+        (id)kIOSurfacePlaneInfo: @[
+            @{ (id)kIOSurfacePlaneWidth: @(kPlW), (id)kIOSurfacePlaneHeight: @(kPlH),
+               (id)kIOSurfacePlaneBytesPerElement: @1, (id)kIOSurfacePlaneBytesPerRow: @(bpr0),
+               (id)kIOSurfacePlaneOffset: @0, (id)kIOSurfacePlaneSize: @(size0) },
+            @{ (id)kIOSurfacePlaneWidth: @(kPlW / 2), (id)kIOSurfacePlaneHeight: @(kPlH / 2),
+               (id)kIOSurfacePlaneBytesPerElement: @2, (id)kIOSurfacePlaneBytesPerRow: @(bpr1),
+               (id)kIOSurfacePlaneOffset: @(off1), (id)kIOSurfacePlaneSize: @(bpr1 * kPlH / 2) },
+        ],
+        (id)kIOSurfaceAllocSize: @(off1 + bpr1 * kPlH / 2),
+    };
+    IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!s) { printf("  IOSurfaceCreate failed\n"); return NO; }
+    printf("  planes %zu: plane0 %zux%zu bpr %zu, plane1 %zux%zu bpr %zu at +0x%zx, id %u\n",
+           IOSurfaceGetPlaneCount(s), IOSurfaceGetWidthOfPlane(s, 0), IOSurfaceGetHeightOfPlane(s, 0),
+           IOSurfaceGetBytesPerRowOfPlane(s, 0), IOSurfaceGetWidthOfPlane(s, 1),
+           IOSurfaceGetHeightOfPlane(s, 1), IOSurfaceGetBytesPerRowOfPlane(s, 1),
+           (size_t)((uint8_t *)IOSurfaceGetBaseAddressOfPlane(s, 1)
+                    - (uint8_t *)IOSurfaceGetBaseAddress(s)), IOSurfaceGetID(s));
+    IOSurfaceLock(s, 0, NULL);
+    uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(s, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(s, 1);
+    size_t r0 = IOSurfaceGetBytesPerRowOfPlane(s, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(s, 1);
+    for (int y = 0; y < kPlH; y++)
+        for (int x = 0; x < kPlW; x++) p0[y * r0 + x] = plane0_texel(x, y);
+    for (int y = 0; y < kPlH / 2; y++)
+        for (int x = 0; x < kPlW / 2; x++) plane1_texel(x, y, &p1[y * r1 + 2 * x], &p1[y * r1 + 2 * x + 1]);
+    IOSurfaceUnlock(s, 0, NULL);
+
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:kPlW height:kPlH mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t0 = [gDevice newTextureWithDescriptor:td iosurface:s plane:0];
+    td.pixelFormat = MTLPixelFormatRG8Unorm;
+    td.width = kPlW / 2;
+    td.height = kPlH / 2;
+    id<MTLTexture> t1 = [gDevice newTextureWithDescriptor:td iosurface:s plane:1];
+    if (!t0 || !t1) { printf("  plane textures: %p %p\n", (__bridge void *)t0, (__bridge void *)t1); CFRelease(s); return NO; }
+    static const uint32_t zero[2] = {0, 0};
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_quad", @"fs_tex_read", nil, nil);
+    static bgra_t px[kSize * kSize];
+    BOOL ok = YES;
+    // plane 0 (64x64 window of 128x96): R = Y
+    if (!draw_quad(ps, MTLClearColorMake(0, 0, 0, 1), ^(id<MTLRenderCommandEncoder> e) {
+            [e setFragmentTexture:t0 atIndex:0];
+            [e setFragmentBytes:zero length:sizeof zero atIndex:0];
+        }, px)) { CFRelease(s); return NO; }
+    int bad0 = 0;
+    for (int y = 0; y < (int)kSize; y++)
+        for (int x = 0; x < (int)kSize; x++)
+            bad0 += abs(px[y * kSize + x].r - plane0_texel(x, y)) > kTol;
+    printf("  plane 0: %d/%lu pixels wrong; (0,0) r=%u want %u\n", bad0,
+           (unsigned long)(kSize * kSize), px[0].r, plane0_texel(0, 0));
+    if (bad0) { ok = NO; write_ppm(gCase, "-plane0", px); }
+    // plane 1 (64x48 of CbCr): R = Cb, G = Cr; rows past 48 are outside the plane
+    if (!draw_quad(ps, MTLClearColorMake(0, 0, 0, 1), ^(id<MTLRenderCommandEncoder> e) {
+            [e setFragmentTexture:t1 atIndex:0];
+            [e setFragmentBytes:zero length:sizeof zero atIndex:0];
+        }, px)) { CFRelease(s); return NO; }
+    int bad1 = 0;
+    for (int y = 0; y < kPlH / 2; y++)
+        for (int x = 0; x < kPlW / 2; x++) {
+            uint8_t cb, cr;
+            plane1_texel(x, y, &cb, &cr);
+            bad1 += abs(px[y * kSize + x].r - cb) > kTol || abs(px[y * kSize + x].g - cr) > kTol;
+        }
+    uint8_t cb0, cr0;
+    plane1_texel(0, 0, &cb0, &cr0);
+    printf("  plane 1: %d/%d pixels wrong; (0,0) rg=%u,%u want %u,%u\n", bad1, kPlW / 2 * kPlH / 2,
+           px[0].r, px[0].g, cb0, cr0);
+    if (bad1) { ok = NO; write_ppm(gCase, "-plane1", px); }
+    CFRelease(s);
+    return ok;
+}
+
 // Compute: out[i] = i * 3 + 1 into a shared buffer.
 static BOOL case_compute(void) {
     const NSUInteger n = 4096;
@@ -1565,6 +1655,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"iosurface-big", case_iosurface_big, YES},
     {"tex-bufbig", case_tex_bufbig, YES},
     {"tex-update", case_tex_update, YES},
+    {"iosurface-planes", case_iosurface_planes, YES},
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
     {"compute-props", case_compute_props, NO},

@@ -43,6 +43,7 @@
  *   +0x10  u32  the object's own id
  *   +0x14  descriptor, as at +0x54 above (usage +0x15, format +0x16,
  *          width +0x18, height +0x1c, depth +0x20, options +0x2a)
+ *   +0x34  u32  plane (newTextureWithDescriptor:iosurface:plane:)
  *
  * The surface itself is object <IOSurface id> of task 0, which holds every
  * surface's memory; its object data (slot type 0x04, 0x24 bytes) is
@@ -50,13 +51,19 @@
  *   +0x00  u64  size (page-rounded allocation)
  *   +0x08  u32  page in task 0's address space (low 32 bits)
  *   +0x0c  u32  IOSurface pixel format (four-character code, e.g. 'BGRA')
- *   +0x18  u32  width
- *   +0x1c  u32  height
- *   +0x20  u16  bytes per row
- *   +0x23  u8   bytes per element (+0x22 has been 0)
+ *   +0x10  u32  plane count (1 for single-plane surfaces)
+ *   +0x14  one 16-byte entry per plane:
+ *            +0  u32  byte offset of the plane in the surface's memory
+ *            +4  u32  width
+ *            +8  u32  height
+ *            +c  u16  bytes per row
+ *            +f  u8   bytes per element (+e has been 0)
+ *          so plane 0's width is at +0x18 and its bytes per row at +0x20.
  *
  * Matched against surfaces of known size and row stride
- * (tests/guest/kat.m, `kat iosurface-probe`).
+ * (tests/guest/kat.m, `kat iosurface-probe`) and a two-plane '420v' surface
+ * (`kat iosurface-planes`: plane 1 at +0x24, offset 0x5000). The desktop
+ * wallpaper is such a surface: 16-bit Y at 3840x2160 and CbCr at 1920x1080.
  */
 #ifndef LIBAPPLEGFX_PROTOCOL_TEXTURE_OBJECT_H
 #define LIBAPPLEGFX_PROTOCOL_TEXTURE_OBJECT_H
@@ -66,8 +73,10 @@
 #include <stdint.h>
 
 #define LAGFX_TEXTURE_OBJECT_MIN_LEN 0x70u
-#define LAGFX_IOSURFACE_TEXTURE_MIN_LEN 0x30u
-#define LAGFX_IOSURFACE_RECORD_LEN 0x24u
+#define LAGFX_IOSURFACE_TEXTURE_MIN_LEN 0x38u
+#define LAGFX_IOSURFACE_RECORD_MIN_LEN 0x24u     /* one plane */
+#define LAGFX_IOSURFACE_MAX_PLANES 4u
+#define LAGFX_IOSURFACE_RECORD_LEN (0x14u + 0x10u * LAGFX_IOSURFACE_MAX_PLANES)
 #define LAGFX_BUFFER_TEXTURE_MIN_LEN 0x38u
 
 /* MTLStorageMode */
@@ -88,14 +97,24 @@ typedef struct {
     uint64_t base_offset;     /* byte offset of texel (0,0) in the placement */
     uint32_t buffer_ref;      /* buffer-backed: the buffer's object id, else 0 */
     uint32_t surface_id;      /* IOSurface-backed: the surface's id, else 0 */
+    uint32_t plane;           /* IOSurface-backed: the surface plane it views */
 } lagfx_texture_object_t;
 
-/* An IOSurface's record in task 0. */
+/* One plane of an IOSurface. */
+typedef struct {
+    uint32_t offset;          /* bytes from the start of the surface's memory */
+    uint32_t width, height;
+    uint32_t bytes_per_row, bytes_per_element;
+} lagfx_iosurface_plane_t;
+
+/* An IOSurface's record in task 0. width .. bytes_per_element repeat plane 0. */
 typedef struct {
     uint64_t size, page;
     uint32_t fourcc;
     uint32_t width, height;
     uint32_t bytes_per_row, bytes_per_element;
+    uint32_t plane_count;     /* 1 for single-plane surfaces */
+    lagfx_iosurface_plane_t planes[LAGFX_IOSURFACE_MAX_PLANES];
 } lagfx_iosurface_record_t;
 
 /* Decode; false when the bytes don't look like a texture object. */

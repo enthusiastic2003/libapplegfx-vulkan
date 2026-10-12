@@ -66,6 +66,7 @@ bool lagfx_parse_iosurface_texture_object(const uint8_t *b, size_t len,
     out->mip_levels   = rd16(b + 0x24);
     out->sample_count = rd16(b + 0x26);
     out->array_length = rd16(b + 0x28);
+    out->plane        = rd32(b + 0x34);
     if (out->surface_id == 0u || (b[0x14] & 0xf0u) != 0x40u) return false;
     if (out->width == 0u || out->height == 0u || out->width > 16384u || out->height > 16384u)
         return false;
@@ -99,27 +100,42 @@ bool lagfx_parse_buffer_texture_object(const uint8_t *b, size_t len, lagfx_textu
 }
 
 bool lagfx_parse_iosurface_record(const uint8_t *b, size_t len, lagfx_iosurface_record_t *out) {
-    if (!b || !out || len < LAGFX_IOSURFACE_RECORD_LEN) return false;
+    if (!b || !out || len < LAGFX_IOSURFACE_RECORD_MIN_LEN) return false;
     memset(out, 0, sizeof(*out));
-    out->size              = rd64(b + 0x00);
-    out->page              = rd64(b + 0x08) & 0xffffffffull;
-    out->fourcc            = rd32(b + 0x0c);
-    out->width             = rd32(b + 0x18);
-    out->height            = rd32(b + 0x1c);
-    out->bytes_per_row     = rd16(b + 0x20);
-    out->bytes_per_element = b[0x23];
-    if (out->size == 0u || out->page == 0u || out->width == 0u || out->height == 0u)
-        return false;
-    if (out->bytes_per_row < out->width) return false;
-    return (uint64_t)out->bytes_per_row * out->height <= out->size;
+    out->size   = rd64(b + 0x00);
+    out->page   = rd64(b + 0x08) & 0xffffffffull;
+    out->fourcc = rd32(b + 0x0c);
+    uint32_t count = rd32(b + 0x10);
+    out->plane_count = count == 0u ? 1u : count;
+    if (out->plane_count > LAGFX_IOSURFACE_MAX_PLANES) return false;
+    for (uint32_t i = 0; i < out->plane_count; i++) {
+        const uint8_t *e = b + 0x14u + 0x10u * i;
+        if ((size_t)(e + 0x10 - b) > len) return false;
+        lagfx_iosurface_plane_t *pl = &out->planes[i];
+        pl->offset            = rd32(e + 0x0);
+        pl->width             = rd32(e + 0x4);
+        pl->height            = rd32(e + 0x8);
+        pl->bytes_per_row     = rd16(e + 0xc);
+        pl->bytes_per_element = e[0xf];
+        if (pl->width == 0u || pl->height == 0u || pl->bytes_per_row < pl->width) return false;
+        if ((uint64_t)pl->offset + (uint64_t)pl->bytes_per_row * pl->height > out->size)
+            return false;
+    }
+    out->width             = out->planes[0].width;
+    out->height            = out->planes[0].height;
+    out->bytes_per_row     = out->planes[0].bytes_per_row;
+    out->bytes_per_element = out->planes[0].bytes_per_element;
+    return out->size != 0u && out->page != 0u;
 }
 
 bool lagfx_texture_object_attach_surface(lagfx_texture_object_t *t,
                                          const lagfx_iosurface_record_t *s) {
-    if (!t || !s) return false;
-    /* A texture may cover part of the surface, never more. */
-    if (t->width > s->width || t->height > s->height) return false;
-    t->bytes_per_row = s->bytes_per_row;
+    if (!t || !s || t->plane >= s->plane_count) return false;
+    const lagfx_iosurface_plane_t *pl = &s->planes[t->plane];
+    /* A texture may cover part of its plane, never more. */
+    if (t->width > pl->width || t->height > pl->height) return false;
+    t->bytes_per_row = pl->bytes_per_row;
+    t->base_offset = pl->offset;
     t->n_place = 1;
     t->place[0].size = s->size;
     t->place[0].page = s->page;

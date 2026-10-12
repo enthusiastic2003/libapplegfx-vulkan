@@ -60,6 +60,20 @@ void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref) {
 #include "vulkan/instance.h"
 #include "vulkan/render_target.h"
 
+/* Read an IOSurface record: one plane's worth, then the rest of the plane
+ * entries when it has more (a full-length read could run off the page). */
+static bool read_surface_record(lagfx_protocol_t *p, const lagfx_task_entry_t *t0, uint64_t va,
+                                uint8_t *b, size_t cap, lagfx_iosurface_record_t *rec) {
+    size_t len = LAGFX_IOSURFACE_RECORD_MIN_LEN;
+    if (cap < len || !lagfx_task_read_virtual(p, t0, va, (uint32_t)len, b)) return false;
+    uint32_t count = lagfx_le32(b + 0x10);
+    if (count > 1u) {
+        len = 0x14u + 0x10u * (size_t)count;
+        if (len > cap || !lagfx_task_read_virtual(p, t0, va, (uint32_t)len, b)) return false;
+    }
+    return lagfx_parse_iosurface_record(b, len, rec);
+}
+
 /* An IOSurface texture's memory belongs to its surface: object <surface id>
  * of task 0 (see protocol/texture_object.h). */
 static bool attach_surface(lagfx_protocol_t *p, lagfx_texture_object_t *obj,
@@ -70,10 +84,10 @@ static bool attach_surface(lagfx_protocol_t *p, lagfx_texture_object_t *obj,
     uint8_t b[LAGFX_IOSURFACE_RECORD_LEN];
     lagfx_iosurface_record_t rec;
     if (!t0 || !lagfx_resolve_object_data(p, t0, obj->surface_id, &type, &va, &gpa)
-        || va == 0u || type != 0x04u || !lagfx_task_read_virtual(p, t0, va, sizeof b, b)
-        || !lagfx_parse_iosurface_record(b, sizeof b, &rec)
+        || va == 0u || type != 0x04u || !read_surface_record(p, t0, va, b, sizeof b, &rec)
         || !lagfx_texture_object_attach_surface(obj, &rec)) {
-        LAGFX_WARN("guest_texture: IOSurface %u not found in task 0", obj->surface_id);
+        LAGFX_WARN("guest_texture: IOSurface %u (plane %u) not found in task 0", obj->surface_id,
+                   obj->plane);
         return false;
     }
     *mem_task = t0;
@@ -86,12 +100,17 @@ static bool attach_surface(lagfx_protocol_t *p, lagfx_texture_object_t *obj,
         for (unsigned k = 0; k < 256u; k++) dup |= seen_r[k] == key;
         if (!dup) {
             seen_r[nr++ % 256u] = key;
-            char hx[3 * LAGFX_IOSURFACE_RECORD_LEN + 1];
-            size_t hn = 0;
-            for (unsigned k = 0; k < sizeof b; k++)
-                hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", b[k]);
-            LAGFX_WARN("SURFREC id=%u tex %ux%u fmt %u: %s", obj->surface_id, obj->width,
-                       obj->height, obj->pixel_format, hx);
+            /* past the fields we decode: multi-plane surfaces carry more */
+            uint8_t wide[0xa0];
+            if (!lagfx_task_read_virtual(p, t0, va, sizeof wide, wide)) memset(wide, 0, sizeof wide);
+            for (unsigned row = 0; row < sizeof wide; row += 32u) {
+                char hx[3 * 32 + 1];
+                size_t hn = 0;
+                for (unsigned k = row; k < row + 32u; k++)
+                    hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", wide[k]);
+                LAGFX_WARN("SURFREC id=%u tex %ux%u fmt %u +%02x: %s", obj->surface_id, obj->width,
+                           obj->height, obj->pixel_format, row, hx);
+            }
         }
     }
     if (getenv("LAGFX_DUMP_WB")) {
@@ -124,8 +143,8 @@ uint8_t *lagfx_iosurface_read_pixels(lagfx_protocol_t *p, uint32_t surface_id,
     memset(&rec, 0, sizeof rec);
     memset(b, 0, sizeof b);
     bool found = t0 && lagfx_resolve_object_data(p, t0, surface_id, &type, &va, &gpa) && va != 0u;
-    bool read = found && lagfx_task_read_virtual(p, t0, va, sizeof b, b);
-    bool parsed = read && lagfx_parse_iosurface_record(b, sizeof b, &rec);
+    bool read = found && lagfx_task_read_virtual(p, t0, va, LAGFX_IOSURFACE_RECORD_MIN_LEN, b);
+    bool parsed = read && read_surface_record(p, t0, va, b, sizeof b, &rec);
     if (!found || type != 0x04u || !parsed || rec.bytes_per_element != 4u) {
         LAGFX_WARN("iosurface: surface %u not readable (found=%d type=0x%02x read=%d parsed=%d "
                    "%ux%u bpr %u bpe %u size 0x%llx fourcc 0x%08x)",

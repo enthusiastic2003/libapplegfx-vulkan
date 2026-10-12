@@ -96,6 +96,45 @@ static void test_iosurface(void) {
     make_surface(sb, 0x2000, 0x8d1, 100, 20, 512);
     CHECK(!lagfx_parse_iosurface_record(sb, sizeof sb, &s));
 
+    /* a two-plane '420v' surface (bytes from kat iosurface-planes): Y 128x96
+     * at 192 bytes per row, then CbCr 64x48 at 160 bytes per row, 0x5000 in */
+    {
+        static const uint8_t rec2[0x34] = {
+            0x00, 0x70, 0, 0, 0, 0, 0, 0,  0xbe, 0x78, 0, 0,  0x76, 0x30, 0x32, 0x34,
+            0x02, 0, 0, 0,  0, 0, 0, 0,  0x80, 0, 0, 0,  0x60, 0, 0, 0,
+            0xc0, 0x00, 0x00, 0x01,  0x00, 0x50, 0, 0,  0x40, 0, 0, 0,  0x30, 0, 0, 0,
+            0xa0, 0x00, 0x00, 0x02,
+        };
+        CHECK(lagfx_parse_iosurface_record(rec2, sizeof rec2, &s));
+        CHECK(s.plane_count == 2 && s.fourcc == 0x34323076u && s.page == 0x78be);
+        CHECK(s.width == 128 && s.height == 96 && s.bytes_per_row == 192 && s.bytes_per_element == 1);
+        CHECK(s.planes[1].offset == 0x5000 && s.planes[1].width == 64 && s.planes[1].height == 48);
+        CHECK(s.planes[1].bytes_per_row == 160 && s.planes[1].bytes_per_element == 2);
+        /* truncated before plane 1's entry */
+        CHECK(!lagfx_parse_iosurface_record(rec2, 0x24, &s));
+        CHECK(lagfx_parse_iosurface_record(rec2, sizeof rec2, &s));
+
+        make_ios_tex(tb, 6, 64, 48, 30, 1, 1);      /* RG8Unorm, plane 1 */
+        put32(tb, 0x34, 1);
+        CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+        CHECK(t.plane == 1);
+        CHECK(lagfx_texture_object_attach_surface(&t, &s));
+        CHECK(t.bytes_per_row == 160 && t.base_offset == 0x5000 && t.place[0].page == 0x78be);
+
+        make_ios_tex(tb, 6, 128, 96, 10, 1, 1);     /* R8Unorm, plane 0 */
+        CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+        CHECK(lagfx_texture_object_attach_surface(&t, &s));
+        CHECK(t.plane == 0 && t.bytes_per_row == 192 && t.base_offset == 0);
+
+        put32(tb, 0x34, 2);                         /* no such plane */
+        CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+        CHECK(!lagfx_texture_object_attach_surface(&t, &s));
+        make_ios_tex(tb, 6, 128, 96, 30, 1, 1);     /* plane 1 is only 64x48 */
+        put32(tb, 0x34, 1);
+        CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+        CHECK(!lagfx_texture_object_attach_surface(&t, &s));
+    }
+
     /* no surface id / not a descriptor */
     make_ios_tex(tb, 0, 40, 24, 80, 1, 1);
     CHECK(!lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
