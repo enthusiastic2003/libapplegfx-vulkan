@@ -1474,6 +1474,9 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                     break;
                 }
 
+                if (getenv("LAGFX_DRAWMAP"))
+                    LAGFX_WARN("PIPEFN pipe=0x%x %s %s", reference,
+                               stage == 0 ? "vtx" : "frag", fn->name);
                 /* Parse AIR + translate to SPIR-V. */
                 lagfx_air_module_t *m = NULL;
                 lagfx_status_t open_st = lagfx_air_module_open(

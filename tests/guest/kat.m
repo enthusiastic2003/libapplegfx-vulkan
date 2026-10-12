@@ -78,6 +78,11 @@ static NSString *const kShaderSrc =
      "    return float4(p[vid], 0, 1);\n"
      "}\n"
      "fragment float4 fs_red() { return float4(1, 0, 0, 1); }\n"
+     // positions indexed by vertex id and a matrix, both from buffers (as Core Animation draws)
+     "vertex float4 vs_vid_mat(uint vid [[vertex_id]], const device float2 *pos [[buffer(1)]],\n"
+     "                         constant float4x4 &m [[buffer(2)]]) {\n"
+     "    return m * float4(pos[vid], 0, 1);\n"
+     "}\n"
      // vertex buffer with a serialized vertex descriptor
      "struct VIn { float2 pos [[attribute(0)]]; float4 color [[attribute(1)]]; };\n"
      "struct VOut { float4 pos [[position]]; float4 color; };\n"
@@ -326,6 +331,34 @@ static BOOL case_triangle(void) {
 // Interleaved vertex buffer at buffer index 0: float2 position @0 and a
 // uchar4-normalized color @8, stride 12 — goes through the serialized vertex
 // descriptor on the host.
+// Vertex positions (pixels) and an orthographic matrix at large offsets in one
+// shared buffer, bound at indices 1 and 2: the pattern of WindowServer's draws.
+static BOOL case_vid_matrix(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_vid_mat", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    enum { kPosOff = 0x18000, kMatOff = 0x19a00 };
+    id<MTLBuffer> b = [gDevice newBufferWithLength:0x40000 options:MTLResourceStorageModeShared];
+    uint8_t *base = b.contents;
+    memset(base, 0xee, 0x40000);
+    const float k = (float)kSize;
+    float pos[6] = { 0, 0, k, 0, 0, k };
+    memcpy(base + kPosOff, pos, sizeof pos);
+    float m[16] = { 2 / k, 0, 0, 0,   0, 2 / k, 0, 0,   0, 0, 1, 0,   -1, -1, 0, 1 };  // columns
+    memcpy(base + kMatOff, m, sizeof m);
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 1, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setVertexBuffer:b offset:kPosOff atIndex:1];
+    [enc setVertexBuffer:b offset:kMatOff atIndex:2];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return in_tri(x, y) ? kRed : kBlue; }, tri_edge);
+}
+
 static BOOL case_triangle_vbuf(void) {
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
     vd.attributes[0].format = MTLVertexFormatFloat2;
@@ -759,6 +792,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"clear", case_clear, YES},
     {"triangle", case_triangle, YES},
     {"triangle-vbuf", case_triangle_vbuf, YES},
+    {"vid-matrix", case_vid_matrix, YES},
     {"frag-bytes", case_frag_bytes, YES},
     {"frag-buffer", case_frag_buffer, YES},
     {"load", case_load, YES},

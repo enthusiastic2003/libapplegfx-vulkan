@@ -419,6 +419,10 @@ typedef struct {
     uint32_t                  n_vec_cache;
 } xlate_ctx_t;
 
+/* Entry function being translated, for warnings. */
+static __thread const char *g_xlate_fn;
+#define XFN (g_xlate_fn ? g_xlate_fn : "?")
+
 /* Copy the MODULE-scope mutable state between function contexts. Helper
  * functions are translated with their own ctx (fresh value maps — bitcode
  * value-id spaces are per function) but must SHARE every uniqueness-
@@ -2320,6 +2324,25 @@ static void emit_module_vars_and_function(xlate_ctx_t *c) {
             uint32_t id_load = lagfx_spv_builder_alloc_id(c->b);
             uint32_t ops[] = { elem_spv, id_load, c->arg_input_var_ids[i] };
             lagfx_spv_builder_emit_op(c->b, LAGFX_SPV_OP_LOAD, ops, 3);
+            /* The built-in is a 32-bit uint, but the Metal argument may be
+             * narrower (`ushort vid [[vertex_id]]`, as Core Animation's
+             * vertex shaders declare it). Every use of the argument has the
+             * narrow type (compares against ushort constants), so convert:
+             * a mixed-width OpIEqual is invalid and lavapipe evaluated it
+             * wrongly, misplacing quad corners. */
+            if (k == LAGFX_VARG_VID) {
+                uint32_t nt = 0;
+                const lagfx_air_type_t *ts = lagfx_air_module_types(c->m, &nt);
+                uint32_t at = c->arg_air_type_ids[i];
+                if (ts && at < nt && ts[at].kind == LAGFX_AIR_TYPE_INTEGER
+                    && ts[at].num_op >= 1u && ts[at].op[0] < 32u) {
+                    uint32_t narrow = emit_air_type(c, at);
+                    uint32_t id_conv = lagfx_spv_builder_alloc_id(c->b);
+                    uint32_t cops[] = { narrow, id_conv, id_load };
+                    lagfx_spv_builder_emit_op(c->b, LAGFX_SPV_OP_UCONVERT, cops, 3);
+                    id_load = id_conv;
+                }
+            }
             c->arg_spv_ids[i] = id_load;
             bind_value_spv(c, c->arg_id_base + i, id_load);
         }
@@ -2548,6 +2571,120 @@ static bool emit_bool_to_float_select(xlate_ctx_t *c, uint32_t opval_id,
     return true;
 }
 
+/* Integer constant `val` (low `width` bits, sign-extended for widths > 32)
+ * of SPIR-V integer type `spv_ty`. */
+static uint32_t emit_const_int_of(xlate_ctx_t *c, uint32_t spv_ty, uint32_t width,
+                                  uint64_t val) {
+    if (width < 64u) val &= ((uint64_t)1 << width) - 1u;
+    uint32_t cached = cache_lookup_const(c, 1, spv_ty, val);
+    if (cached) return cached;
+    uint32_t id = lagfx_spv_builder_alloc_id(c->b);
+    uint32_t ops[4] = { spv_ty, id, (uint32_t)val, (uint32_t)(val >> 32) };
+    lagfx_spv_builder_emit_op(c->b, LAGFX_SPV_OP_CONSTANT, ops, width > 32u ? 4u : 3u);
+    cache_store_const(c, 1, spv_ty, val, id);
+    return id;
+}
+
+/* Is value `id` a bool (i1) scalar or vector? */
+static bool value_is_bool(xlate_ctx_t *c, uint32_t id) {
+    uint32_t src_ty = value_air_type_idx(c, id);
+    if (src_ty == LAGFX_AIR_TYPE_BOOL) return true;
+    uint32_t n_types = 0;
+    const lagfx_air_type_t *ts = lagfx_air_module_types(c->m, &n_types);
+    if (src_ty != LAGFX_AIR_TYPE_NONE && src_ty < n_types) {
+        const lagfx_air_type_t *st = &ts[src_ty];
+        if (st->kind == LAGFX_AIR_TYPE_VECTOR && st->num_op >= 2u && st->op[1] < n_types)
+            st = &ts[st->op[1]];
+        if (st->kind == LAGFX_AIR_TYPE_INTEGER && st->num_op >= 1u && st->op[0] == 1u)
+            return true;
+    }
+    uint32_t have = get_value_spv_type(c, id);
+    uint32_t b = emit_type_bool(c);
+    if (have == b) return true;
+    for (uint32_t l = 2; l <= 4; l++)
+        if (have && have == emit_type_vec(c, b, l)) return true;
+    return false;
+}
+
+/* Integer AIR type `ty` (scalar or vector): lanes and element width; false if
+ * it isn't an integer type. */
+static bool air_int_shape(xlate_ctx_t *c, uint32_t ty, uint32_t *lanes, uint32_t *width,
+                          uint32_t *elem_ty) {
+    uint32_t n_types = 0;
+    const lagfx_air_type_t *ts = lagfx_air_module_types(c->m, &n_types);
+    if (ty >= n_types) return false;
+    *lanes = 1u;
+    *elem_ty = ty;
+    if (ts[ty].kind == LAGFX_AIR_TYPE_VECTOR && ts[ty].num_op >= 2u) {
+        *lanes = (uint32_t)ts[ty].op[0];
+        *elem_ty = ts[ty].op[1];
+    }
+    if (*elem_ty >= n_types || ts[*elem_ty].kind != LAGFX_AIR_TYPE_INTEGER
+        || ts[*elem_ty].num_op < 1u || *lanes > 4u)
+        return false;
+    *width = (uint32_t)ts[*elem_ty].op[0];
+    return true;
+}
+
+/* Splat scalar constant `k` to a `lanes`-wide composite of type `vec_ty`. */
+static uint32_t splat(xlate_ctx_t *c, uint32_t vec_ty, uint32_t k, uint32_t lanes) {
+    if (lanes <= 1u) return k;
+    uint32_t v[6] = { vec_ty, lagfx_spv_builder_alloc_id(c->b) };
+    for (uint32_t i = 0; i < lanes; i++) v[2 + i] = k;
+    lagfx_spv_builder_emit_op(c->b, LAGFX_SPV_OP_COMPOSITE_CONSTRUCT, v, 2u + lanes);
+    return v[1];
+}
+
+/* Lower `zext/sext i1 -> iN` to OpSelect(cond, 1 or -1, 0): SPIR-V bool is not
+ * an integer, so OpUConvert/OpSConvert reject it (Xgc's `zext i1` before a
+ * sitofp). Returns true if the lowering applied. */
+static bool emit_bool_to_int_select(xlate_ctx_t *c, uint32_t opval_id, uint32_t opval_spv,
+                                    uint32_t dest_ty, bool sign, uint32_t result_value_id) {
+    if (!value_is_bool(c, opval_id)) return false;
+    uint32_t lanes, width, elem_ty;
+    if (!air_int_shape(c, dest_ty, &lanes, &width, &elem_ty) || width <= 1u) return false;
+    uint32_t dest_spv = emit_air_type(c, dest_ty);
+    uint32_t elem_spv = emit_air_type(c, elem_ty);
+    uint32_t one  = splat(c, dest_spv, emit_const_int_of(c, elem_spv, width, sign ? ~0ull : 1u),
+                          lanes);
+    uint32_t zero = splat(c, dest_spv, emit_const_int_of(c, elem_spv, width, 0u), lanes);
+    uint32_t rid = lagfx_spv_builder_alloc_id(c->b);
+    uint32_t sel[] = { dest_spv, rid, opval_spv, one, zero };
+    lagfx_spv_builder_emit_op(c->b, LAGFX_SPV_OP_SELECT, sel, 5);
+    bind_value_spv(c, result_value_id, rid);
+    set_result_air_type(c, result_value_id, dest_ty);
+    set_value_spv_type(c, result_value_id, dest_spv);
+    return true;
+}
+
+/* Lower `trunc iN -> i1` to (x & 1) != 0 (OpUConvert can't produce a bool).
+ * Returns true if the lowering applied. */
+static bool emit_int_to_bool_trunc(xlate_ctx_t *c, uint32_t opval_id, uint32_t opval_spv,
+                                   uint32_t dest_ty, uint32_t result_value_id) {
+    uint32_t dl, dw, de;
+    if (dest_ty != LAGFX_AIR_TYPE_BOOL
+        && !(air_int_shape(c, dest_ty, &dl, &dw, &de) && dw == 1u))
+        return false;
+    uint32_t src_ty = value_air_type_idx(c, opval_id);
+    uint32_t lanes, width, elem_ty;
+    if (!air_int_shape(c, src_ty, &lanes, &width, &elem_ty) || width <= 1u) return false;
+    uint32_t src_spv = emit_air_type(c, src_ty);
+    uint32_t elem_spv = emit_air_type(c, elem_ty);
+    uint32_t one  = splat(c, src_spv, emit_const_int_of(c, elem_spv, width, 1u), lanes);
+    uint32_t zero = splat(c, src_spv, emit_const_int_of(c, elem_spv, width, 0u), lanes);
+    uint32_t bty = lanes > 1u ? emit_type_vec(c, emit_type_bool(c), lanes) : emit_type_bool(c);
+    uint32_t and_id = lagfx_spv_builder_alloc_id(c->b);
+    uint32_t a[] = { src_spv, and_id, opval_spv, one };
+    lagfx_spv_builder_emit_op(c->b, LAGFX_SPV_OP_BITWISE_AND, a, 4);
+    uint32_t rid = lagfx_spv_builder_alloc_id(c->b);
+    uint32_t ne[] = { bty, rid, and_id, zero };
+    lagfx_spv_builder_emit_op(c->b, LAGFX_SPV_OP_INOT_EQUAL, ne, 4);
+    bind_value_spv(c, result_value_id, rid);
+    set_result_air_type(c, result_value_id, LAGFX_AIR_TYPE_BOOL);
+    set_value_spv_type(c, result_value_id, bty);
+    return true;
+}
+
 static void emit_inst_cast(xlate_ctx_t *c, uint32_t inst_idx,
                              const lagfx_air_inst_t *inst,
                              uint32_t result_value_id, uint32_t next_val_id) {
@@ -2600,6 +2737,8 @@ static void emit_inst_cast(xlate_ctx_t *c, uint32_t inst_idx,
     /* Per-CastOp dispatch to SPIR-V conversion opcodes per SPIR-V §3.32.11 */
     switch (cast_op) {
         case 0:  /* CAST_TRUNC → OpUConvert (smaller width int) */
+            if (emit_int_to_bool_trunc(c, opval_id, opval_spv, dest_ty, result_value_id))
+                return;
             if (!result_spv) result_spv = lagfx_spv_builder_alloc_id(c->b);
             { uint32_t dest_ty_spv = emit_air_type(c, dest_ty);
               uint32_t ops[] = { dest_ty_spv, result_spv, opval_spv };
@@ -2607,6 +2746,8 @@ static void emit_inst_cast(xlate_ctx_t *c, uint32_t inst_idx,
             break;
 
         case 1:  /* CAST_ZEXT → OpUConvert (larger width int) */
+            if (emit_bool_to_int_select(c, opval_id, opval_spv, dest_ty, false, result_value_id))
+                return;
             if (!result_spv) result_spv = lagfx_spv_builder_alloc_id(c->b);
             { uint32_t dest_ty_spv = emit_air_type(c, dest_ty);
               uint32_t ops[] = { dest_ty_spv, result_spv, opval_spv };
@@ -2614,6 +2755,8 @@ static void emit_inst_cast(xlate_ctx_t *c, uint32_t inst_idx,
             break;
 
         case 2:  /* CAST_SEXT → OpSConvert (larger width int) */
+            if (emit_bool_to_int_select(c, opval_id, opval_spv, dest_ty, true, result_value_id))
+                return;
             if (!result_spv) result_spv = lagfx_spv_builder_alloc_id(c->b);
             { uint32_t dest_ty_spv = emit_air_type(c, dest_ty);
               uint32_t ops[] = { dest_ty_spv, result_spv, opval_spv };
@@ -5094,7 +5237,7 @@ static void emit_inst_extractelt(xlate_ctx_t *c, uint32_t inst_idx,
         }
     }
     if (vec_ty_air == LAGFX_AIR_TYPE_NONE) {
-        LAGFX_WARN("extractelt: couldn't resolve vector operand type — drop");
+        LAGFX_WARN("extractelt: couldn't resolve vector operand type — drop (%s)", XFN);
         return;
     }
 
@@ -5102,7 +5245,7 @@ static void emit_inst_extractelt(xlate_ctx_t *c, uint32_t inst_idx,
     uint32_t n_types = 0u;
     const lagfx_air_type_t *ts = lagfx_air_module_types(c->m, &n_types);
     if (vec_ty_air >= n_types || ts[vec_ty_air].kind != LAGFX_AIR_TYPE_VECTOR) {
-        LAGFX_WARN("extractelt: vector operand type is not a VECTOR — drop");
+        LAGFX_WARN("extractelt: vector operand type is not a VECTOR — drop (%s)", XFN);
         return;
     }
 
@@ -5173,7 +5316,7 @@ static void emit_inst_insertelt(xlate_ctx_t *c, uint32_t inst_idx,
     uint32_t n_types = 0u;
     const lagfx_air_type_t *ts = lagfx_air_module_types(c->m, &n_types);
     if (vec_ty_air >= n_types || ts[vec_ty_air].kind != LAGFX_AIR_TYPE_VECTOR) {
-        LAGFX_WARN("insertelt: vector operand type is not a VECTOR — drop");
+        LAGFX_WARN("insertelt: vector operand type is not a VECTOR — drop (%s)", XFN);
         return;
     }
 
@@ -5259,7 +5402,7 @@ static void emit_inst_select(xlate_ctx_t *c, uint32_t inst_idx,
         result_ty_air = value_air_type_idx(c, false_id);
     }
     if (result_ty_air == LAGFX_AIR_TYPE_NONE) {
-        LAGFX_WARN("select: couldn't resolve operand type — drop");
+        LAGFX_WARN("select: couldn't resolve operand type — drop (%s)", XFN);
         return;
     }
     uint32_t result_spv_type = emit_air_type(c, result_ty_air);
@@ -7740,6 +7883,11 @@ lagfx_air2spv_translate_function(const lagfx_air_module_t *m,
     if (!m || !out_blob || !out_size_bytes) return LAGFX_ERR_INVALID_ARG;
     *out_blob = NULL;
     *out_size_bytes = 0u;
+    {
+        uint32_t nf = 0;
+        const lagfx_air_function_t *fs = lagfx_air_module_functions(m, &nf);
+        g_xlate_fn = (fs && fn_idx < nf) ? lagfx_air_module_string(m, fs[fn_idx].name_offset) : NULL;
+    }
 
     xlate_ctx_t c = {0};
     c.b = lagfx_spv_builder_create(256u);

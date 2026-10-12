@@ -1342,3 +1342,12 @@ psodesc_test = executable('pipeline-descriptor-unit',
   build_by_default : true,
 )
 test('pipeline descriptor decode (unit)', psodesc_test)
+
+# Offline translator driver (tools/air2spv-file.c): translate a metallib saved
+# with LAGFX_DUMP_MLIB=1. Not a test.
+air2spv_file = executable('air2spv-file',
+  '../tools/air2spv-file.c',
+  include_directories : [include_dir, internal_include_dir],
+  dependencies : libapplegfx_vulkan_dep,
+  build_by_default : true,
+)
