@@ -687,6 +687,8 @@ static BOOL case_patch_probe(void) {
 //   M: TriangleStrip, vertexStart 5, vertexCount 7, instanceCount 3, baseInstance 2
 //   N: Triangle, vertexStart 0x11, vertexCount 0x3f, instanceCount 1
 //   O: TriangleStrip, vertexStart 0, vertexCount 4, instanceCount 1
+// Metal 4 exists only in the macOS 26 SDK; on older SDKs the probe is a stub.
+#if __has_include(<Metal/MTL4CommandQueue.h>)
 static BOOL case_mtl4_probe(void) {
     if (@available(macOS 26.0, *)) {
         id<MTL4CommandQueue> q = [gDevice newMTL4CommandQueue];
@@ -727,6 +729,12 @@ static BOOL case_mtl4_probe(void) {
     }
     return NO;
 }
+#else
+static BOOL case_mtl4_probe(void) {
+    printf("  Metal 4 is not in this SDK\n");
+    return YES;
+}
+#endif
 
 // Stencil-then-cover (how the lock screen clock fills its paths): a triangle
 // with colour writes off marks the stencil (Always / Replace, reference 1),
@@ -1485,6 +1493,29 @@ static BOOL case_compute_props(void) {
     return YES;
 }
 
+// Name-only probe: what Metal reports about this device (families, tiers).
+static BOOL case_device_props(void) {
+    printf("  name \"%s\", low power %d, headless %d, unified memory %d\n",
+           gDevice.name.UTF8String, gDevice.lowPower, gDevice.headless, gDevice.hasUnifiedMemory);
+    const struct { const char *n; MTLGPUFamily f; } fam[] = {
+        {"Apple1", MTLGPUFamilyApple1}, {"Apple2", MTLGPUFamilyApple2}, {"Apple3", MTLGPUFamilyApple3},
+        {"Apple4", MTLGPUFamilyApple4}, {"Apple5", MTLGPUFamilyApple5}, {"Apple6", MTLGPUFamilyApple6},
+        {"Apple7", MTLGPUFamilyApple7}, {"Apple8", MTLGPUFamilyApple8}, {"Apple9", MTLGPUFamilyApple9},
+        {"Mac2", MTLGPUFamilyMac2}, {"Common1", MTLGPUFamilyCommon1}, {"Common2", MTLGPUFamilyCommon2},
+        {"Common3", MTLGPUFamilyCommon3}, {"Metal3", MTLGPUFamilyMetal3},
+    };
+    printf("  families:");
+    for (size_t i = 0; i < sizeof fam / sizeof fam[0]; i++)
+        if ([gDevice supportsFamily:fam[i].f]) printf(" %s", fam[i].n);
+    printf("\n  argument buffers tier %lu, read-write textures tier %lu, raytracing %d, "
+           "max buffer %lu MB, recommended working set %lu MB\n",
+           (unsigned long)gDevice.argumentBuffersSupport + 1,
+           (unsigned long)gDevice.readWriteTextureSupport, gDevice.supportsRaytracing,
+           (unsigned long)(gDevice.maxBufferLength >> 20),
+           (unsigned long)(gDevice.recommendedMaxWorkingSetSize >> 20));
+    return YES;
+}
+
 // Not a pass/fail case: draws with known samplers so the host-side dumps
 // (LAGFX_DUMP_AIR_GLOBALS=1 for constexpr samplers, LAGFX_DUMP_OBJ=1 for
 // sampler state objects) can be matched to the settings.
@@ -1726,6 +1757,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
     {"compute-props", case_compute_props, NO},
+    {"device-props", case_device_props, NO},
     {"sampler-probe", case_sampler_probe, NO},
     {"blend-probe", case_blend_probe, NO},
     {"iosurface-probe", case_iosurface_probe, NO},
