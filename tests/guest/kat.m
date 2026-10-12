@@ -872,6 +872,41 @@ static BOOL case_indexed32_small(void) {
     return compare(px, ^bgra_t(int x, int y) { return kRed; }, nil);
 }
 
+// drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:
+// instanceCount: with no base vertex or instance: opcode 0x09, the draw
+// RenderBox (widgets, SwiftUI, the lock screen clock) uses for everything.
+// A strip of four 16-bit indices at 0x200, the rest of the buffer garbage.
+static BOOL case_indexed_instanced(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_vid_mat", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    const float k = (float)kSize;
+    const float pos[8] = { 0, 0, k, 0, 0, k, k, k };
+    const float m[16] = { 2 / k, 0, 0, 0,   0, 2 / k, 0, 0,
+                          0, 0, 1, 0,       -1, -1, 0, 1 };
+    id<MTLBuffer> vb = [gDevice newBufferWithBytes:pos length:sizeof pos
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mb = [gDevice newBufferWithBytes:m length:sizeof m
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ib = [gDevice newBufferWithLength:0x1000 options:MTLResourceStorageModeShared];
+    memset(ib.contents, 0x77, 0x1000);
+    const uint16_t idx[4] = {0, 1, 2, 3};
+    memcpy((uint8_t *)ib.contents + 0x200, idx, sizeof idx);
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setVertexBuffer:vb offset:0 atIndex:1];
+    [enc setVertexBuffer:mb offset:0 atIndex:2];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip indexCount:4
+                     indexType:MTLIndexTypeUInt16 indexBuffer:ib indexBufferOffset:0x200
+                 instanceCount:2];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return kRed; }, nil);
+}
+
 // Name-only probe: one draw (TriangleStrip, start 5, count 7, instances 3,
 // base instance 2) through pipelines with different properties, to find what
 // makes the driver encode a draw as op 0x09 (LAGFX_OPTASK=* on the host):
@@ -1645,6 +1680,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"stencil", case_stencil, YES},
     {"vbuf-instance", case_vbuf_instance, YES},
     {"indexed32-small", case_indexed32_small, YES},
+    {"indexed-instanced", case_indexed_instanced, YES},
     {"tex-linear", case_tex_linear, YES},
     {"tex-pixel", case_tex_pixel, YES},
     {"blend-alpha", case_blend_alpha, YES},

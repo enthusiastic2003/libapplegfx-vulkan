@@ -258,40 +258,36 @@ static int op_draw_indexed_instanced_16(lagfx_protocol_t *p, uint32_t enc, uint3
     return queue_draw(p, task_id, "op_0x1d", &a);
 }
 
-/* 0x09: the draw the lock screen clock's renderer (a third process, with
- * path_distance / path_interior pipelines) issues after each pipeline change.
- * No draw in kat draw-probe produces it, and its first field is only ever 3
- * or 4: likely drawPatches (quadratic / cubic control points), not yet
- * confirmed. Drawing it as plain primitives gives wrong geometry under both
- * readings tried, so it is only drawn with LAGFX_DRAW09=1:
- *   {u32 prim?, u32 instances?, u16 count (+ 2 unknown bytes), u32 start?} */
-static int op_draw_0x09(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
-                        const uint8_t *b, size_t len) {
+/* 0x09 drawIndexedPrimitives:...:indexBufferOffset:instanceCount: (compact)
+ *   {u16 prim, u16 indexType, u32 index buffer, u16 count, u16 byte offset,
+ *    u16 instances}
+ * 0x08 the same, wide: {u16 prim, u16 indexType, u32 buffer, u64 count,
+ *    u64 byte offset, u64 instances}
+ * Layout from the public PVG implementation (apple-silicon-anyos-project,
+ * vendor/pvg-vulkan, pvg-vulkan-wire/src/ops/render.rs), and it fits every
+ * body RenderBox sends (the lock screen clock, widgets, SwiftUI apps), e.g.
+ * 04 00 00 00 01 00 00 00 40 00 00 02 0b 00: a strip of 64 indices at byte
+ * 0x200 of buffer 1, 11 instances. Our draw-probe never hit it: its
+ * instanced indexed draw also had a base vertex and instance (0x1d). */
+static int op_draw_indexed_instanced_compact(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                             const uint8_t *b, size_t len) {
     (void)enc;
-    if (len < 16u || !getenv("LAGFX_DRAW09")) return 1;
-    /* LAGFX_DRAW09=<reading> while the layout is unconfirmed:
-     *   1: +4 instances, +12 vertex start
-     *   2: +4 instances, +12 base instance
-     *   3: +12 instances, +4 ignored (always 1), start 0
-     *   4: indexed {u32 prim, u32 indexType, u16 count, u16 offset, u32 buffer} */
-    unsigned mode = (unsigned)strtoul(getenv("LAGFX_DRAW09"), NULL, 0);
-    draw_args_t a = { .prim = lagfx_le32(b), .count = lagfx_le16(b + 8) };
-    if (mode == 1u) {
-        a.instances = lagfx_le32(b + 4);
-        a.start = (int32_t)lagfx_le32(b + 12);
-    } else if (mode == 2u) {
-        a.instances = lagfx_le32(b + 4);
-        a.base_instance = lagfx_le32(b + 12);
-    } else if (mode == 4u) {
-        /* indexed: {u32 prim, u32 indexType, u16 count, u16 offset, u32 index buffer} */
-        a.indexed = true;
-        a.index_type = lagfx_le32(b + 4);
-        a.index_offset = lagfx_le16(b + 10);
-        a.index_ref = lagfx_le32(b + 12);
-    } else {
-        a.instances = lagfx_le32(b + 12);
-    }
+    if (len < 14u) return 1;
+    draw_args_t a = { .indexed = true, .prim = lagfx_le16(b), .index_type = lagfx_le16(b + 2),
+                      .index_ref = lagfx_le32(b + 4), .count = lagfx_le16(b + 8),
+                      .index_offset = lagfx_le16(b + 10), .instances = lagfx_le16(b + 12) };
     return queue_draw(p, task_id, "op_0x09", &a);
+}
+
+static int op_draw_indexed_instanced_wide(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                          const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 32u) return 1;
+    draw_args_t a = { .indexed = true, .prim = lagfx_le16(b), .index_type = lagfx_le16(b + 2),
+                      .index_ref = lagfx_le32(b + 4), .count = (uint32_t)lagfx_le64(b + 8),
+                      .index_offset = lagfx_le64(b + 16),
+                      .instances = (uint32_t)lagfx_le64(b + 24) };
+    return queue_draw(p, task_id, "op_0x08", &a);
 }
 
 static int op_draw_primitives_16(lagfx_protocol_t *p,
@@ -2250,7 +2246,8 @@ static const lagfx_compute_inner_op_desc_t compute_inner_op_table[] = {
     { 0x0002, "DrawInstancedPrimitives64",       op_draw_instanced_64 },
     { 0x0004, "DrawBaseInstancePrimitives64",    op_draw_base_instance_64 },
     { 0x0005, "DrawBaseInstancePrimitives16",    op_draw_base_instance_16 },
-    { 0x0009, "DrawPrimitives0x09",              op_draw_0x09 },
+    { 0x0009, "DrawIndexedInstancedPrimitives16", op_draw_indexed_instanced_compact },
+    { 0x0008, "DrawIndexedInstancedPrimitives64", op_draw_indexed_instanced_wide },
     { 0x001d, "DrawIndexedInstancedPrimitives16", op_draw_indexed_instanced_16 },
     { 0x0068, "SetDepthStencilState",            op_set_depth_stencil_state },
     { 0x0077, "SetStencilReference",             op_set_stencil_reference },
