@@ -15,6 +15,7 @@
 #include "../../vulkan/display_blit.h"
 #include "../../vulkan/iosurface.h"
 #include "../../protocol/resource_registry.h"
+#include "../../protocol/object_resolver.h"
 #include "../compute/compute_draw_internal.h"  /* lagfx_texture_realize */
 #include "../compute/guest_texture.h"           /* lagfx_iosurface_read_pixels */
 #endif
@@ -799,31 +800,42 @@ lagfx_handler_status_t lagfx_display_define_child_fifo(
         return LAGFX_HANDLER_ERR_SIZE;
     }
 
-    uint64_t ring_base = lagfx_le64(hdr->payload + 8);
-    uint64_t ring_size = lagfx_le64(hdr->payload + 16);
-    uint32_t entry_count = lagfx_le32(hdr->payload + 24);
-
-    /* display_index = current_chan_id - 5 (SLOT_DISPLAY_PIPE_0 starts
-     * at chan 5). Guard against the underflow that would happen if
-     * this handler is ever invoked on a non-display channel — the
-     * vchan-compact 0x04 currently routes only from channel 5+, but
-     * a future router change could regress that. Log a sentinel
-     * instead of u32-wrapping to ~4 billion. */
-    int display_index = (int)p->current_chan_id - 5;
-    if (display_index < 0) {
-        LAGFX_WARN("vchan CmdDefineChildFIFO: invoked on chan=%u (<5) — "
-                   "logging as display_index=-1",
-                   (unsigned)p->current_chan_id);
-        display_index = -1;
+    /* Display op 0x04 is the cursor image, not a child FIFO (matched against
+     * the guest's 8x8 placeholders and its arrow; the host advertises a 64x64
+     * cursor at shared page +0x18):
+     *   +0 u32 display, +4 u32 ?, +8 u64 image address, +16 u64 buffer size
+     *   (0x4000 = 64*64*4), +24 u64 bytes per row, +32 u16 width, +34 u16
+     *   height, +36 u16 hot x, +38 u16 hot y.
+     * The position and visibility are on the shared page (+0xe00, timer.c). */
+    uint32_t display_id = lagfx_le32(hdr->payload + 0);
+    uint64_t addr = lagfx_le64(hdr->payload + 8);
+    uint64_t bpr = lagfx_le64(hdr->payload + 24);
+    uint32_t w = lagfx_le16(hdr->payload + 32), h = lagfx_le16(hdr->payload + 34);
+    uint16_t hot_x = lagfx_le16(hdr->payload + 36), hot_y = lagfx_le16(hdr->payload + 38);
+    if (w == 0u || h == 0u || w > 256u || h > 256u || bpr < (uint64_t)w * 4u) {
+        LAGFX_WARN("cursor image: unexpected %ux%u bpr %llu", w, h, (unsigned long long)bpr);
+        return LAGFX_HANDLER_OK;
     }
-
-    LAGFX_LOG("vchan CmdDefineChildFIFO: display[%d] ring_base=0x%llx size=0x%x entries=%u stamp=0x%08x",
-              display_index, (unsigned long long)ring_base,
-              (uint32_t)ring_size, entry_count, hdr->stamp);
-
-    /* TODO: Store child FIFO geometry for sub-channel command delivery */
-    LAGFX_WARN("CmdDefineChildFIFO: FIFO geometry storage not implemented yet");
-
+    uint8_t *px = malloc((size_t)w * h * 4u);
+    if (!px) return LAGFX_HANDLER_OK;
+    /* The address is in task 0's GPU address space (like IOSurface memory). */
+    lagfx_task_entry_t *t0 = lagfx_protocol_find_task(p, 0u);
+    bool ok = t0 != NULL;
+    for (uint32_t y = 0; y < h && ok; y++)
+        ok = lagfx_task_read_virtual(p, t0, addr + (uint64_t)y * bpr, w * 4u, px + (size_t)y * w * 4u);
+    size_t nz = 0;
+    for (size_t k = 0; ok && k < (size_t)w * h * 4u; k++) nz += px[k] != 0u;
+    LAGFX_WARN("cursor image: display %u %ux%u hot (%u,%u) at 0x%llx: %s, %zu bytes non-zero",
+               display_id, w, h, hot_x, hot_y, (unsigned long long)addr,
+               ok ? "read" : "unreadable", nz);
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    if (ok && dev && display_id < LAGFX_MAX_DISPLAYS && dev->displays[display_id]
+        && dev->displays[display_id]->desc.callbacks.cursor_glyph) {
+        lagfx_display_t *d = dev->displays[display_id];
+        d->desc.callbacks.cursor_glyph(d->desc.callbacks.opaque, px, w, h,
+                                       (lagfx_coord_t){ hot_x, hot_y });
+    }
+    free(px);
     return LAGFX_HANDLER_OK;
 }
 

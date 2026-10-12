@@ -11,6 +11,7 @@
 #include "../common/log.h"
 #ifdef LAGFX_HAVE_VULKAN
 #include "../device.h"
+#include "../display.h"
 #include "../protocol/state.h"
 #include "../vulkan/iosurface.h"
 #endif
@@ -120,6 +121,22 @@ bool lagfx_timer_tick_vblank(
 
             /* Mark as enabled to avoid repeated IRQ raises. */
             dev->display_ss_enabled |= (1u << i);
+        }
+
+        /* The cursor: shared page +0xe00 {u16 x, u16 y}, +0xe04 u32 visible
+         * (written by the guest; found by moving the pointer). */
+        uint64_t cw = 0u;
+        if (read_memory(shell_opaque, ss_gpa + 0xe00u, sizeof cw, &cw)
+            && cw != dev->cursor_ss_word[i] && dev->displays[i]) {
+            lagfx_display_t *d = dev->displays[i];
+            bool vis = (cw >> 32) != 0u, was = (dev->cursor_ss_word[i] >> 32) != 0u;
+            bool first = dev->cursor_ss_word[i] == 0u;
+            dev->cursor_ss_word[i] = cw;
+            d->cursor_pos = (lagfx_coord_t){ (int16_t)(cw & 0xffffu), (int16_t)((cw >> 16) & 0xffffu) };
+            if ((first || vis != was) && d->desc.callbacks.cursor_show)
+                d->desc.callbacks.cursor_show(d->desc.callbacks.opaque, vis);
+            if (d->desc.callbacks.cursor_moved)
+                d->desc.callbacks.cursor_moved(d->desc.callbacks.opaque);
         }
     }
 
