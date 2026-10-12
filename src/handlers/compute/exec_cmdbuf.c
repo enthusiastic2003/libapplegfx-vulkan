@@ -565,6 +565,7 @@ lagfx_handler_status_t lagfx_compute_exec_cmdbuf(lagfx_protocol_t *p, const lagf
             lagfx_guest_texture_writeback(p, task, gdev->vk);
     }
 #endif
+    if (task) task->cmdbuf_gen++;
     LAGFX_LOG("CmdExecIndirect2: completed taskID=%u (observation-only)",
               task_id);
 

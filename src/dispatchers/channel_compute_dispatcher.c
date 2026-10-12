@@ -21,6 +21,7 @@
  * authoritative — host advances it after draining.
  */
 
+#include "cmd_dump.h"
 #include "channel_compute_dispatcher.h"
 #include "ring_common.h"
 #include "../doorbell.h"
@@ -430,6 +431,7 @@ size_t channel_compute_dispatcher_drain(lagfx_protocol_t *p, uint32_t chan_id) {
         hdr.payload      = (hdr.payload_size > 0)
                               ? (cmd_buf + LAGFX_CMD_HEADER_BYTES)
                               : NULL;
+        lagfx_dump_cmd("compute", &hdr);
 
         dispatch_command(p, &hdr);
 

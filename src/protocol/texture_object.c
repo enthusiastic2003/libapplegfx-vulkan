@@ -45,3 +45,49 @@ bool lagfx_parse_texture_object(const uint8_t *b, size_t len, lagfx_texture_obje
     }
     return true;
 }
+
+bool lagfx_parse_iosurface_texture_object(const uint8_t *b, size_t len,
+                                          lagfx_texture_object_t *out) {
+    if (!b || !out || len < LAGFX_IOSURFACE_TEXTURE_MIN_LEN) return false;
+    memset(out, 0, sizeof(*out));
+    out->surface_id   = rd32(b + 0x00);
+    out->usage        = b[0x15];
+    out->pixel_format = rd16(b + 0x16);
+    out->width        = rd32(b + 0x18);
+    out->height       = rd32(b + 0x1c);
+    out->depth        = rd32(b + 0x20);
+    out->storage      = (rd16(b + 0x2a) >> 4) & 0xfu;
+    if (out->surface_id == 0u || b[0x14] != 0x42u) return false;
+    if (out->width == 0u || out->height == 0u || out->width > 16384u || out->height > 16384u)
+        return false;
+    if (out->pixel_format == 0u || out->storage > LAGFX_STORAGE_PRIVATE) return false;
+    return true;
+}
+
+bool lagfx_parse_iosurface_record(const uint8_t *b, size_t len, lagfx_iosurface_record_t *out) {
+    if (!b || !out || len < LAGFX_IOSURFACE_RECORD_LEN) return false;
+    memset(out, 0, sizeof(*out));
+    out->size              = rd64(b + 0x00);
+    out->page              = rd64(b + 0x08) & 0xffffffffull;
+    out->fourcc            = rd32(b + 0x0c);
+    out->width             = rd32(b + 0x18);
+    out->height            = rd32(b + 0x1c);
+    out->bytes_per_row     = rd16(b + 0x20);
+    out->bytes_per_element = rd16(b + 0x22);
+    if (out->size == 0u || out->page == 0u || out->width == 0u || out->height == 0u)
+        return false;
+    if (out->bytes_per_row < out->width) return false;
+    return (uint64_t)out->bytes_per_row * out->height <= out->size;
+}
+
+bool lagfx_texture_object_attach_surface(lagfx_texture_object_t *t,
+                                         const lagfx_iosurface_record_t *s) {
+    if (!t || !s) return false;
+    /* A texture may cover part of the surface, never more. */
+    if (t->width > s->width || t->height > s->height) return false;
+    t->bytes_per_row = s->bytes_per_row;
+    t->n_place = 1;
+    t->place[0].size = s->size;
+    t->place[0].page = s->page;
+    return true;
+}

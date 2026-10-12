@@ -485,6 +485,15 @@ static void dump_object(lagfx_protocol_t *p, const lagfx_task_entry_t *task, uin
             hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", ob[k]);
         LAGFX_WARN("OBJ-DUMP %s task=%u ref=0x%x +%03x: %s", what, task->id, ref, row, hx);
     }
+    /* An IOSurface texture object (type 0x05) starts with the surface id;
+     * dump object <id> of task 0, where the surfaces' memory is mapped. */
+    if (ot == 0x05u && task->id != 0u) {
+        uint32_t sid = lagfx_le32(ob);
+        lagfx_task_entry_t *t0 = lagfx_protocol_find_task(p, 0u);
+        if (!t0) LAGFX_WARN("OBJ-DUMP ios surface %u: task 0 not live", sid);
+        else { if (sid < 256u) dumped_va[0][sid] = 0u; dump_object(p, t0, sid, "ios-surface"); }
+        dumped_va[task->id][ref] = 0u;   /* ids are reused: dump again next bind */
+    }
 }
 
 static int op_render_describe_render_pass(lagfx_protocol_t *p,
@@ -565,7 +574,8 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
                 && getenv("LAGFX_DISABLE_GUEST_RT") == NULL) {
                 lagfx_texture_object_t tobj;
                 lagfx_vk_iosurface_t *gios = lagfx_guest_texture_target(
-                    p, task, gdev->vk, rp.colors[0].texture_ref, &tobj);
+                    p, task, gdev->vk, rp.colors[0].texture_ref,
+                    rp.colors[0].load_action == 1u /* MTLLoadActionLoad */, &tobj);
                 if (gios) {
                     rp_target = rp.colors[0].texture_ref;
                     rp_target_vkfmt = (uint32_t)gios->format;

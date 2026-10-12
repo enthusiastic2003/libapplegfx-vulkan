@@ -58,11 +58,41 @@ void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref) {
 #include "vulkan/instance.h"
 #include "vulkan/render_target.h"
 
+/* An IOSurface texture's memory belongs to its surface: object <surface id>
+ * of task 0 (see protocol/texture_object.h). */
+static bool attach_surface(lagfx_protocol_t *p, lagfx_texture_object_t *obj,
+                           const lagfx_task_entry_t **mem_task) {
+    lagfx_task_entry_t *t0 = lagfx_protocol_find_task(p, 0u);
+    uint8_t type = 0;
+    uint64_t va = 0, gpa = 0;
+    uint8_t b[LAGFX_IOSURFACE_RECORD_LEN];
+    lagfx_iosurface_record_t rec;
+    if (!t0 || !lagfx_resolve_object_data(p, t0, obj->surface_id, &type, &va, &gpa)
+        || va == 0u || type != 0x04u || !lagfx_task_read_virtual(p, t0, va, sizeof b, b)
+        || !lagfx_parse_iosurface_record(b, sizeof b, &rec)
+        || !lagfx_texture_object_attach_surface(obj, &rec)) {
+        LAGFX_WARN("guest_texture: IOSurface %u not found in task 0", obj->surface_id);
+        return false;
+    }
+    *mem_task = t0;
+    return true;
+}
+
+/* Decode texture object `ref` of `task`. *mem_task receives the task whose
+ * address space holds the texels (task 0 for IOSurfaces). */
 static bool read_texture_object(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
-                                uint32_t ref, lagfx_texture_object_t *obj) {
+                                uint32_t ref, lagfx_texture_object_t *obj,
+                                const lagfx_task_entry_t **mem_task) {
     uint8_t type = 0;
     uint64_t va = 0, gpa = 0;
     if (!lagfx_resolve_object_data(p, task, ref, &type, &va, &gpa) || va == 0u) return false;
+    *mem_task = task;
+    if (type == 0x05u) {
+        uint8_t b[LAGFX_IOSURFACE_TEXTURE_MIN_LEN];
+        return lagfx_task_read_virtual(p, task, va, sizeof b, b)
+               && lagfx_parse_iosurface_texture_object(b, sizeof b, obj)
+               && attach_surface(p, obj, mem_task);
+    }
     if (type != 0x02u && type != 0x03u && type != 0x0cu) return false;
     uint8_t b[LAGFX_TEXTURE_OBJECT_MIN_LEN];
     if (!lagfx_task_read_virtual(p, task, va, sizeof b, b)) return false;
@@ -126,20 +156,40 @@ static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_
     return ios;
 }
 
+static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                              const lagfx_task_entry_t *mem_task,
+                              struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                              const lagfx_texture_object_t *obj, uint32_t ref);
+
+/* IOSurfaces are written by the CPU without notice, so their contents are
+ * re-read once per command buffer, unless the GPU copy is newer. */
+static bool needs_refresh(const lagfx_task_entry_t *task, const lagfx_vk_iosurface_t *ios,
+                          const lagfx_texture_object_t *obj) {
+    return obj->surface_id != 0u && !ios->gpu_drawn && ios->upload_gen != task->cmdbuf_gen + 1u;
+}
+
 lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
                                                  lagfx_task_entry_t *task,
                                                  struct lagfx_vk_state *vk,
-                                                 uint32_t ref,
+                                                 uint32_t ref, bool load,
                                                  lagfx_texture_object_t *out_obj) {
     lagfx_texture_object_t obj;
-    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj)) return NULL;
+    const lagfx_task_entry_t *mem_task;
+    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj, &mem_task)) return NULL;
     if (out_obj) *out_obj = obj;
     stats.targets++;
     stats_tick();
     bool created;
     lagfx_vk_iosurface_t *ios = ensure_image(p, task, vk, ref, &obj, &created);
+    if (!ios) return NULL;
+    /* A pass that loads the previous contents of an IOSurface (or of a new
+     * image for CPU-visible memory) starts from guest memory. */
+    if (load && obj.storage != LAGFX_STORAGE_PRIVATE
+        && (needs_refresh(task, ios, &obj) || (created && !ios->gpu_drawn))
+        && upload_from_guest(p, task, mem_task, vk, ios, &obj, ref))
+        ios->upload_gen = task->cmdbuf_gen + 1u;
     /* Rendered into: the GPU copy is now the authoritative one. */
-    if (ios) ios->gpu_drawn = 1u;
+    ios->gpu_drawn = 1u;
     return ios;
 }
 
@@ -163,7 +213,8 @@ static bool read_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *t
 }
 
 /* Copy the texture's guest memory (rows of bytes_per_row) into the image. */
-static bool upload_from_guest(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                              const lagfx_task_entry_t *mem_task,
                               struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                               const lagfx_texture_object_t *obj, uint32_t ref) {
     uint32_t bpp = lagfx_metal_pixel_format_bytes(obj->pixel_format);
@@ -178,14 +229,15 @@ static bool upload_from_guest(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     if (!px) return false;
     bool ok = true;
     for (uint32_t y = 0; y < obj->height && ok; y++)
-        ok = read_texture_memory(p, task, obj, (uint64_t)y * obj->bytes_per_row,
+        ok = read_texture_memory(p, mem_task, obj, (uint64_t)y * obj->bytes_per_row,
                                  px + (size_t)y * tight, tight);
     if (getenv("LAGFX_DUMP_OBJ")) {
         uint32_t nz = 0;
         for (size_t k = 0; ok && k < tight * obj->height; k++) nz += px[k] != 0u;
-        LAGFX_WARN("guest_texture: upload task %u ref 0x%x %ux%u fmt %u storage %u bpr %u "
-                   "place %u x {0x%llx @ page 0x%llx} read=%d nonzero=%u/%zu first=%02x%02x%02x%02x",
-                   task->id, ref, obj->width, obj->height, obj->pixel_format, obj->storage,
+        LAGFX_WARN("guest_texture: upload task %u ref 0x%x surface %u %ux%u fmt %u storage %u "
+                   "bpr %u place %u x {0x%llx @ page 0x%llx} read=%d nonzero=%u/%zu "
+                   "first=%02x%02x%02x%02x",
+                   task->id, ref, obj->surface_id, obj->width, obj->height, obj->pixel_format, obj->storage,
                    obj->bytes_per_row, obj->n_place,
                    (unsigned long long)(obj->n_place ? obj->place[0].size : 0u),
                    (unsigned long long)(obj->n_place ? obj->place[0].page : 0u), ok, nz,
@@ -206,19 +258,22 @@ lagfx_vk_iosurface_t *lagfx_guest_texture_source(lagfx_protocol_t *p,
                                                  struct lagfx_vk_state *vk,
                                                  uint32_t ref) {
     lagfx_texture_object_t obj;
-    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj)) return NULL;
+    const lagfx_task_entry_t *mem_task;
+    if (!p || !task || !vk || !read_texture_object(p, task, ref, &obj, &mem_task)) return NULL;
     bool created;
     lagfx_vk_iosurface_t *ios = ensure_image(p, task, vk, ref, &obj, &created);
     if (!ios) return NULL;
     lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task->id);
     bool dirty = e && e->backing_dirty;
-    /* Contents come from guest memory when the image is new, or when the guest
-     * announced a CPU write since. Private textures have no CPU-written memory,
-     * and an image the GPU rendered into is newer than guest memory. */
-    if ((created || dirty) && obj.storage != LAGFX_STORAGE_PRIVATE
-        && (!ios->gpu_drawn || dirty)) {
-        if (upload_from_guest(p, task, vk, ios, &obj, ref)) {
+    /* Contents come from guest memory when the image is new, when the guest
+     * announced a CPU write since, or (IOSurfaces) at the first use in a
+     * command buffer. Private textures have no CPU-written memory, and an
+     * image the GPU rendered into is newer than guest memory. */
+    if (obj.storage != LAGFX_STORAGE_PRIVATE
+        && (((created || dirty) && (!ios->gpu_drawn || dirty)) || needs_refresh(task, ios, &obj))) {
+        if (upload_from_guest(p, task, mem_task, vk, ios, &obj, ref)) {
             ios->gpu_drawn = 0u;
+            ios->upload_gen = task->cmdbuf_gen + 1u;
             if (e) e->backing_dirty = 0u;
         }
     }
@@ -296,7 +351,7 @@ static uint32_t bytes_per_pixel(uint32_t metal_format) {
 /* Write `len` bytes at texture-memory offset `off` through the placement
  * entries, page by page via the task's VA translation. Never writes to an
  * address that doesn't translate. */
-static bool write_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+static bool write_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
                                  const lagfx_texture_object_t *obj, uint64_t off,
                                  const uint8_t *src, uint64_t len) {
     lagfx_device_t *dev = (lagfx_device_t *)p->dev;
@@ -312,7 +367,7 @@ static bool write_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *
             uint64_t page_left = 0x1000u - (va & 0xfffu);
             uint64_t chunk = n < page_left ? n : page_left;
             uint64_t gpa = 0;
-            if (!lagfx_task_translate(p, task, va, &gpa)) return false;
+            if (!lagfx_task_translate(p, mem_task, va, &gpa)) return false;
             if (!dev->desc.shell.write_memory(dev->desc.shell.opaque, gpa, chunk, src))
                 return false;
             va += chunk; src += chunk; off += chunk; len -= chunk; n -= chunk;
@@ -325,12 +380,15 @@ static bool write_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *
 static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                           struct lagfx_vk_state *vk, uint32_t ref) {
     lagfx_texture_object_t obj;
-    if (!read_texture_object(p, task, ref, &obj)) return;
-    /* Managed only for now: Metal makes those CPU-visible at an explicit
-     * synchronize, which is when the guest reads them. Shared storage
-     * (IOSurfaces) would need a full copy after every command buffer — far too
-     * slow this way; it needs host-mapped guest memory instead. */
-    if (obj.storage != LAGFX_STORAGE_MANAGED) {
+    const lagfx_task_entry_t *mem_task;
+    if (!read_texture_object(p, task, ref, &obj, &mem_task)) return;
+    /* Managed textures and IOSurfaces only. Metal makes managed textures
+     * CPU-visible at an explicit synchronize, which is when the guest reads
+     * them; IOSurfaces are read by the CPU (and other processes) directly, so
+     * they're copied after every command buffer that wrote them. Other shared
+     * textures would need the same copy — too slow this way; they need
+     * host-mapped guest memory instead. */
+    if (obj.storage != LAGFX_STORAGE_MANAGED && obj.surface_id == 0u) {
         stats.skipped_storage++;
         return;
     }
@@ -361,13 +419,16 @@ static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     if (stride == 0u) stride = tight;
     bool ok = true;
     for (uint32_t y = 0; y < obj.height && ok; y++)
-        ok = write_texture_memory(p, task, &obj, (uint64_t)y * obj.bytes_per_row,
+        ok = write_texture_memory(p, mem_task, &obj, (uint64_t)y * obj.bytes_per_row,
                                   px + (size_t)y * stride, tight);
     free(px);
     stats.writebacks++;
     stats.wb_bytes += (unsigned long long)tight * obj.height;
     stats.wb_ms += now_ms() - t0;
     stats_tick();
+    /* Guest memory now matches the image, so later CPU writes to a surface
+     * may be picked up again. */
+    if (ok && obj.surface_id != 0u) ios->gpu_drawn = 0u;
     if (ok)
         LAGFX_LOG("guest_texture: wrote back task %u ref 0x%x (%ux%u)", task->id, ref,
                   obj.width, obj.height);

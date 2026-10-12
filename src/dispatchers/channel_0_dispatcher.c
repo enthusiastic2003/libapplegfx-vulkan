@@ -21,6 +21,7 @@
  * adapted to the new lagfx_protocol_t layout and handler tables.
  */
 
+#include "cmd_dump.h"
 #include "channel_0_dispatcher.h"
 #include "../device.h"
 #include "../doorbell.h"
@@ -470,6 +471,7 @@ size_t channel_0_dispatcher_drain(lagfx_protocol_t *p) {
         hdr.payload      = (hdr.payload_size > 0)
                               ? (cmd_buf + LAGFX_CMD_HEADER_BYTES)
                               : NULL;
+        lagfx_dump_cmd("ch0", &hdr);
 
         /* Hex dump of first 32 bytes on TRACE for bring-up debugging. */
         if (lagfx_log_level() >= LAGFX_LOG_LVL_TRACE) {

@@ -46,6 +46,9 @@ typedef struct {
      * a new backing write (0x3b). Keeps the sample-bind refresh from wiping
      * rendered content with a stale/zero backing read. */
     uint8_t  gpu_drawn;
+    /* Task command buffer (cmdbuf_gen + 1) whose start the contents were last
+     * read from guest memory for; 0 = never. */
+    uint32_t upload_gen;
 } lagfx_vk_iosurface_t;
 
 lagfx_status_t lagfx_vk_iosurface_create(struct lagfx_vk_state *vk,

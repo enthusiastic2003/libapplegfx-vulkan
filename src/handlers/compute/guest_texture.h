@@ -26,18 +26,21 @@
 struct lagfx_vk_state;
 
 /* Find or create the host image for texture object `ref` of `task`, sized and
- * formatted from the guest's descriptor. Returns NULL if `ref` isn't a texture
- * object we can decode. *out_obj receives the decoded object. */
+ * formatted from the guest's descriptor. `load`: the pass keeps the previous
+ * contents, which then come from guest memory when that is newer. Returns NULL
+ * if `ref` isn't a texture object we can decode. *out_obj receives the decoded
+ * object. IOSurface textures (object type 0x05) use their surface's memory. */
 lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
                                                  lagfx_task_entry_t *task,
                                                  struct lagfx_vk_state *vk,
-                                                 uint32_t ref,
+                                                 uint32_t ref, bool load,
                                                  lagfx_texture_object_t *out_obj);
 
 /* Find or create the host image for texture object `ref` of `task` to sample
  * from. A new image (or one whose guest memory the guest announced it wrote)
  * gets its contents from the texture's guest memory, unless the storage is
- * private or the GPU rendered into it. Returns NULL if `ref` isn't a texture
+ * private or the GPU rendered into it. IOSurface contents are re-read at the
+ * first use in each command buffer. Returns NULL if `ref` isn't a texture
  * object we can decode. */
 lagfx_vk_iosurface_t *lagfx_guest_texture_source(lagfx_protocol_t *p,
                                                  lagfx_task_entry_t *task,

@@ -297,6 +297,9 @@ typedef struct {
      * (handlers/compute/guest_texture.c). */
     uint32_t written_tex[16];
     uint8_t  n_written_tex;
+    /* Counts the task's executed command buffers (IOSurface contents are
+     * re-read from guest memory once per command buffer). */
+    uint32_t cmdbuf_gen;
 
     /* Render pass description from PGCmdDescribeRenderPass (0x1a).
      * Per-task state: each task has its own render pass descriptor. */

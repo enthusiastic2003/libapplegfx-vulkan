@@ -24,6 +24,7 @@
  * (0x10-0x14) that fire on display channels.
  */
 
+#include "cmd_dump.h"
 #include "channel_display_dispatcher.h"
 #include "ring_common.h"
 #include "../doorbell.h"
@@ -288,6 +289,7 @@ size_t channel_display_dispatcher_drain(lagfx_protocol_t *p, uint32_t chan_id) {
         hdr.payload      = (hdr.payload_size > 0)
                               ? (cmd_buf + LAGFX_CMD_HEADER_BYTES)
                               : NULL;
+        lagfx_dump_cmd("display", &hdr);
 
         dispatch_command(p, &hdr);
 

@@ -696,6 +696,38 @@ static BOOL case_blend_probe(void) {
 
 // Not a pass/fail case: clears textures with distinct, known properties so
 // the host-side object dump (LAGFX_DUMP_OBJ=1) can be matched to fields.
+// Name-only probe for decoding IOSurface textures on the host: surfaces of
+// distinct sizes, each page starting with "LAGFXIOS" (run the host with
+// LAGFX_FIND_SIG=LAGFXIOS LAGFX_DUMP_IOS=1 LAGFX_DUMP_OBJ=1), sampled once.
+static BOOL case_iosurface_probe(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_quad", @"fs_tex_nearest", nil, nil);
+    if (!ps) return NO;
+    static const struct { int w, h, bpr; } kSurf[] = { {40, 24, 0}, {100, 20, 512}, {64, 64, 0} };
+    for (size_t i = 0; i < sizeof kSurf / sizeof kSurf[0]; i++) {
+        NSMutableDictionary *props = [@{
+            (id)kIOSurfaceWidth: @(kSurf[i].w), (id)kIOSurfaceHeight: @(kSurf[i].h),
+            (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+        } mutableCopy];
+        if (kSurf[i].bpr) props[(id)kIOSurfaceBytesPerRow] = @(kSurf[i].bpr);
+        IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        if (!s) { printf("  IOSurfaceCreate failed\n"); return NO; }
+        IOSurfaceLock(s, 0, NULL);
+        uint8_t *base = IOSurfaceGetBaseAddress(s);
+        size_t bpr = IOSurfaceGetBytesPerRow(s), alloc = IOSurfaceGetAllocSize(s);
+        for (size_t k = 0; k < alloc; k++) base[k] = (uint8_t)(0x10 * (i + 1) + (k >> 12));
+        for (size_t pg = 0; pg < alloc; pg += 4096) memcpy(base + pg, "LAGFXIOS", 8);
+        IOSurfaceUnlock(s, 0, NULL);
+        printf("  surface %zu: id=%u %dx%d bpr=%zu alloc=0x%zx\n", i, IOSurfaceGetID(s),
+               kSurf[i].w, kSurf[i].h, bpr, alloc);
+        id<MTLTexture> t = surface_texture(s, kSurf[i].w, kSurf[i].h, MTLTextureUsageShaderRead);
+        static bgra_t px[kSize * kSize];
+        draw_quad(ps, MTLClearColorMake(0, 0, 0, 1),
+                  ^(id<MTLRenderCommandEncoder> e) { [e setFragmentTexture:t atIndex:0]; }, px);
+        CFRelease(s);
+    }
+    return YES;
+}
+
 static BOOL case_probe(void) {
     struct { NSUInteger w, h; MTLPixelFormat fmt; MTLStorageMode sm; MTLTextureUsage use; } t[] = {
         {48, 32, MTLPixelFormatRGBA8Unorm, MTLStorageModePrivate, MTLTextureUsageRenderTarget},
@@ -741,6 +773,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"probe", case_probe, NO},
     {"sampler-probe", case_sampler_probe, NO},
     {"blend-probe", case_blend_probe, NO},
+    {"iosurface-probe", case_iosurface_probe, NO},
 };
 #define kNumCases (sizeof kCases / sizeof kCases[0])
 

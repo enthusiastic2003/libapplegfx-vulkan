@@ -39,6 +39,68 @@ static void make(uint8_t *b, uint32_t w, uint32_t h, uint32_t bpr, uint32_t fmt,
     put16(b, 0x6a, storage << 4);
 }
 
+static void make_ios_tex(uint8_t *b, uint32_t sid, uint32_t w, uint32_t h, uint32_t fmt,
+                         uint32_t usage, uint32_t storage) {
+    memset(b, 0, 0x38);
+    put32(b, 0x00, sid);
+    put32(b, 0x10, 4);          /* own id */
+    b[0x14] = 0x42;
+    b[0x15] = (uint8_t)usage;
+    put16(b, 0x16, fmt);
+    put32(b, 0x18, w);
+    put32(b, 0x1c, h);
+    put32(b, 0x20, 1);
+    put16(b, 0x2a, storage << 4);
+}
+
+static void make_surface(uint8_t *b, uint64_t size, uint32_t page, uint32_t w, uint32_t h,
+                         uint32_t bpr) {
+    memset(b, 0, 0x24);
+    put64(b, 0x00, size);
+    put32(b, 0x08, page);
+    put32(b, 0x0c, 0x42475241u);   /* 'BGRA' */
+    put32(b, 0x10, 1);
+    put32(b, 0x18, w);
+    put32(b, 0x1c, h);
+    put16(b, 0x20, bpr);
+    put16(b, 0x22, 4);
+}
+
+static void test_iosurface(void) {
+    uint8_t tb[0x38], sb[0x24];
+    lagfx_texture_object_t t;
+    lagfx_iosurface_record_t s;
+
+    /* 100x20 BGRA surface with a padded 512-byte row stride */
+    make_ios_tex(tb, 3, 100, 20, 80, 1, 1);
+    CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+    CHECK(t.surface_id == 3 && t.width == 100 && t.height == 20 && t.pixel_format == 80);
+    CHECK(t.usage == 1 && t.storage == LAGFX_STORAGE_MANAGED && t.n_place == 0);
+    make_surface(sb, 0x3000, 0x8d1, 100, 20, 512);
+    CHECK(lagfx_parse_iosurface_record(sb, sizeof sb, &s));
+    CHECK(s.size == 0x3000 && s.page == 0x8d1 && s.fourcc == 0x42475241u);
+    CHECK(s.width == 100 && s.height == 20 && s.bytes_per_row == 512 && s.bytes_per_element == 4);
+    CHECK(lagfx_texture_object_attach_surface(&t, &s));
+    CHECK(t.bytes_per_row == 512 && t.n_place == 1);
+    CHECK(t.place[0].page == 0x8d1 && t.place[0].size == 0x3000);
+
+    /* texture larger than its surface */
+    make_ios_tex(tb, 3, 101, 20, 80, 1, 1);
+    CHECK(lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+    CHECK(!lagfx_texture_object_attach_surface(&t, &s));
+
+    /* rows that don't fit the allocation */
+    make_surface(sb, 0x2000, 0x8d1, 100, 20, 512);
+    CHECK(!lagfx_parse_iosurface_record(sb, sizeof sb, &s));
+
+    /* no surface id / not a descriptor */
+    make_ios_tex(tb, 0, 40, 24, 80, 1, 1);
+    CHECK(!lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+    make_ios_tex(tb, 3, 40, 24, 80, 1, 1);
+    tb[0x14] = 0;
+    CHECK(!lagfx_parse_iosurface_texture_object(tb, sizeof tb, &t));
+}
+
 int main(void) {
     uint8_t b[0x80];
     lagfx_texture_object_t t;
@@ -63,6 +125,8 @@ int main(void) {
     /* too short */
     make(b, 64, 64, 256, 80, 5, 1, 0x4000, 0x101);
     CHECK(!lagfx_parse_texture_object(b, 0x40, &t));
+
+    test_iosurface();
 
     if (failures) return 1;
     printf("texture-object-unit: OK\n");

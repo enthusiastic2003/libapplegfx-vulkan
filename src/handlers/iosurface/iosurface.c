@@ -34,7 +34,20 @@
 #include "../../vulkan/iosurface.h"
 
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* LAGFX_DUMP_IOS=1: log each IOSurface command's payload in hex. */
+static void dump_payload(const char *what, const lagfx_cmd_header_t *hdr) {
+    if (!getenv("LAGFX_DUMP_IOS") || !hdr->payload) return;
+    for (uint32_t row = 0; row < hdr->payload_size && row < 256u; row += 32u) {
+        char hx[3 * 32 + 1]; size_t hn = 0;
+        for (uint32_t k = row; k < row + 32u && k < hdr->payload_size; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", hdr->payload[k]);
+        LAGFX_WARN("IOS-DUMP %s len=%u +%03x: %s", what, (unsigned)hdr->payload_size, row, hx);
+    }
+}
 
 /* === 0x26 — CmdDeleteIOSurfaceBacking2 =========================== *
  *
@@ -45,6 +58,7 @@
 lagfx_handler_status_t lagfx_iosurface_delete_backing2(
     lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
     if (!p || !hdr) return LAGFX_HANDLER_ERR_INTERNAL;
+    dump_payload("delete-0x26", hdr);
     if (!hdr->payload || hdr->payload_size < 4) {
         LAGFX_WARN("CmdDeleteIOSurfaceBacking2: payload too small (%u)",
                    (unsigned)hdr->payload_size);
@@ -105,6 +119,7 @@ lagfx_handler_status_t lagfx_iosurface_delete_backing2(
 lagfx_handler_status_t lagfx_iosurface_create_backing2(
     lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
     if (!p || !hdr) return LAGFX_HANDLER_ERR_INTERNAL;
+    dump_payload("create-0x27", hdr);
     if (!hdr->payload || hdr->payload_size < 28u) {
         LAGFX_WARN("CmdCreateIOSurfaceBacking2: payload too small (%u, need 28) "
                    "— treating as capability probe; no registry update",
@@ -210,6 +225,7 @@ lagfx_handler_status_t lagfx_iosurface_create_backing2(
 lagfx_handler_status_t lagfx_iosurface_lookup(
     lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
     if (!p || !hdr) return LAGFX_HANDLER_ERR_INTERNAL;
+    dump_payload("lookup-0x28", hdr);
     if (!hdr->payload || hdr->payload_size < 4) {
         LAGFX_WARN("CmdLookupIOSurface: payload too small (%u)",
                    (unsigned)hdr->payload_size);
@@ -293,6 +309,7 @@ lagfx_handler_status_t lagfx_iosurface_lookup(
 lagfx_handler_status_t lagfx_iosurface_import_mach_port(
     lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
     if (!p || !hdr) return LAGFX_HANDLER_ERR_INTERNAL;
+    dump_payload("import-0x29", hdr);
     if (!hdr->payload || hdr->payload_size < 16) {
         LAGFX_WARN("CmdImportIOSurfaceMachPort: payload too small (%u < 16)",
                    (unsigned)hdr->payload_size);
@@ -346,6 +363,7 @@ lagfx_handler_status_t lagfx_iosurface_import_mach_port(
 lagfx_handler_status_t lagfx_iosurface_unmap(
     lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr) {
     if (!p || !hdr) return LAGFX_HANDLER_ERR_INTERNAL;
+    dump_payload("unmap-0x2a", hdr);
     if (!hdr->payload || hdr->payload_size < 8) {
         LAGFX_WARN("CmdUnmapIOSurface: payload too small (%u < 8)",
                    (unsigned)hdr->payload_size);
