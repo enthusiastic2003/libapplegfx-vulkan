@@ -19,23 +19,34 @@ bool lagfx_parse_texture_object(const uint8_t *b, size_t len, lagfx_texture_obje
     if (!b || !out || len < LAGFX_TEXTURE_OBJECT_MIN_LEN) return false;
     memset(out, 0, sizeof(*out));
 
-    out->width         = rd32(b + 0x3c);
-    out->height        = rd32(b + 0x40);
+    /* Level 0's record; the descriptor follows the last level's record, so
+     * it is found by its repeated dimensions and (mipmapped) level count. */
+    uint32_t width = rd32(b + 0x3c), height = rd32(b + 0x40);
+    if (width == 0u || height == 0u || width > 16384u || height > 16384u) return false;
+    const uint8_t *d = NULL;
+    for (uint32_t n = 1; n <= LAGFX_TEXTURE_MAX_LEVELS; n++) {
+        size_t at = LAGFX_TEXTURE_LEVEL0 + (size_t)LAGFX_TEXTURE_LEVEL_LEN * n;
+        if (at + LAGFX_TEXTURE_LEVEL_LEN > len) break;
+        const uint8_t *c = b + at;
+        if (rd32(c + 0x10) != width || rd32(c + 0x14) != height || c[0x0c] < 0x40u) continue;
+        if (n > 1u && rd16(c + 0x1c) != n) continue;
+        d = c;
+        break;
+    }
+    if (!d) return false;
+
+    out->width         = width;
+    out->height        = height;
     out->depth         = rd32(b + 0x44);
     out->bytes_per_row = rd32(b + 0x34);
-    out->usage         = b[0x55];
-    out->pixel_format  = rd16(b + 0x56);
-    out->storage       = (rd16(b + 0x6a) >> 4) & 0xfu;
-    out->texture_type  = b[0x54] >= 0x40u ? b[0x54] - 0x40u : 2u;
-    out->mip_levels    = rd16(b + 0x64);
-    out->sample_count  = rd16(b + 0x66);
-    out->array_length  = rd16(b + 0x68);
+    out->usage         = d[0x0d];
+    out->pixel_format  = rd16(d + 0x0e);
+    out->storage       = (rd16(d + 0x22) >> 4) & 0xfu;
+    out->texture_type  = d[0x0c] - 0x40u;
+    out->mip_levels    = rd16(d + 0x1c);
+    out->sample_count  = rd16(d + 0x1e);
+    out->array_length  = rd16(d + 0x20);
 
-    /* The dimensions are stored twice; disagreement means this isn't the
-     * layout we know. */
-    if (out->width == 0u || out->height == 0u || out->width > 16384u || out->height > 16384u)
-        return false;
-    if (rd32(b + 0x58) != out->width || rd32(b + 0x5c) != out->height) return false;
     if (out->pixel_format == 0u || out->storage > LAGFX_STORAGE_PRIVATE) return false;
     if (out->bytes_per_row < out->width) return false;
 

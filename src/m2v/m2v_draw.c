@@ -1035,12 +1035,30 @@ static void describe_stage(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     for (uint32_t i = 0; texs && i < LAGFX_MAX_BINDING_SLOTS; i++) {
         if (!texs[i].valid || texs[i].ref == 0u) continue;
         lagfx_texture_object_t obj;
-        if (!lagfx_guest_texture_info(p, task, texs[i].ref, &obj)) continue;
+        if (!lagfx_guest_texture_info(p, task, texs[i].ref, &obj)) {
+            /* the shader then samples a neutral (transparent) image here */
+            static unsigned n_drop;
+            uint8_t ty = 0;
+            uint64_t dva = 0, dgpa = 0;
+            bool found = lagfx_resolve_object_data(p, task, texs[i].ref, &ty, &dva, &dgpa);
+            if (n_drop++ < 30u) {
+                uint8_t ob[0x70] = { 0 };
+                char hx[3 * 0x70 + 1];
+                size_t hn = 0;
+                if (found && dva) (void)lagfx_task_read_virtual(p, task, dva, sizeof ob, ob);
+                for (size_t q = 0; q < sizeof ob; q++)
+                    hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", ob[q]);
+                LAGFX_WARN("M2V: texture slot %u ref 0x%x (task %u) not decoded: found=%d type 0x%02x: %s",
+                           i, texs[i].ref, task->id, found, ty, hx);
+            }
+            continue;
+        }
         s->texture_ref[s->nt] = texs[i].ref;
         s->textures[s->nt++] = (lagfx_m2v_texture_t){
             .index = i, .texture_type = obj.texture_type, .pixel_format = obj.pixel_format,
             .usage = obj.usage ? obj.usage : 1u,
-            .mip_levels = obj.mip_levels ? obj.mip_levels : 1u,
+            /* host images hold level 0 only (guest_texture.c) */
+            .mip_levels = 1u,
             .array_length = obj.array_length ? obj.array_length : 1u,
             .sample_count = obj.sample_count ? obj.sample_count : 1u,
         };

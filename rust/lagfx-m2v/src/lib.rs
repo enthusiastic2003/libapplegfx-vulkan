@@ -787,6 +787,39 @@ pub unsafe extern "C" fn lagfx_m2v_plan_draw(
                 return Err("variant plan asks for another variant".into());
             }
         }
+        // LAGFX_M2V_PLANLOG: a plan that samples a neutral image while textures are bound,
+        // with the bind shape that led to it (once per distinct shape).
+        if std::env::var_os("LAGFX_M2V_PLANLOG").is_some()
+            && st[1].n_textures > 0
+            && plan.descriptors.iter().any(|d| matches!(&d.source,
+                WriteSource::CombinedImageSampler { image: ImageSource::Neutral(_), .. }
+                | WriteSource::Neutral(metal2vulkan::bind::NeutralResource::Image { .. })))
+        {
+            static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            shape.hash(&mut h);
+            let k = h.finish();
+            let mut seen = SEEN.lock().map_err(|_| "planlog lock")?;
+            if !seen.contains(&k) && seen.len() < 16 {
+                seen.push(k);
+                let pl = unsafe { &*used };
+                eprintln!("LAGFX M2V PLANLOG entries {:?} handles={} slots {:?}",
+                          pl.pipeline.stages.iter().map(|m| m.entry_point.as_str()).collect::<Vec<_>>(),
+                          pl.pipeline.interface.needs_handle_translation,
+                          pl.pipeline.interface.slots.keys().collect::<Vec<_>>());
+                eprintln!("LAGFX M2V PLANLOG diagnostics {:?} variant {:?}", plan.diagnostics, plan.variant);
+                for set in &pl.pipeline.layout.sets {
+                    for b in &set.bindings {
+                        eprintln!("LAGFX M2V PLANLOG   layout set{}.{} {:?}", set.set, b.binding, b);
+                    }
+                }
+                eprintln!("LAGFX M2V PLANLOG shape: {:?}", shape.stages);
+                for d in &plan.descriptors {
+                    eprintln!("LAGFX M2V PLANLOG   set{}.{} {:?}", d.set, d.binding, d.source);
+                }
+            }
+        }
         let draw = match unsafe { indexed.as_ref() } {
             None => DrawCall::Primitives { vertex_start, vertex_count, instance_count, base_instance },
             Some(ix) => DrawCall::Indexed {

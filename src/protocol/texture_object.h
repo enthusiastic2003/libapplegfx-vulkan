@@ -22,10 +22,17 @@
  *   +0x54  u8   0x40 + MTLTextureType (0x41 1D array, 0x42 2D, 0x47 3D, ...)
  *   +0x55  u8   MTLTextureUsage
  *   +0x56  u16  MTLPixelFormat
- *   +0x64  u16  mipmap level count (unconfirmed: it and +0x66 have only been 1)
+ *   +0x64  u16  mipmap level count
  *   +0x66  u16  sample count (unconfirmed)
  *   +0x68  u16  array length (3 for WindowServer's 1D-array colour lookup table)
  *   +0x6a  u16  MTLResourceOptions (storage mode in bits 4..7)
+ *
+ * +0x24..+0x48 is level 0's record; a mipmapped texture has one 0x24-byte
+ * record per level (+0x00 offset in the allocation, +0x08 length, +0x10 bytes
+ * per row, +0x18/+0x1c/+0x20 width/height/depth), and the descriptor
+ * (+0x54.. above, i.e. +0x0c.. of a record-sized block) follows the last one.
+ * A 128x128 BGRA8 Dock icon with 8 levels: level 1 at +0x48 (offset 0x10000,
+ * 256 bytes per row, 64x64), its descriptor at +0x144.
  *
  * A texture made from a buffer (newTextureWithDescriptor:offset:bytesPerRow:,
  * slot type 0x08) has the buffer's memory from a byte offset (kat tex-buffer):
@@ -74,6 +81,11 @@
 #include <stdint.h>
 
 #define LAGFX_TEXTURE_OBJECT_MIN_LEN 0x70u
+#define LAGFX_TEXTURE_LEVEL0 0x24u           /* level 0's record */
+#define LAGFX_TEXTURE_LEVEL_LEN 0x24u
+#define LAGFX_TEXTURE_MAX_LEVELS 15u         /* 16384 x 16384 */
+#define LAGFX_TEXTURE_OBJECT_MAX_LEN \
+    (LAGFX_TEXTURE_LEVEL0 + LAGFX_TEXTURE_LEVEL_LEN * (LAGFX_TEXTURE_MAX_LEVELS + 1u))
 #define LAGFX_IOSURFACE_TEXTURE_MIN_LEN 0x38u
 #define LAGFX_IOSURFACE_RECORD_MIN_LEN 0x24u     /* one plane */
 #define LAGFX_IOSURFACE_MAX_PLANES 4u

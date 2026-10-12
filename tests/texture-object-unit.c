@@ -186,6 +186,46 @@ int main(void) {
     put32(b, 0x58, 65);
     CHECK(!lagfx_parse_texture_object(b, sizeof b, &t));
 
+    /* a mipmapped 128x128 BGRA8 texture (a Dock icon): 8 level records, the
+     * descriptor after the last; +0x58 is level 1's bytes per row */
+    {
+        uint8_t m[LAGFX_TEXTURE_OBJECT_MAX_LEN];
+        lagfx_texture_object_t mt;
+        memset(m, 0, sizeof m);
+        put64(m, 0x00, 0x16000);
+        put64(m, 0x08, 0x3e30);
+        put64(m, 0x18, 0x15500);
+        uint32_t off = 0;
+        for (uint32_t l = 0; l < 8u; l++) {
+            uint32_t r = 0x24u + 0x24u * l, w = 128u >> l, bpr = w * 4u < 64u ? 64u : w * 4u;
+            put32(m, r + 0x00, off);
+            put32(m, r + 0x08, bpr * w);
+            put32(m, r + 0x10, bpr);
+            put32(m, r + 0x18, w);
+            put32(m, r + 0x1c, w);
+            put32(m, r + 0x20, 1);
+            off += bpr * w;
+        }
+        uint32_t d = 0x24u + 0x24u * 8u;
+        m[d + 0x0c] = 0x42;
+        m[d + 0x0d] = 0x01;
+        put16(m, d + 0x0e, 80);
+        put32(m, d + 0x10, 128);
+        put32(m, d + 0x14, 128);
+        put16(m, d + 0x1c, 8);
+        put16(m, d + 0x1e, 1);
+        put16(m, d + 0x20, 1);
+        CHECK(lagfx_parse_texture_object(m, sizeof m, &mt));
+        CHECK(mt.width == 128 && mt.height == 128 && mt.bytes_per_row == 512);
+        CHECK(mt.pixel_format == 80 && mt.mip_levels == 8 && mt.texture_type == 2);
+        CHECK(mt.n_place == 1 && mt.place[0].page == 0x3e30 && mt.base_offset == 0);
+        /* only the first 0x70 bytes: the descriptor isn't there */
+        CHECK(!lagfx_parse_texture_object(m, LAGFX_TEXTURE_OBJECT_MIN_LEN, &mt));
+        /* a level count that disagrees with the records */
+        put16(m, d + 0x1c, 7);
+        CHECK(!lagfx_parse_texture_object(m, sizeof m, &mt));
+    }
+
     /* too short */
     make(b, 64, 64, 256, 80, 5, 1, 0x4000, 0x101);
     CHECK(!lagfx_parse_texture_object(b, 0x40, &t));

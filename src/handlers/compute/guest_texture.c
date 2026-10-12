@@ -223,9 +223,12 @@ static bool read_texture_object(lagfx_protocol_t *p, const lagfx_task_entry_t *t
                && attach_buffer(p, task, obj);
     }
     if (type != 0x02u && type != 0x03u && type != 0x0cu) return false;
-    uint8_t b[LAGFX_TEXTURE_OBJECT_MIN_LEN];
-    if (!lagfx_task_read_virtual(p, task, va, sizeof b, b)) return false;
-    return lagfx_parse_texture_object(b, sizeof b, obj);
+    /* a mipmapped texture's descriptor follows its level records */
+    uint8_t b[LAGFX_TEXTURE_OBJECT_MAX_LEN];
+    if (lagfx_task_read_virtual(p, task, va, sizeof b, b))
+        return lagfx_parse_texture_object(b, sizeof b, obj);
+    return lagfx_task_read_virtual(p, task, va, LAGFX_TEXTURE_OBJECT_MIN_LEN, b)
+           && lagfx_parse_texture_object(b, LAGFX_TEXTURE_OBJECT_MIN_LEN, obj);
 }
 
 bool lagfx_guest_texture_info(lagfx_protocol_t *p, const lagfx_task_entry_t *task, uint32_t ref,
@@ -295,33 +298,69 @@ static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_
 /* LAGFX_DUMP_WB=<dir>: save each written-back (wb-) and uploaded (up-) image
  * of a 4-byte format, read as BGRA, as <dir>/<kind>-t<task>-r<ref>-s<surface>.ppm
  * (surface 0: not an IOSurface); the latest wins. */
+static uint8_t half_to_u8(uint16_t h) {
+    if (h & 0x8000u) return 0u;
+    uint32_t e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    if (e >= 15u) return 255u;   /* >= 1.0, inf, nan */
+    float f = e ? (1.0f + (float)m / 1024.0f) / (float)(1u << (15u - e))
+                : (float)m / (1024.0f * 16384.0f);
+    return (uint8_t)(f * 255.0f + 0.5f);
+}
+
+/* LAGFX_DUMP_WB=<dir> dumps uploads/write-backs as <kind>-t<task>-r<ref>-s<surface>.ppm
+ * (RGB) and .pgm (alpha). LAGFX_DUMP_WB_TASK=<id> keeps one task. 16-byte
+ * RGBA32Uint/Sint (123/124) is shown as the BGRA8 bytes it packs (4x width);
+ * RGBA16Float (115) is clamped to 0..1. LAGFX_DUMP_WB_MAXPX=<n> skips images
+ * of more than n pixels. */
 static void dump_image(const char *kind, const lagfx_task_entry_t *task, uint32_t ref,
                        const lagfx_texture_object_t *obj, const uint8_t *px, size_t stride) {
     const char *dir = getenv("LAGFX_DUMP_WB");
-    uint32_t bpp = lagfx_metal_pixel_format_bytes(obj->pixel_format);
-    if (!dir || (bpp != 4u && bpp != 1u)) return;
+    const char *only = getenv("LAGFX_DUMP_WB_TASK");
+    const char *maxpx = getenv("LAGFX_DUMP_WB_MAXPX");
+    if (!dir || (only && strtoul(only, NULL, 0) != task->id)) return;
+    if (maxpx && (uint64_t)obj->width * obj->height > strtoull(maxpx, NULL, 0)) return;
+    uint32_t fmt = obj->pixel_format, bpp = lagfx_metal_pixel_format_bytes(fmt), w = obj->width;
+    bool packed = fmt == 123u || fmt == 124u, half = fmt == 115u;
+    if (packed) { bpp = 4u; w *= 4u; }
+    if (bpp != 4u && bpp != 1u && !half) return;
     char path[512];
-    snprintf(path, sizeof path, "%s/%s-t%u-r%x-s%u.ppm", dir, kind, task->id, ref,
-             obj->surface_id);
+    snprintf(path, sizeof path, "%s/%s-t%u-r%x-s%u-f%u.ppm", dir, kind, task->id, ref,
+             obj->surface_id, fmt);
     FILE *f = fopen(path, "wb");
-    if (!f) return;
-    fprintf(f, "P6\n%u %u\n255\n", obj->width, obj->height);
+    path[strlen(path) - 3] = 'p'; path[strlen(path) - 2] = 'g'; path[strlen(path) - 1] = 'm';
+    FILE *fa = fopen(path, "wb");
+    if (!f || !fa) { if (f) fclose(f); if (fa) fclose(fa); return; }
+    fprintf(f, "P6\n%u %u\n255\n", w, obj->height);
+    fprintf(fa, "P5\n%u %u\n255\n", w, obj->height);
     for (uint32_t y = 0; y < obj->height; y++)
-        for (uint32_t x = 0; x < obj->width; x++) {
-            const uint8_t *q = px + (size_t)y * stride + (size_t)x * bpp;
-            uint8_t rgb[3] = { q[bpp == 4u ? 2 : 0], q[bpp == 4u ? 1 : 0], q[0] };
-            if (obj->pixel_format == 94u || obj->pixel_format == 90u) {
-                /* 10-bit channels, low bits first: B,G,R (94) or R,G,B (90) */
-                uint32_t v = lagfx_le32(q);
-                uint8_t c0 = (uint8_t)((v >> 2) & 0xffu), c1 = (uint8_t)((v >> 12) & 0xffu),
-                        c2 = (uint8_t)((v >> 22) & 0xffu);
-                rgb[0] = obj->pixel_format == 94u ? c2 : c0;
-                rgb[1] = c1;
-                rgb[2] = obj->pixel_format == 94u ? c0 : c2;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t rgb[3], a = 255u;
+            if (half) {
+                const uint8_t *q = px + (size_t)y * stride + (size_t)x * 8u;
+                rgb[0] = half_to_u8((uint16_t)(q[0] | q[1] << 8));
+                rgb[1] = half_to_u8((uint16_t)(q[2] | q[3] << 8));
+                rgb[2] = half_to_u8((uint16_t)(q[4] | q[5] << 8));
+                a = half_to_u8((uint16_t)(q[6] | q[7] << 8));
+            } else {
+                const uint8_t *q = px + (size_t)y * stride + (size_t)x * bpp;
+                rgb[0] = q[bpp == 4u ? 2 : 0]; rgb[1] = q[bpp == 4u ? 1 : 0]; rgb[2] = q[0];
+                if (bpp == 4u) a = q[3];
+                if (fmt == 94u || fmt == 90u) {
+                    /* 10-bit channels, low bits first: B,G,R (94) or R,G,B (90) */
+                    uint32_t v = lagfx_le32(q);
+                    uint8_t c0 = (uint8_t)((v >> 2) & 0xffu), c1 = (uint8_t)((v >> 12) & 0xffu),
+                            c2 = (uint8_t)((v >> 22) & 0xffu);
+                    rgb[0] = fmt == 94u ? c2 : c0;
+                    rgb[1] = c1;
+                    rgb[2] = fmt == 94u ? c0 : c2;
+                    a = 255u;
+                }
             }
             fwrite(rgb, 1, 3, f);
+            fputc(a, fa);
         }
     fclose(f);
+    fclose(fa);
 }
 
 static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
