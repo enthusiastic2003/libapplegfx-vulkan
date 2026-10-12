@@ -1219,6 +1219,30 @@ static BOOL case_tex_bufbig(void) {
     return ok;
 }
 
+// A managed texture updated with replaceRegion after it was first drawn with
+// (as Core Animation updates the password-dot mask): the second draw must
+// see the new contents.
+static BOOL case_tex_update(void) {
+    id<MTLTexture> src = make_texture(kPat, kPat, MTLTextureUsageShaderRead);
+    static uint8_t texels[kPat * kPat * 4];
+    memset(texels, 0, sizeof texels);
+    [src replaceRegion:MTLRegionMake2D(0, 0, kPat, kPat) mipmapLevel:0 withBytes:texels
+           bytesPerRow:kPat * 4];
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_quad", @"fs_tex_nearest", nil, nil);
+    static bgra_t px[kSize * kSize];
+    if (!draw_quad(ps, MTLClearColorMake(0, 0, 0, 1),
+                   ^(id<MTLRenderCommandEncoder> e) { [e setFragmentTexture:src atIndex:0]; }, px))
+        return NO;
+    printf("  first draw (zeros): pixel 0 = %02x%02x%02x%02x\n", px[0].r, px[0].g, px[0].b, px[0].a);
+    fill_pattern(texels, kPat * 4);
+    [src replaceRegion:MTLRegionMake2D(0, 0, kPat, kPat) mipmapLevel:0 withBytes:texels
+           bytesPerRow:kPat * 4];
+    if (!draw_quad(ps, MTLClearColorMake(0, 0, 0, 1),
+                   ^(id<MTLRenderCommandEncoder> e) { [e setFragmentTexture:src atIndex:0]; }, px))
+        return NO;
+    return compare(px, pattern_blocks, nil);
+}
+
 // Compute: out[i] = i * 3 + 1 into a shared buffer.
 static BOOL case_compute(void) {
     const NSUInteger n = 4096;
@@ -1483,6 +1507,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"tex-big", case_tex_big, YES},
     {"iosurface-big", case_iosurface_big, YES},
     {"tex-bufbig", case_tex_bufbig, YES},
+    {"tex-update", case_tex_update, YES},
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
     {"sampler-probe", case_sampler_probe, NO},

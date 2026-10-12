@@ -764,6 +764,16 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
                       (unsigned long long)rp.render_target_height,
                       (unsigned long long)rp.render_target_array_length,
                       rp.has_depth ? "yes" : "no");
+            /* Diagnostic: /tmp/lagfx_trace_rp present logs every pass's colour
+             * attachments at warn level. */
+            bool rp_trace = access("/tmp/lagfx_trace_rp", F_OK) == 0;
+            for (uint32_t c = 0; c < rp.color_attachment_count; c++)
+                if (rp_trace)
+                    LAGFX_WARN("TRACE-RP task=%u %llux%llu color[%u] tex=0x%x resolve=0x%x load=%u store=%u",
+                               task_id, (unsigned long long)rp.render_target_width,
+                               (unsigned long long)rp.render_target_height, c,
+                               rp.colors[c].texture_ref, rp.colors[c].resolve_texture_ref,
+                               rp.colors[c].load_action, rp.colors[c].store_action);
             for (uint32_t c = 0; c < rp.color_attachment_count; c++)
                 LAGFX_LOG("0x1a RP   color[%u] tex=0x%x resolve=0x%x load=%u store=%u clear=[%g %g %g %g]",
                           c, rp.colors[c].texture_ref, rp.colors[c].resolve_texture_ref,

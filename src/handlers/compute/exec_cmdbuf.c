@@ -546,6 +546,27 @@ lagfx_handler_status_t lagfx_compute_exec_cmdbuf(lagfx_protocol_t *p, const lagf
         LAGFX_TRACE("CmdExecIndirect2: taskID=%u not found (fail-open)", task_id);
     }
 
+    /* LAGFX_EXECTASK=<id> or >N: log that task's (tasks above N) descriptor and
+     * resource tables. */
+    {
+        const char *et = getenv("LAGFX_EXECTASK");
+        if (et && (et[0] == '>' ? task_id > (uint32_t)strtoul(et + 1, NULL, 0)
+                                : task_id == (uint32_t)strtoul(et, NULL, 0))) {
+            LAGFX_WARN("EXECTASK t%u stamp=0x%08x descs=%u res=%u", task_id, hdr->stamp,
+                       descriptor_count, resource_count);
+            for (uint32_t i = 0; i < descriptor_count + resource_count; i++) {
+                bool is_desc = i < descriptor_count;
+                const uint8_t *d = hdr->payload + 12u
+                                   + (is_desc ? 24u * i : 24u * descriptor_count + 16u * (i - descriptor_count));
+                char hx[3 * 24 + 1];
+                size_t hn = 0;
+                for (uint32_t k = 0; k < (is_desc ? 24u : 16u); k++)
+                    hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", d[k]);
+                LAGFX_WARN("EXECTASK   %s[%u]: %s", is_desc ? "desc" : "res", i, hx);
+            }
+        }
+    }
+
     /* One-time hexdump of first CmdExecIndirect2 descriptor table */
     if (!p->diag.desc_table_dumped && descriptor_count > 0) {
         p->diag.desc_table_dumped = 1;

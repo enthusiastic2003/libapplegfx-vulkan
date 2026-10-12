@@ -310,11 +310,17 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
                               struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                               const lagfx_texture_object_t *obj, uint32_t ref);
 
-/* IOSurfaces are written by the CPU without notice, so their contents are
- * re-read once per command buffer, unless the GPU copy is newer. */
+/* The guest's memory is the texture: the CPU writes IOSurfaces and managed
+ * textures (replaceRegion, Core Animation's text masks and password dots)
+ * without any command, so their contents are re-read once per command
+ * buffer unless the GPU copy is newer (kat tex-update). Render targets of
+ * these kinds are written back after each command buffer, so re-reading
+ * them is safe; shared-storage targets are not written back, and are left
+ * alone. */
 static bool needs_refresh(const lagfx_task_entry_t *task, const lagfx_vk_iosurface_t *ios,
                           const lagfx_texture_object_t *obj) {
-    return obj->surface_id != 0u && !ios->gpu_drawn && ios->upload_gen != task->cmdbuf_gen + 1u;
+    return (obj->surface_id != 0u || obj->storage == LAGFX_STORAGE_MANAGED)
+           && !ios->gpu_drawn && ios->upload_gen != task->cmdbuf_gen + 1u;
 }
 
 lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,

@@ -869,9 +869,9 @@ static void trace_texture(lagfx_protocol_t *p, lagfx_task_entry_t *task, int sta
     bool rd = lagfx_resolve_object_data(p, task, ref, &type, &va, &gpa) && va
               && lagfx_task_read_virtual(p, task, va, sizeof raw, raw);
     if (have)
-        LAGFX_WARN("TRACE pipe=0x%x stage%d texture[%u] ref=0x%x type=0x%02x %ux%u fmt=%u "
+        LAGFX_WARN("TRACE task=%u pipe=0x%x stage%d texture[%u] ref=0x%x type=0x%02x %ux%u fmt=%u "
                    "ttype=%u bpr=%u offset=0x%llx surface=%u places=%u {0x%llx@0x%llx}",
-                   task->pending_pipeline.reference, stage, index, ref, type, o.width, o.height,
+                   task->id, task->pending_pipeline.reference, stage, index, ref, type, o.width, o.height,
                    o.pixel_format, o.texture_type, o.bytes_per_row,
                    (unsigned long long)o.base_offset, o.surface_id, o.n_place,
                    (unsigned long long)o.place[0].size, (unsigned long long)o.place[0].page);
