@@ -945,6 +945,18 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
             if (!getenv("LAGFX_M2V_FALLBACK")) return;
         }
     }
+    /* The same goes for draws metal2vulkan never got: pipelines it refused
+     * (e.g. UnmatchedVarying) and passes without a guest render target. The
+     * legacy path hung lavapipe on one of these (fence timeout) and froze a
+     * Sequoia session. */
+    if (getenv("LAGFX_M2V") && dev_with_vk->vk->m2v && !getenv("LAGFX_M2V_FALLBACK")) {
+        static unsigned n_dropped;
+        if (n_dropped++ < 20u)
+            LAGFX_WARN("M2V: dropped draw t%u pipe=0x%x (%s)", task->id,
+                       task->pending_pipeline.reference,
+                       task->pending_pipeline.m2v ? "no guest target" : "no metal2vulkan pipeline");
+        return;
+    }
 #endif
     /* M2c SOLIDFRAG (LAGFX_M2_SOLIDFRAG): split-test — draw the REAL translated
      * vertex geometry with the SUBSTITUTE solid-colour fragment. If colour
