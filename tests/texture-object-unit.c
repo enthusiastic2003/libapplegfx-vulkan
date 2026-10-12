@@ -116,6 +116,16 @@ int main(void) {
     CHECK(t.n_place == 1 && t.place[0].size == 0x4000 && t.place[0].page == 0x101);
 
     CHECK(t.texture_type == 2 && t.array_length == 1 && t.mip_levels == 1 && t.sample_count == 1);
+    CHECK(t.base_offset == 0);
+
+    /* a 167x24 A8 text mask 0x100 bytes into an 8 KiB allocation (+0x18 is
+     * its length, not a second placement) */
+    make(b, 167, 24, 192, 1, 1, 1, 0x2000, 0xb1f);
+    put64(b, 0x10, 0x100);
+    put64(b, 0x18, 0x1200);
+    CHECK(lagfx_parse_texture_object(b, sizeof b, &t));
+    CHECK(t.n_place == 1 && t.place[0].size == 0x2000 && t.place[0].page == 0xb1f);
+    CHECK(t.base_offset == 0x100 && t.pixel_format == 1 && t.bytes_per_row == 192);
 
     /* a 1D array of 3 layers (WindowServer's colour lookup table shape) */
     make(b, 16384, 1, 65536, 55, 1, 0, 0x30000, 0x1a9a);

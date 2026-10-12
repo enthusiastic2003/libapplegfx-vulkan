@@ -279,7 +279,8 @@ static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_
 static void dump_image(const char *kind, const lagfx_task_entry_t *task, uint32_t ref,
                        const lagfx_texture_object_t *obj, const uint8_t *px, size_t stride) {
     const char *dir = getenv("LAGFX_DUMP_WB");
-    if (!dir || lagfx_metal_pixel_format_bytes(obj->pixel_format) != 4u) return;
+    uint32_t bpp = lagfx_metal_pixel_format_bytes(obj->pixel_format);
+    if (!dir || (bpp != 4u && bpp != 1u)) return;
     char path[512];
     snprintf(path, sizeof path, "%s/%s-t%u-r%x-s%u.ppm", dir, kind, task->id, ref,
              obj->surface_id);
@@ -288,8 +289,8 @@ static void dump_image(const char *kind, const lagfx_task_entry_t *task, uint32_
     fprintf(f, "P6\n%u %u\n255\n", obj->width, obj->height);
     for (uint32_t y = 0; y < obj->height; y++)
         for (uint32_t x = 0; x < obj->width; x++) {
-            const uint8_t *q = px + (size_t)y * stride + (size_t)x * 4u;
-            uint8_t rgb[3] = { q[2], q[1], q[0] };
+            const uint8_t *q = px + (size_t)y * stride + (size_t)x * bpp;
+            uint8_t rgb[3] = { q[bpp == 4u ? 2 : 0], q[bpp == 4u ? 1 : 0], q[0] };
             if (obj->pixel_format == 94u || obj->pixel_format == 90u) {
                 /* 10-bit channels, low bits first: B,G,R (94) or R,G,B (90) */
                 uint32_t v = lagfx_le32(q);

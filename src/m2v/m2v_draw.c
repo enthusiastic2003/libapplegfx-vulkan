@@ -386,7 +386,7 @@ static const neutral_img_t *neutral_image_any(struct lagfx_vk_state *vk, uint32_
  * layers, back to back), cached by (task, object, memory). */
 typedef struct {
     uint32_t task, ref;
-    uint64_t page;
+    uint64_t where;             /* texel (0,0): placement address + offset */
     VkImage image;
     VkDeviceMemory mem;
     VkFormat format;
@@ -402,8 +402,9 @@ static const other_tex_t *other_texture(lagfx_protocol_t *p, lagfx_task_entry_t 
     lagfx_texture_object_t o;
     if (!lagfx_guest_texture_info(p, task, ref, &o) || !o.n_place || o.surface_id) return NULL;
     other_tex_t *cached = NULL;
+    uint64_t where = (o.place[0].page << 12) + o.base_offset;
     for (uint32_t i = 0; i < g_nother; i++)
-        if (g_other[i].task == task->id && g_other[i].ref == ref && g_other[i].page == o.place[0].page)
+        if (g_other[i].task == task->id && g_other[i].ref == ref && g_other[i].where == where)
             cached = &g_other[i];
     /* contents are re-read once per command buffer: the guest may fill the
      * texture after creating it */
@@ -434,7 +435,7 @@ static const other_tex_t *other_texture(lagfx_protocol_t *p, lagfx_task_entry_t 
                        .length = o.place[0].size };
     for (uint32_t z = 0; z < nslices; z++)
         for (uint32_t y = 0; y < o.height; y++)
-            read_buffer(p, task, &pl, z * slice + (uint64_t)y * o.bytes_per_row, row,
+            read_buffer(p, task, &pl, o.base_offset + z * slice + (uint64_t)y * o.bytes_per_row, row,
                         px + ((size_t)z * o.height + y) * row);
     if (getenv("LAGFX_SRCCHECK")) {
         size_t nz = 0;
@@ -449,7 +450,7 @@ static const other_tex_t *other_texture(lagfx_protocol_t *p, lagfx_task_entry_t 
         cached->image = VK_NULL_HANDLE;
         cached->mem = VK_NULL_HANDLE;
     }
-    other_tex_t t = { task->id, ref, o.place[0].page, VK_NULL_HANDLE, VK_NULL_HANDLE, fmt, layers,
+    other_tex_t t = { task->id, ref, where, VK_NULL_HANDLE, VK_NULL_HANDLE, fmt, layers,
                       task->cmdbuf_gen + 1u };
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = itype,
@@ -839,6 +840,52 @@ static VkPipeline variant(struct lagfx_vk_state *vk, m2v_pipe_t *mp, VkFormat fm
 }
 
 /* ------------------------------------------------------------------- stencil */
+
+/* Live tracing (diagnostic): /tmp/lagfx_trace.txt holds pipeline refs in the
+ * LAGFX_SKIP_PIPES format; draws with those pipelines log their bindings as
+ * LAGFX_BINDLOG does, plus each texture object. Re-read every draw, since
+ * pipeline refs differ per boot. */
+static bool traced_pipeline(uint32_t ref) {
+    char buf[256], pref[16];
+    FILE *f = fopen("/tmp/lagfx_trace.txt", "r");
+    if (!f) return false;
+    size_t got = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+    snprintf(pref, sizeof pref, "0x%x", ref);
+    size_t pl = strlen(pref);
+    for (const char *h = strstr(buf, pref); h; h = strstr(h + 1, pref))
+        if ((h == buf || h[-1] == ',') && (h[pl] == '\0' || h[pl] == ',' || h[pl] == '\n'))
+            return true;
+    return false;
+}
+
+static void trace_texture(lagfx_protocol_t *p, lagfx_task_entry_t *task, int stage,
+                          uint32_t index, uint32_t ref) {
+    lagfx_texture_object_t o;
+    uint8_t type = 0, raw[0x80];
+    uint64_t va = 0, gpa = 0;
+    bool have = lagfx_guest_texture_info(p, task, ref, &o);
+    bool rd = lagfx_resolve_object_data(p, task, ref, &type, &va, &gpa) && va
+              && lagfx_task_read_virtual(p, task, va, sizeof raw, raw);
+    if (have)
+        LAGFX_WARN("TRACE pipe=0x%x stage%d texture[%u] ref=0x%x type=0x%02x %ux%u fmt=%u "
+                   "ttype=%u bpr=%u offset=0x%llx surface=%u places=%u {0x%llx@0x%llx}",
+                   task->pending_pipeline.reference, stage, index, ref, type, o.width, o.height,
+                   o.pixel_format, o.texture_type, o.bytes_per_row,
+                   (unsigned long long)o.base_offset, o.surface_id, o.n_place,
+                   (unsigned long long)o.place[0].size, (unsigned long long)o.place[0].page);
+    else
+        LAGFX_WARN("TRACE pipe=0x%x stage%d texture[%u] ref=0x%x type=0x%02x undecoded",
+                   task->pending_pipeline.reference, stage, index, ref, type);
+    for (uint32_t row = 0; rd && row < sizeof raw; row += 32u) {
+        char hx[3 * 32 + 1];
+        size_t hn = 0;
+        for (uint32_t k = row; k < row + 32u; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", raw[k]);
+        LAGFX_WARN("TRACE   +%02x: %s", row, hx);
+    }
+}
 
 /* A host stencil image per (task, stencil texture, size). Its contents live
  * only on the host: the clock's renderer stores none (store DontCare). */
@@ -1258,8 +1305,12 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
 
     {
         const char *bl = getenv("LAGFX_BINDLOG");
-        if (bl && (strcmp(bl, "all") == 0
-                   || strtoul(bl, NULL, 0) == task->pending_pipeline.reference)) {
+        if ((bl && (strcmp(bl, "all") == 0
+                    || strtoul(bl, NULL, 0) == task->pending_pipeline.reference))
+            || traced_pipeline(task->pending_pipeline.reference)) {
+            for (int si = 0; si < 2; si++)
+                for (uint32_t k = 0; k < sb[si].nt; k++)
+                    trace_texture(p, task, si, sb[si].textures[k].index, sb[si].texture_ref[k]);
             for (int si = 0; si < 2; si++) {
                 for (uint32_t k = 0; k < sb[si].nb; k++) {
                     uint8_t head[384];

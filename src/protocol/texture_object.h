@@ -5,12 +5,16 @@
  * SPDX-License-Identifier: MIT
  *
  * A texture's object data (the slot's bytes_va) starts with its placement:
- * up to two {u64 size, u64 page} entries locating the texel memory in the
- * task's address space (page << 12), followed by the texture descriptor.
- * Offsets below were matched against textures created with known
- * properties (tests/guest/kat.m, `kat probe`):
+ * the allocation holding the texel memory in the task's address space
+ * (page << 12) and where in it the texture lies, followed by the texture
+ * descriptor. Offsets below were matched against textures created with
+ * known properties (tests/guest/kat.m, `kat probe`):
  *
- *   +0x00  {u64 size, u64 page} x 2   placement (page: low 32 bits)
+ *   +0x00  u64  allocation size
+ *   +0x08  u64  allocation page (low 32 bits)
+ *   +0x10  u64  byte offset of texel (0,0) in the allocation (non-zero for
+ *               Core Animation's sub-allocated text masks, e.g. 0x100)
+ *   +0x18  u64  texture length (bytes per row x height)
  *   +0x34  u32  bytes per row
  *   +0x3c  u32  width            (repeated at +0x58)
  *   +0x40  u32  height           (repeated at +0x5c)

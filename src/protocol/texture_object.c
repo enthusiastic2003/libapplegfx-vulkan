@@ -39,14 +39,15 @@ bool lagfx_parse_texture_object(const uint8_t *b, size_t len, lagfx_texture_obje
     if (out->pixel_format == 0u || out->storage > LAGFX_STORAGE_PRIVATE) return false;
     if (out->bytes_per_row < out->width) return false;
 
-    for (uint32_t e = 0; e < 2u; e++) {
-        uint64_t size = rd64(b + e * 16u);
-        uint64_t page = rd64(b + e * 16u + 8u) & 0xffffffffull;
-        if (size == 0u || page == 0u) continue;
-        out->place[out->n_place].size = size;
-        out->place[out->n_place].page = page;
-        out->n_place++;
+    uint64_t size = rd64(b + 0x00), page = rd64(b + 0x08) & 0xffffffffull;
+    if (size != 0u && page != 0u) {
+        out->place[0].size = size;
+        out->place[0].page = page;
+        out->n_place = 1;
     }
+    /* Textures sub-allocated from a larger allocation (Core Animation's text
+     * masks) start part-way into it. */
+    out->base_offset = rd64(b + 0x10);
     return true;
 }
 

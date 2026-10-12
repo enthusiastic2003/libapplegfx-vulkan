@@ -146,6 +146,11 @@ static NSString *const kShaderSrc =
      "fragment float4 fs_sp11(QOut in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
      "    constexpr sampler s(address::clamp_to_border, border_color::opaque_white); return t.sample(s, in.uv);\n"
      "}\n"
+     // texel fetch at pixel position + offset: a 64x64 window into a large texture
+     "fragment float4 fs_tex_read(float4 pos [[position]], texture2d<float> t [[texture(0)]],\n"
+     "                            constant uint2 &off [[buffer(0)]]) {\n"
+     "    return t.read(uint2(pos.xy) + off);\n"
+     "}\n"
      // compute
      "kernel void k_fill(device uint *out [[buffer(0)]], constant uint &mul [[buffer(1)]],\n"
      "                   uint i [[thread_position_in_grid]]) { out[i] = i * mul + 1u; }\n";
@@ -1134,6 +1139,86 @@ static BOOL case_iosurface_target(void) {
     return ok;
 }
 
+// Large, odd-sized textures (as window and text surfaces are), read through a
+// 64x64 window at an offset. Every texel encodes its coordinates, so a wrong
+// row pitch shows as a shear and a wrong start offset as a constant shift.
+#define kBigW 298
+#define kBigH 113
+static const uint32_t kBigOff[2] = {201, 37};
+static bgra_t big_texel(int x, int y) {
+    return px_rgba(x & 0xff, y & 0xff, 0x80 | (x >> 8) | ((y >> 8) << 2), 255);
+}
+static void fill_big(uint8_t *base, size_t bpr) {
+    for (int y = 0; y < kBigH; y++)
+        for (int x = 0; x < kBigW; x++) *(bgra_t *)(base + y * bpr + x * 4) = big_texel(x, y);
+}
+static BOOL check_big(id<MTLTexture> src) {
+    if (!src) return NO;
+    static bgra_t px[kSize * kSize];
+    if (!draw_quad(make_pipeline(@"vs_quad", @"fs_tex_read", nil, nil), MTLClearColorMake(0, 0, 0, 1),
+                   ^(id<MTLRenderCommandEncoder> e) {
+                       [e setFragmentTexture:src atIndex:0];
+                       [e setFragmentBytes:kBigOff length:sizeof kBigOff atIndex:0];
+                   },
+                   px))
+        return NO;
+    // Report where the first row's samples actually came from.
+    bgra_t p = px[0];
+    printf("  pixel (0,0) holds texel (%d,%d), want (%u,%u)\n",
+           p.r | ((p.b & 3) << 8), p.g | (((p.b >> 2) & 3) << 8), kBigOff[0], kBigOff[1]);
+    return compare(px, ^bgra_t(int x, int y) {
+        int tx = x + (int)kBigOff[0], ty = y + (int)kBigOff[1];
+        return tx < kBigW && ty < kBigH ? big_texel(tx, ty) : px_rgba(0, 0, 0, 0);
+    }, ^BOOL(int x, int y) { return x + (int)kBigOff[0] >= kBigW || y + (int)kBigOff[1] >= kBigH; });
+}
+
+static BOOL case_tex_big(void) {
+    id<MTLTexture> src = make_texture(kBigW, kBigH, MTLTextureUsageShaderRead);
+    static uint8_t texels[kBigW * kBigH * 4];
+    fill_big(texels, kBigW * 4);
+    [src replaceRegion:MTLRegionMake2D(0, 0, kBigW, kBigH) mipmapLevel:0 withBytes:texels
+           bytesPerRow:kBigW * 4];
+    return check_big(src);
+}
+
+static BOOL case_iosurface_big(void) {
+    IOSurfaceRef s = make_surface(kBigW, kBigH);
+    if (!s) { printf("  IOSurfaceCreate failed\n"); return NO; }
+    printf("  bytes per row %zu (width x 4 = %d), alloc %zu\n", IOSurfaceGetBytesPerRow(s),
+           kBigW * 4, IOSurfaceGetAllocSize(s));
+    IOSurfaceLock(s, 0, NULL);
+    fill_big(IOSurfaceGetBaseAddress(s), IOSurfaceGetBytesPerRow(s));
+    IOSurfaceUnlock(s, 0, NULL);
+    BOOL ok = check_big(surface_texture(s, kBigW, kBigH, MTLTextureUsageShaderRead));
+    CFRelease(s);
+    return ok;
+}
+
+static BOOL case_tex_bufbig(void) {
+    NSUInteger align = [gDevice minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm];
+    NSUInteger off = 5 * align, bpr = ((kBigW * 4 + 3 * align - 1) / align) * align;
+    printf("  offset 0x%lx, bytes per row 0x%lx\n", (unsigned long)off, (unsigned long)bpr);
+    NSUInteger len = off + bpr * kBigH;
+    BOOL ok = YES;
+    const MTLStorageMode modes[2] = {MTLStorageModeShared, MTLStorageModeManaged};
+    for (int m = 0; m < 2; m++) {
+        id<MTLBuffer> b = [gDevice newBufferWithLength:len
+                                               options:(MTLResourceOptions)modes[m]
+                                                       << MTLResourceStorageModeShift];
+        memset(b.contents, 0x33, len);
+        fill_big((uint8_t *)b.contents + off, bpr);
+        if (modes[m] == MTLStorageModeManaged) [b didModifyRange:NSMakeRange(0, len)];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:kBigW height:kBigH
+                                     mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = modes[m];
+        printf("  storage mode %lu:\n", (unsigned long)modes[m]);
+        ok &= check_big([b newTextureWithDescriptor:td offset:off bytesPerRow:bpr]);
+    }
+    return ok;
+}
+
 // Compute: out[i] = i * 3 + 1 into a shared buffer.
 static BOOL case_compute(void) {
     const NSUInteger n = 4096;
@@ -1395,6 +1480,9 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"blend-premul", case_blend_premul, YES},
     {"iosurface-sample", case_iosurface_sample, YES},
     {"iosurface-target", case_iosurface_target, YES},
+    {"tex-big", case_tex_big, YES},
+    {"iosurface-big", case_iosurface_big, YES},
+    {"tex-bufbig", case_tex_bufbig, YES},
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
     {"sampler-probe", case_sampler_probe, NO},
