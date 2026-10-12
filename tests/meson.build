@@ -1327,6 +1327,14 @@ texobj_test = executable('texture-object-unit',
 )
 test('texture object decode (unit)', texobj_test)
 
+depth_stencil_test = executable('depth-stencil-unit',
+  'depth-stencil-unit.c',
+  include_directories : [include_dir, internal_include_dir],
+  dependencies : [libapplegfx_vulkan_dep],
+  build_by_default : true,
+)
+test('depth-stencil state decode (unit)', depth_stencil_test)
+
 sampler_test = executable('sampler-state-unit',
   'sampler-state-unit.c',
   include_directories : [include_dir, internal_include_dir],

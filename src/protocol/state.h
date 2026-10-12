@@ -312,6 +312,14 @@ typedef struct {
     /* Render pass description from PGCmdDescribeRenderPass (0x1a).
      * Per-task state: each task has its own render pass descriptor. */
     lagfx_render_pass_desc_t render_pass_desc;
+    /* depth-stencil state object bound by 0x68 (0: none) and stencil
+     * reference values from 0x77; reset by each render pass */
+    uint32_t depth_stencil_ref;
+    uint32_t stencil_ref_front, stencil_ref_back;
+    /* the pass's stencil attachment (0x1a +0x28..): texture (0: none), load
+     * action, clear value; the clear is applied by the pass's first draw */
+    uint32_t stencil_target_ref, stencil_load_action, stencil_clear_value;
+    bool stencil_clear_pending;
 
     /* Scissor rect (0x75) — the authoritative draw-region size. 0x1a
      * render_area is genuinely 0 for real passes (Metal leaves

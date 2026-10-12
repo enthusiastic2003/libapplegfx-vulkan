@@ -25,6 +25,7 @@
 #include "handlers/compute/compute_draw_internal.h"
 #include "handlers/compute/guest_texture.h"
 #include "handlers/compute/task_translate.h"
+#include "protocol/depth_stencil.h"
 #include "protocol/object_resolver.h"
 #include "protocol/pipeline_descriptor.h"
 #include "protocol/sampler_state.h"
@@ -47,6 +48,8 @@ typedef struct {
     VkFormat format;
     uint32_t topology;
     uint64_t spec_hash;
+    VkFormat stencil_format;     /* VK_FORMAT_UNDEFINED: no stencil attachment */
+    uint64_t ds_hash;            /* the depth-stencil state baked in */
     VkPipeline pipeline;
 } variant_t;
 
@@ -642,8 +645,18 @@ void *lagfx_m2v_pipeline_get(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     lagfx_m2v_vertex_layout_t ml[8];
     for (uint32_t i = 0; i < na; i++)
         ma[i] = (lagfx_m2v_vertex_attribute_t){ va[i].index, va[i].fmt, va[i].off, va[i].bufidx };
-    for (uint32_t i = 0; i < nl; i++)
-        ml[i] = (lagfx_m2v_vertex_layout_t){ vl[i].index, vl[i].stride, 1u /* PerVertex */, 1u };
+    for (uint32_t i = 0; i < nl; i++) {
+        /* layout record key 1: MTLVertexStepFunction (absent: PerVertex), key 2:
+         * step rate (absent: 1); kat vtxstep-probe */
+        ml[i] = (lagfx_m2v_vertex_layout_t){
+            vl[i].index, vl[i].stride,
+            (vl[i].present & 2u) ? vl[i].value[1] : 1u,
+            (vl[i].present & 4u) ? vl[i].value[2] : 1u };
+        if (getenv("LAGFX_VTXLOG"))
+            LAGFX_WARN("VTXLAYOUT ref=0x%x buffer %u stride %u keys 0x%x: [1]=%u [2]=%u [4]=%u [5]=%u",
+                       reference, vl[i].index, vl[i].stride, vl[i].present, vl[i].value[1],
+                       vl[i].value[2], vl[i].value[4], vl[i].value[5]);
+    }
     if (na) {
         d.has_vertex_descriptor = 1u;
         d.n_attributes = na; d.attributes = ma;
@@ -706,11 +719,13 @@ static VkBlendOp blend_op(uint8_t o) {
 
 static VkPipeline variant(struct lagfx_vk_state *vk, m2v_pipe_t *mp, VkFormat fmt, uint32_t topology,
                           const uint8_t *spec, size_t spec_len, const uint32_t (*entries)[3],
-                          uint32_t n_entries) {
+                          uint32_t n_entries, VkFormat sfmt, const lagfx_depth_stencil_t *dss) {
     uint64_t sh = fnv(0xcbf29ce484222325ull, spec, spec_len);
     sh = fnv(sh, entries, sizeof entries[0] * n_entries);
+    uint64_t dh = sfmt != VK_FORMAT_UNDEFINED ? fnv(0xcbf29ce484222325ull, dss, sizeof *dss) : 0u;
     for (uint32_t i = 0; i < mp->nvar; i++)
-        if (mp->var[i].format == fmt && mp->var[i].topology == topology && mp->var[i].spec_hash == sh)
+        if (mp->var[i].format == fmt && mp->var[i].topology == topology && mp->var[i].spec_hash == sh
+            && mp->var[i].stencil_format == sfmt && mp->var[i].ds_hash == dh)
             return mp->var[i].pipeline;
     if (mp->nvar >= MAX_VARIANTS) return VK_NULL_HANDLE;
 
@@ -780,14 +795,29 @@ static VkPipeline variant(struct lagfx_vk_state *vk, m2v_pipe_t *mp, VkFormat fm
         .attachmentCount = 1, .pAttachments = &cba,
     };
     VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                             VK_DYNAMIC_STATE_BLEND_CONSTANTS };
+                             VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+    bool stencil = sfmt != VK_FORMAT_UNDEFINED;
     VkPipelineDynamicStateCreateInfo ds = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 3, .pDynamicStates = dyn,
+        .dynamicStateCount = stencil ? 4u : 3u, .pDynamicStates = dyn,
     };
+    /* Metal's compare functions and stencil operations are numbered as Vulkan's */
+    VkPipelineDepthStencilStateCreateInfo dsi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .stencilTestEnable = stencil ? VK_TRUE : VK_FALSE,
+    };
+    if (stencil) {
+        const lagfx_stencil_face_t *f[2] = { &dss->front, &dss->back };
+        VkStencilOpState *o[2] = { &dsi.front, &dsi.back };
+        for (int k = 0; k < 2; k++)
+            *o[k] = (VkStencilOpState){ (VkStencilOp)f[k]->stencil_fail, (VkStencilOp)f[k]->pass,
+                                        (VkStencilOp)f[k]->depth_fail, (VkCompareOp)f[k]->compare,
+                                        f[k]->read_mask, f[k]->write_mask, 0u };
+    }
     VkPipelineRenderingCreateInfo rci = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
         .colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt,
+        .stencilAttachmentFormat = sfmt,
     };
     VkGraphicsPipelineCreateInfo ci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -795,6 +825,7 @@ static VkPipeline variant(struct lagfx_vk_state *vk, m2v_pipe_t *mp, VkFormat fm
         .stageCount = mp->n_stages, .pStages = st,
         .pVertexInputState = &vis, .pInputAssemblyState = &ias, .pViewportState = &vps,
         .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cbs,
+        .pDepthStencilState = stencil ? &dsi : NULL,
         .pDynamicState = &ds, .layout = mp->layout,
     };
     VkPipeline pl = VK_NULL_HANDLE;
@@ -803,8 +834,100 @@ static VkPipeline variant(struct lagfx_vk_state *vk, m2v_pipe_t *mp, VkFormat fm
         LAGFX_WARN("M2V: vkCreateGraphicsPipelines failed (%d)", (int)vr);
         return VK_NULL_HANDLE;
     }
-    mp->var[mp->nvar++] = (variant_t){ fmt, topology, sh, pl };
+    mp->var[mp->nvar++] = (variant_t){ fmt, topology, sh, sfmt, dh, pl };
     return pl;
+}
+
+/* ------------------------------------------------------------------- stencil */
+
+/* A host stencil image per (task, stencil texture, size). Its contents live
+ * only on the host: the clock's renderer stores none (store DontCare). */
+typedef struct {
+    uint32_t task, ref, width, height;
+    VkFormat format;
+    VkImage image;
+    VkDeviceMemory mem;
+    VkImageView view;
+    VkImageLayout layout;
+} stencil_img_t;
+
+static stencil_img_t g_stencil[32];
+static uint32_t g_nstencil;
+
+static VkFormat stencil_format(struct lagfx_vk_state *vk) {
+    static VkFormat f = VK_FORMAT_MAX_ENUM;
+    if (f != VK_FORMAT_MAX_ENUM) return f;
+    const VkFormat cand[] = { VK_FORMAT_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT,
+                              VK_FORMAT_D24_UNORM_S8_UINT };
+    f = VK_FORMAT_UNDEFINED;
+    for (size_t i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(vk->phys_device, cand[i], &fp);
+        if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+            f = cand[i];
+            break;
+        }
+    }
+    LAGFX_WARN("M2V: stencil attachments use VkFormat %d", (int)f);
+    return f;
+}
+
+static stencil_img_t *stencil_image(struct lagfx_vk_state *vk, uint32_t task, uint32_t ref,
+                                    uint32_t w, uint32_t h) {
+    for (uint32_t i = 0; i < g_nstencil; i++)
+        if (g_stencil[i].task == task && g_stencil[i].ref == ref && g_stencil[i].width == w
+            && g_stencil[i].height == h)
+            return &g_stencil[i];
+    VkFormat fmt = stencil_format(vk);
+    if (fmt == VK_FORMAT_UNDEFINED) return NULL;
+    stencil_img_t *e = &g_stencil[g_nstencil < 32u ? g_nstencil++ : (task + ref) % 32u];
+    if (e->image) {
+        vkDestroyImageView(vk->device, e->view, NULL);
+        vkDestroyImage(vk->device, e->image, NULL);
+        vkFreeMemory(vk->device, e->mem, NULL);
+    }
+    *e = (stencil_img_t){ task, ref, w, h, fmt, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                          VK_IMAGE_LAYOUT_UNDEFINED };
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = fmt, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkMemoryRequirements mr;
+    if (vkCreateImage(vk->device, &ici, NULL, &e->image) != VK_SUCCESS) goto fail;
+    vkGetImageMemoryRequirements(vk->device, e->image, &mr);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                .allocationSize = mr.size,
+                                .memoryTypeIndex = find_mem(vk, mr.memoryTypeBits, 0) };
+    if (vkAllocateMemory(vk->device, &ai, NULL, &e->mem) != VK_SUCCESS) goto fail;
+    vkBindImageMemory(vk->device, e->image, e->mem, 0);
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = e->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+        .subresourceRange = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 },
+    };
+    if (vkCreateImageView(vk->device, &vci, NULL, &e->view) != VK_SUCCESS) goto fail;
+    return e;
+fail:
+    if (e->image) vkDestroyImage(vk->device, e->image, NULL);
+    if (e->mem) vkFreeMemory(vk->device, e->mem, NULL);
+    *e = (stencil_img_t){ 0 };
+    return NULL;
+}
+
+/* The task's bound depth-stencil state (Metal's default without one). */
+static void bound_depth_stencil(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                                lagfx_depth_stencil_t *out) {
+    lagfx_depth_stencil_default(out);
+    uint8_t type = 0, d[LAGFX_DEPTH_STENCIL_OBJECT_LEN];
+    uint64_t va = 0, gpa = 0;
+    if (task->depth_stencil_ref
+        && lagfx_resolve_object_data(p, task, task->depth_stencil_ref, &type, &va, &gpa) && va
+        && lagfx_task_read_virtual(p, task, va, sizeof d, d)
+        && !lagfx_parse_depth_stencil_object(d, sizeof d, out))
+        lagfx_depth_stencil_default(out);
 }
 
 /* ---------------------------------------------------------------------- draw */
@@ -1338,8 +1461,15 @@ image_done:
     uint32_t n_spec = 0;
     const uint32_t *se = lagfx_m2v_draw_specialization(dr, &spec, &spec_len, &n_spec);
     uint32_t topology = prim <= 4u ? prim : 3u;   /* MTLPrimitiveType == VkPrimitiveTopology here */
+    /* the pass's stencil attachment and the bound depth-stencil state */
+    stencil_img_t *sti = task->stencil_target_ref
+        ? stencil_image(vk, task->id, task->stencil_target_ref, target->width, target->height)
+        : NULL;
+    lagfx_depth_stencil_t dss;
+    bound_depth_stencil(p, task, &dss);
     VkPipeline pl = variant(vk, mp, target->format, topology, spec, spec_len,
-                            (const uint32_t (*)[3])se, n_spec);
+                            (const uint32_t (*)[3])se, n_spec,
+                            sti ? sti->format : VK_FORMAT_UNDEFINED, &dss);
     if (!pl) FAIL_AT(20);
 
     /* vertex buffers */
@@ -1449,12 +1579,49 @@ image_done:
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
+    VkRenderingAttachmentInfo satt = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    if (sti) {
+        bool combined = sti->format != VK_FORMAT_S8_UINT;
+        VkImageMemoryBarrier sb = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .oldLayout = sti->layout,
+            .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = sti->image,
+            .subresourceRange = { VK_IMAGE_ASPECT_STENCIL_BIT
+                                  | (combined ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u), 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                             | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                             0, 0, NULL, 0, NULL, 1, &sb);
+        satt.imageView = sti->view;
+        /* a pass that loads (or doesn't care about) a stencil we never saw starts at 0 */
+        if (task->stencil_clear_pending || sti->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            satt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            satt.clearValue.depthStencil.stencil =
+                task->stencil_clear_pending ? task->stencil_clear_value & 0xffu : 0u;
+        }
+    }
     VkRenderingInfo ri = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
         .renderArea = { { 0, 0 }, { target->width, target->height } },
         .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att,
+        .pStencilAttachment = sti ? &satt : NULL,
     };
     vkCmdBeginRendering(cb, &ri);
+    if (sti) {
+        vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, task->stencil_ref_front & 0xffu);
+        vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, task->stencil_ref_back & 0xffu);
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pl);
     {
         uint32_t vx = 0, vy = 0, vw = target->width, vh = target->height;
@@ -1526,6 +1693,10 @@ image_done:
         VkResult wr2 = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 10000000000ull);
         if (wr2 == VK_SUCCESS) {
             ok = true;
+            if (sti) {
+                sti->layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                task->stencil_clear_pending = false;
+            }
         } else {
             LAGFX_WARN("M2V draw: fence wait failed (%d); waiting for the device", (int)wr2);
             vkDeviceWaitIdle(vk->device);

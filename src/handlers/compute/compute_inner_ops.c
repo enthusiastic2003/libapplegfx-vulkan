@@ -127,6 +127,44 @@ static int queue_draw(lagfx_protocol_t *p, uint32_t task_id, const char *name,
     return 0;
 }
 
+/* 0x68 setDepthStencilState {u32 object ref} and 0x77 setStencilReference
+ * {u32 front, u32 back}: decoded with kat stencil-probe. */
+static int op_set_depth_stencil_state(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                      const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 4u || task_id >= LAGFX_MAX_TASKS || !p->tasks[task_id].live) return 1;
+    lagfx_task_entry_t *task = &p->tasks[task_id];
+    task->depth_stencil_ref = lagfx_le32(b);
+    if (getenv("LAGFX_DUMP_DS")) {
+        static uint32_t seen[64];
+        static unsigned ns;
+        bool dup = false;
+        for (unsigned k = 0; k < 64u; k++) dup |= seen[k] == ((task_id << 24) | task->depth_stencil_ref);
+        uint8_t type = 0, d[0x60];
+        uint64_t va = 0, gpa = 0;
+        if (!dup && lagfx_resolve_object_data(p, task, task->depth_stencil_ref, &type, &va, &gpa)
+            && va && lagfx_task_read_virtual(p, task, va, sizeof d, d)) {
+            seen[ns++ % 64u] = (task_id << 24) | task->depth_stencil_ref;
+            char hx[3 * sizeof d + 1];
+            size_t hn = 0;
+            for (size_t k = 0; k < sizeof d; k++)
+                hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", d[k]);
+            LAGFX_WARN("DSOBJ t%u ref=0x%x type=0x%02x: %s", task_id, task->depth_stencil_ref,
+                       type, hx);
+        }
+    }
+    return 0;
+}
+
+static int op_set_stencil_reference(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                    const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 8u || task_id >= LAGFX_MAX_TASKS || !p->tasks[task_id].live) return 1;
+    p->tasks[task_id].stencil_ref_front = lagfx_le32(b);
+    p->tasks[task_id].stencil_ref_back = lagfx_le32(b + 4);
+    return 0;
+}
+
 /* Encodings decoded with kat draw-probe (distinct values per field):
  *   0x02 drawPrimitives:vertexStart:vertexCount:instanceCount: (wide)
  *        {u64 start, u64 count, u64 instances, u32 prim}
@@ -189,11 +227,27 @@ static int op_draw_0x09(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
                         const uint8_t *b, size_t len) {
     (void)enc;
     if (len < 16u || !getenv("LAGFX_DRAW09")) return 1;
-    draw_args_t a = { .prim = lagfx_le32(b), .instances = lagfx_le32(b + 4),
-                      .count = lagfx_le16(b + 8), .start = (int32_t)lagfx_le32(b + 12) };
-    if (getenv("LAGFX_DRAW09_START_IS_BASE_INSTANCE")) {
-        a.base_instance = (uint32_t)a.start;
-        a.start = 0;
+    /* LAGFX_DRAW09=<reading> while the layout is unconfirmed:
+     *   1: +4 instances, +12 vertex start
+     *   2: +4 instances, +12 base instance
+     *   3: +12 instances, +4 ignored (always 1), start 0
+     *   4: indexed {u32 prim, u32 indexType, u16 count, u16 offset, u32 buffer} */
+    unsigned mode = (unsigned)strtoul(getenv("LAGFX_DRAW09"), NULL, 0);
+    draw_args_t a = { .prim = lagfx_le32(b), .count = lagfx_le16(b + 8) };
+    if (mode == 1u) {
+        a.instances = lagfx_le32(b + 4);
+        a.start = (int32_t)lagfx_le32(b + 12);
+    } else if (mode == 2u) {
+        a.instances = lagfx_le32(b + 4);
+        a.base_instance = lagfx_le32(b + 12);
+    } else if (mode == 4u) {
+        /* indexed: {u32 prim, u32 indexType, u16 count, u16 offset, u32 index buffer} */
+        a.indexed = true;
+        a.index_type = lagfx_le32(b + 4);
+        a.index_offset = lagfx_le16(b + 10);
+        a.index_ref = lagfx_le32(b + 12);
+    } else {
+        a.instances = lagfx_le32(b + 12);
     }
     return queue_draw(p, task_id, "op_0x09", &a);
 }
@@ -682,6 +736,20 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
      * sticky semantics — only the per-draw rects reset. */
     task->sc_have = 0u;
     task->vp_current = 0u;
+    /* a new encoder starts with the default depth-stencil state */
+    task->depth_stencil_ref = 0u;
+    task->stencil_ref_front = task->stencil_ref_back = 0u;
+    task->stencil_target_ref = body_len >= 0x48u ? lagfx_le32(body + 0x28) : 0u;
+    task->stencil_load_action = body_len >= 0x48u ? lagfx_le16(body + 0x3c) : 0u;
+    task->stencil_clear_value = body_len >= 0x48u ? lagfx_le32(body + 0x44) : 0u;
+    task->stencil_clear_pending = task->stencil_target_ref && task->stencil_load_action == 2u;
+    if (getenv("LAGFX_DUMP_DS") && body_len >= 0x4cu) {
+        char hx[3 * 0x4c + 1];
+        size_t hn = 0;
+        for (size_t k = 0; k < 0x4cu; k++)
+            hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", body[k]);
+        LAGFX_WARN("DSPASS t%u depth/stencil +0..+0x4b: %s", task_id, hx);
+    }
 
     /* Full 584-byte decode (src/protocol/render_pass.h layout). */
     uint32_t rp_target = 0u;   /* colour target bound as a guest texture, if any */
@@ -2131,6 +2199,8 @@ static const lagfx_compute_inner_op_desc_t compute_inner_op_table[] = {
     { 0x0005, "DrawBaseInstancePrimitives16",    op_draw_base_instance_16 },
     { 0x0009, "DrawPrimitives0x09",              op_draw_0x09 },
     { 0x001d, "DrawIndexedInstancedPrimitives16", op_draw_indexed_instanced_16 },
+    { 0x0068, "SetDepthStencilState",            op_set_depth_stencil_state },
+    { 0x0077, "SetStencilReference",             op_set_stencil_reference },
 };
 
 #define LAGFX_COMPUTE_INNER_OP_COUNT \

@@ -16,7 +16,9 @@
  *
  * with keys in increasing order and zero-valued fields omitted. Key 0 is the
  * element index. Attribute records: 1 = MTLVertexFormat, 2 = offset,
- * 3 = bufferIndex. Layout records: 3 = stride.
+ * 3 = bufferIndex. Layout records: 1 = MTLVertexStepFunction (absent:
+ * PerVertex; Constant is present with value 0), 2 = step rate (absent: 1),
+ * 3 = stride (kat vtxstep-probe).
  */
 #ifndef LIBAPPLEGFX_PROTOCOL_VERTEX_DESCRIPTOR_H
 #define LIBAPPLEGFX_PROTOCOL_VERTEX_DESCRIPTOR_H
@@ -33,6 +35,8 @@ typedef struct {
 typedef struct {
     uint32_t index;   /* Metal buffer index */
     uint32_t stride;
+    uint32_t present;     /* keys present in the record (bit per key) */
+    uint32_t value[8];    /* every field, by key (0 when omitted) */
 } lagfx_vtxdesc_layout_t;
 
 /* Decode the vertex descriptor from a pipeline descriptor blob. Attributes are

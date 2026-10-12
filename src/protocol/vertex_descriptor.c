@@ -117,6 +117,8 @@ uint32_t lagfx_parse_vertex_descriptor(const uint8_t *blob, uint32_t len,
             if (j < nl || nl >= layout_cap) continue;
             layouts[nl].index  = recs[k].value[0];
             layouts[nl].stride = recs[k].value[3];
+            layouts[nl].present = recs[k].present;
+            for (uint32_t q = 0; q < 8u; q++) layouts[nl].value[q] = recs[k].value[q];
             nl++;
         }
         break;

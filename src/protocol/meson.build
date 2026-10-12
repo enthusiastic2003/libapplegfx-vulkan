@@ -14,6 +14,7 @@ lagfx_sources += files(
   'test_api.c',     # Test API exports: dispatch_one, mmio_read/write
    'object_resolver.c',  # Phase B object ID resolver for metallib lookup
    'vertex_descriptor.c',  # serialized MTLVertexDescriptor decoder
+   'depth_stencil.c',   # depth-stencil state object (slot type 0x07) decoder
    'texture_object.c',  # texture object (slot type 0x02/0x03/0x0c) decoder
    'sampler_state.c',  # sampler state object / constexpr sampler decoders
    'pipeline_descriptor.c',  # pipeline colour attachments / blend state

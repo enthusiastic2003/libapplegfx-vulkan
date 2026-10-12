@@ -78,6 +78,9 @@ static NSString *const kShaderSrc =
      "    return float4(p[vid], 0, 1);\n"
      "}\n"
      "fragment float4 fs_red() { return float4(1, 0, 0, 1); }\n"
+     "[[patch(quad, 4)]] vertex float4 vs_patch(float2 uv [[position_in_patch]]) {\n"
+     "    return float4(uv * 2 - 1, 0, 1);\n"
+     "}\n"
      // positions indexed by vertex id and a matrix, both from buffers (as Core Animation draws)
      "vertex float4 vs_vid_mat(uint vid [[vertex_id]], const device float2 *pos [[buffer(1)]],\n"
      "                         constant float4x4 &m [[buffer(2)]]) {\n"
@@ -364,6 +367,70 @@ static BOOL case_vid_matrix(void) {
     return compare(px, ^bgra_t(int x, int y) { return in_tri(x, y) ? kRed : kBlue; }, tri_edge);
 }
 
+// Per-instance vertex data: positions per vertex (buffer 0), colours per
+// instance (buffer 1: red, green). Two instances of the same triangle; the
+// second (green) is drawn last.
+static id<MTLRenderPipelineState> step_pipeline(MTLVertexStepFunction fn, NSUInteger rate,
+                                                NSUInteger stride1) {
+    MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+    vd.attributes[0].format = MTLVertexFormatFloat2;
+    vd.attributes[0].offset = 0;
+    vd.attributes[0].bufferIndex = 0;
+    vd.attributes[1].format = MTLVertexFormatUChar4Normalized;
+    vd.attributes[1].offset = 0;
+    vd.attributes[1].bufferIndex = 1;
+    vd.layouts[0].stride = 8;
+    vd.layouts[1].stride = stride1;
+    vd.layouts[1].stepFunction = fn;
+    vd.layouts[1].stepRate = rate;
+    return make_pipeline(@"vs_vbuf", @"fs_color", vd, nil);
+}
+
+static BOOL case_vbuf_instance(void) {
+    id<MTLRenderPipelineState> ps = step_pipeline(MTLVertexStepFunctionPerInstance, 1, 4);
+    if (!ps) return NO;
+    const float pos[6] = { -1, -1, 1, -1, -1, 1 };
+    const uint8_t col[8] = { 0, 0, 255, 255,   0, 255, 0, 255 };   // RGBA red, green
+    id<MTLBuffer> vb = [gDevice newBufferWithBytes:pos length:sizeof pos
+                                           options:MTLResourceStorageModeShared];
+    id<MTLBuffer> cbuf = [gDevice newBufferWithBytes:col length:sizeof col
+                                             options:MTLResourceStorageModeShared];
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setVertexBuffer:vb offset:0 atIndex:0];
+    [enc setVertexBuffer:cbuf offset:0 atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:2];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return in_tri(x, y) ? kGreen : kBlack; },
+                   tri_edge);
+}
+
+// Name-only probe: layouts with step rate 3 (stride 0x24) and the constant
+// step function (stride 0x2c), to decode the layout records (LAGFX_VTXLOG=1).
+static BOOL case_vtxstep_probe(void) {
+    id<MTLRenderPipelineState> a = step_pipeline(MTLVertexStepFunctionPerInstance, 3, 0x24);
+    id<MTLRenderPipelineState> b = step_pipeline(MTLVertexStepFunctionConstant, 0, 0x2c);
+    if (!a || !b) return NO;
+    id<MTLBuffer> vb = [gDevice newBufferWithLength:0x400 options:MTLResourceStorageModeShared];
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setVertexBuffer:vb offset:0 atIndex:0];
+    [enc setVertexBuffer:vb offset:0 atIndex:1];
+    [enc setRenderPipelineState:a];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:2];
+    [enc setRenderPipelineState:b];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:2];
+    [enc endEncoding];
+    return run_cb(cb);
+}
+
 static BOOL case_triangle_vbuf(void) {
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
     vd.attributes[0].format = MTLVertexFormatFloat2;
@@ -541,6 +608,307 @@ static BOOL case_draw_probe(void) {
              indexBufferOffset:0x44 indirectBuffer:args indirectBufferOffset:0x50];
     [enc endEncoding];
     return run_cb(cb);
+}
+
+// Tessellation: a quad-patch pipeline whose vertex function maps the patch's
+// domain onto the whole target, and a factor buffer of 1.0s (half floats).
+static id<MTLRenderPipelineState> patch_pipeline(void) {
+    NSError *err = nil;
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [gLib newFunctionWithName:@"vs_patch"];
+    pd.fragmentFunction = [gLib newFunctionWithName:@"fs_red"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pd.maxTessellationFactor = 16;
+    pd.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionConstant;
+    pd.tessellationPartitionMode = MTLTessellationPartitionModeInteger;
+    pd.tessellationOutputWindingOrder = MTLWindingCounterClockwise;
+    id<MTLRenderPipelineState> ps = [gDevice newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!ps) printf("  pipeline: %s\n", err.localizedDescription.UTF8String);
+    return ps;
+}
+
+static id<MTLBuffer> patch_factors(NSUInteger patches) {
+    id<MTLBuffer> f = [gDevice newBufferWithLength:12 * patches + 16
+                                           options:MTLResourceStorageModeShared];
+    uint16_t *h = (uint16_t *)f.contents;
+    for (NSUInteger i = 0; i < 6 * patches; i++) h[i] = 0x3c00;   // 1.0 (edge x4, inside x2)
+    return f;
+}
+
+// One quad patch with tessellation factors of 1 covers the target.
+static BOOL case_patch(void) {
+    id<MTLRenderPipelineState> ps = patch_pipeline();
+    if (!ps) return NO;
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setTessellationFactorBuffer:patch_factors(1) offset:0 instanceStride:0];
+    [enc drawPatches:4 patchStart:0 patchCount:1 patchIndexBuffer:nil patchIndexBufferOffset:0
+       instanceCount:1 baseInstance:0];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return kRed; }, nil);
+}
+
+// Name-only probe: patch draws with distinct values (LAGFX_OPTASK=* on the host).
+//   P: 4 control points, patchStart 5, patchCount 7, instances 3, baseInstance 2
+//   Q: patch index buffer at offset 0x40, patchStart 0x11, patchCount 0x22
+//   R: patchStart 0x10005 (past 16 bits), patchCount 9, instances 0x10003
+static BOOL case_patch_probe(void) {
+    id<MTLRenderPipelineState> ps = patch_pipeline();
+    if (!ps) return NO;
+    id<MTLTexture> t = make_target();
+    id<MTLBuffer> pib = [gDevice newBufferWithLength:0x1000 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setTessellationFactorBuffer:patch_factors(0x10010) offset:0x60 instanceStride:0x24];
+    [enc drawPatches:4 patchStart:5 patchCount:7 patchIndexBuffer:nil patchIndexBufferOffset:0
+       instanceCount:3 baseInstance:2];
+    [enc drawPatches:4 patchStart:0x11 patchCount:0x22 patchIndexBuffer:pib
+        patchIndexBufferOffset:0x40 instanceCount:1 baseInstance:0];
+    [enc drawPatches:4 patchStart:0x10005 patchCount:9 patchIndexBuffer:nil
+        patchIndexBufferOffset:0 instanceCount:0x10003 baseInstance:0];
+    [enc endEncoding];
+    return run_cb(cb);
+}
+
+// Name-only probe: draws through a Metal 4 encoder with distinct values
+// (LAGFX_OPTASK=* on the host):
+//   M: TriangleStrip, vertexStart 5, vertexCount 7, instanceCount 3, baseInstance 2
+//   N: Triangle, vertexStart 0x11, vertexCount 0x3f, instanceCount 1
+//   O: TriangleStrip, vertexStart 0, vertexCount 4, instanceCount 1
+static BOOL case_mtl4_probe(void) {
+    if (@available(macOS 26.0, *)) {
+        id<MTL4CommandQueue> q = [gDevice newMTL4CommandQueue];
+        id<MTL4CommandAllocator> alloc = [gDevice newCommandAllocator];
+        id<MTL4CommandBuffer> cb = [gDevice newCommandBuffer];
+        if (!q || !alloc || !cb) { printf("  no Metal 4 on this device\n"); return NO; }
+        id<MTLRenderPipelineState> ps = make_pipeline(@"vs_quad", @"fs_red", nil, nil);
+        id<MTLTexture> t = make_target();
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+        NSError *err = nil;
+        id<MTLResidencySet> rs = [gDevice newResidencySetWithDescriptor:rd error:&err];
+        [rs addAllocation:t];
+        [rs commit];
+        [q addResidencySet:rs];
+        [cb beginCommandBufferWithAllocator:alloc];
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = t;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        id<MTL4RenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:5 vertexCount:7
+              instanceCount:3 baseInstance:2];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0x11 vertexCount:0x3f
+              instanceCount:1];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4
+              instanceCount:1];
+        [enc endEncoding];
+        [cb endCommandBuffer];
+        id<MTLSharedEvent> ev = [gDevice newSharedEvent];
+        const id<MTL4CommandBuffer> cbs[1] = { cb };
+        [q commit:cbs count:1];
+        [q signalEvent:ev value:1];
+        BOOL done = [ev waitUntilSignaledValue:1 timeoutMS:10000];
+        if (!done) printf("  Metal 4 command buffer did not complete\n");
+        return done;
+    }
+    return NO;
+}
+
+// Stencil-then-cover (how the lock screen clock fills its paths): a triangle
+// with colour writes off marks the stencil (Always / Replace, reference 1),
+// then a full quad tested Equal 1 colours only the marked pixels.
+static id<MTLRenderPipelineState> stencil_pipeline(NSString *vs, BOOL color) {
+    NSError *err = nil;
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [gLib newFunctionWithName:vs];
+    pd.fragmentFunction = [gLib newFunctionWithName:@"fs_red"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (!color) pd.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+    pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+    id<MTLRenderPipelineState> ps = [gDevice newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!ps) printf("  pipeline: %s\n", err.localizedDescription.UTF8String);
+    return ps;
+}
+
+static BOOL case_stencil(void) {
+    id<MTLRenderPipelineState> mark = stencil_pipeline(@"vs_tri", NO);
+    id<MTLRenderPipelineState> cover = stencil_pipeline(@"vs_quad", YES);
+    if (!mark || !cover) return NO;
+    MTLTextureDescriptor *sd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatStencil8 width:kSize height:kSize
+                                 mipmapped:NO];
+    sd.usage = MTLTextureUsageRenderTarget;
+    sd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> st = [gDevice newTextureWithDescriptor:sd];
+    MTLStencilDescriptor *w = [MTLStencilDescriptor new];
+    w.stencilCompareFunction = MTLCompareFunctionAlways;
+    w.depthStencilPassOperation = MTLStencilOperationReplace;
+    MTLDepthStencilDescriptor *wd = [MTLDepthStencilDescriptor new];
+    wd.frontFaceStencil = w; wd.backFaceStencil = w;
+    MTLStencilDescriptor *e = [MTLStencilDescriptor new];
+    e.stencilCompareFunction = MTLCompareFunctionEqual;
+    MTLDepthStencilDescriptor *ed = [MTLDepthStencilDescriptor new];
+    ed.frontFaceStencil = e; ed.backFaceStencil = e;
+    id<MTLTexture> t = make_target();
+    MTLRenderPassDescriptor *rp = clear_pass(t, MTLClearColorMake(0, 0, 0, 1));
+    rp.stencilAttachment.texture = st;
+    rp.stencilAttachment.loadAction = MTLLoadActionClear;
+    rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+    rp.stencilAttachment.clearStencil = 0;
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setStencilReferenceValue:1];
+    [enc setRenderPipelineState:mark];
+    [enc setDepthStencilState:[gDevice newDepthStencilStateWithDescriptor:wd]];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc setRenderPipelineState:cover];
+    [enc setDepthStencilState:[gDevice newDepthStencilStateWithDescriptor:ed]];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return in_tri(x, y) ? kRed : kBlack; }, tri_edge);
+}
+
+// Name-only probe: a render pass with a stencil attachment and a depth-stencil
+// state with distinct settings (LAGFX_OPTASK=* and LAGFX_DUMP_OBJ=1 on the host):
+//   stencil texture 64x64 Stencil8, clear stencil 0x5a, load Clear / store Store
+//   front: compare Equal(3), fail Replace(2), depthFail Invert(5),
+//          pass IncrementWrap(6), read mask 0x3c, write mask 0xc3
+//   back: compare Greater(4), fail Zero(1), depthFail DecrementClamp(4),
+//         pass Keep(0), read mask 0x0f, write mask 0xf0
+//   references: front 0x12, back 0x34
+static BOOL case_stencil_probe(void) {
+    id<MTLRenderPipelineState> ps = nil;
+    {
+        NSError *err = nil;
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [gLib newFunctionWithName:@"vs_quad"];
+        pd.fragmentFunction = [gLib newFunctionWithName:@"fs_red"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+        ps = [gDevice newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!ps) { printf("  pipeline: %s\n", err.localizedDescription.UTF8String); return NO; }
+    }
+    MTLTextureDescriptor *sd = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatStencil8 width:kSize height:kSize
+                                 mipmapped:NO];
+    sd.usage = MTLTextureUsageRenderTarget;
+    sd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> st = [gDevice newTextureWithDescriptor:sd];
+    MTLStencilDescriptor *f = [MTLStencilDescriptor new];
+    f.stencilCompareFunction = MTLCompareFunctionEqual;
+    f.stencilFailureOperation = MTLStencilOperationReplace;
+    f.depthFailureOperation = MTLStencilOperationInvert;
+    f.depthStencilPassOperation = MTLStencilOperationIncrementWrap;
+    f.readMask = 0x3c; f.writeMask = 0xc3;
+    MTLStencilDescriptor *b = [MTLStencilDescriptor new];
+    b.stencilCompareFunction = MTLCompareFunctionGreater;
+    b.stencilFailureOperation = MTLStencilOperationZero;
+    b.depthFailureOperation = MTLStencilOperationDecrementClamp;
+    b.depthStencilPassOperation = MTLStencilOperationKeep;
+    b.readMask = 0x0f; b.writeMask = 0xf0;
+    MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+    dd.frontFaceStencil = f; dd.backFaceStencil = b;
+    id<MTLDepthStencilState> ds = [gDevice newDepthStencilStateWithDescriptor:dd];
+    id<MTLTexture> t = make_target();
+    MTLRenderPassDescriptor *rp = clear_pass(t, MTLClearColorMake(0, 0, 0, 1));
+    rp.stencilAttachment.texture = st;
+    rp.stencilAttachment.loadAction = MTLLoadActionClear;
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.clearStencil = 0x5a;
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:ps];
+    [enc setDepthStencilState:ds];
+    [enc setStencilFrontReferenceValue:0x12 backReferenceValue:0x34];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+    [enc endEncoding];
+    return run_cb(cb);
+}
+
+// UInt32 indices at a small offset: {0,1,2,2,1,3} at byte 0x200 of the index
+// buffer draw the full quad (the clock renderer's op 0x09 form).
+static BOOL case_indexed32_small(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_vid_mat", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    const float k = (float)kSize;
+    const float pos[8] = { 0, 0, k, 0, 0, k, k, k };
+    const float m[16] = { 2 / k, 0, 0, 0,   0, 2 / k, 0, 0,
+                          0, 0, 1, 0,       -1, -1, 0, 1 };
+    id<MTLBuffer> vb = [gDevice newBufferWithBytes:pos length:sizeof pos
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mb = [gDevice newBufferWithBytes:m length:sizeof m
+                                          options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ib = [gDevice newBufferWithLength:0x1000 options:MTLResourceStorageModeShared];
+    const uint32_t idx[6] = {0, 1, 2, 2, 1, 3};
+    memcpy((uint8_t *)ib.contents + 0x200, idx, sizeof idx);
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc setVertexBuffer:vb offset:0 atIndex:1];
+    [enc setVertexBuffer:mb offset:0 atIndex:2];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6
+                    indexType:MTLIndexTypeUInt32 indexBuffer:ib indexBufferOffset:0x200];
+    [enc endEncoding];
+    static bgra_t px[kSize * kSize];
+    if (!finish(cb, t, px)) return NO;
+    return compare(px, ^bgra_t(int x, int y) { return kRed; }, nil);
+}
+
+// Name-only probe: one draw (TriangleStrip, start 5, count 7, instances 3,
+// base instance 2) through pipelines with different properties, to find what
+// makes the driver encode a draw as op 0x09 (LAGFX_OPTASK=* on the host):
+//   1 plain, 2 supportIndirectCommandBuffers, 3 inputPrimitiveTopology Triangle,
+//   4 rasterSampleCount 4 (into a 4x target), 5 maxVertexAmplificationCount 2
+static BOOL case_pso_probe(void) {
+    id<MTLTexture> t = make_target();
+    MTLTextureDescriptor *md = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:kSize height:kSize
+                                 mipmapped:NO];
+    md.textureType = MTLTextureType2DMultisample;
+    md.sampleCount = 4;
+    md.usage = MTLTextureUsageRenderTarget;
+    md.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> ms = [gDevice newTextureWithDescriptor:md];
+    for (int k = 1; k <= 5; k++) {
+        NSError *err = nil;
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [gLib newFunctionWithName:@"vs_quad"];
+        pd.fragmentFunction = [gLib newFunctionWithName:@"fs_red"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        if (k == 2) pd.supportIndirectCommandBuffers = YES;
+        if (k == 3) pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+        if (k == 4) pd.rasterSampleCount = 4;
+        if (k == 5) pd.maxVertexAmplificationCount = 2;
+        id<MTLRenderPipelineState> ps = [gDevice newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!ps) { printf("  pipeline %d: %s\n", k, err.localizedDescription.UTF8String); continue; }
+        MTLRenderPassDescriptor *rp = clear_pass(k == 4 ? ms : t, MTLClearColorMake(0, 0, 0, 1));
+        if (k == 4) rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+        id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:ps];
+        if (k == 5) {
+            MTLVertexAmplificationViewMapping map[2] = { {0, 0}, {0, 0} };
+            [enc setVertexAmplificationCount:2 viewMappings:map];
+        }
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:5 vertexCount:7
+              instanceCount:3 baseInstance:2];
+        [enc endEncoding];
+        if (!run_cb(cb)) printf("  pipeline %d: command buffer failed\n", k);
+    }
+    return YES;
 }
 
 // A texture made from a buffer at an offset that isn't page-aligned (a linear
@@ -1017,6 +1385,10 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"blit-copy", case_blit_copy, YES},
     {"tex-nearest", case_tex_nearest, YES},
     {"tex-buffer", case_tex_buffer, YES},
+    {"patch", case_patch, YES},
+    {"stencil", case_stencil, YES},
+    {"vbuf-instance", case_vbuf_instance, YES},
+    {"indexed32-small", case_indexed32_small, YES},
     {"tex-linear", case_tex_linear, YES},
     {"tex-pixel", case_tex_pixel, YES},
     {"blend-alpha", case_blend_alpha, YES},
@@ -1031,6 +1403,11 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"type-probe", case_type_probe, NO},
     {"blit-probe", case_blit_probe, NO},
     {"draw-probe", case_draw_probe, NO},
+    {"patch-probe", case_patch_probe, NO},
+    {"mtl4-probe", case_mtl4_probe, NO},
+    {"stencil-probe", case_stencil_probe, NO},
+    {"vtxstep-probe", case_vtxstep_probe, NO},
+    {"pso-probe", case_pso_probe, NO},
 };
 #define kNumCases (sizeof kCases / sizeof kCases[0])
 
