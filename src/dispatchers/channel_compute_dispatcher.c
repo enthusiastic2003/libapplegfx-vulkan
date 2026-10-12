@@ -34,6 +34,7 @@
 #include "handlers/handlers.h"
 #include "handlers/iosurface/iosurface.h"
 #include "handlers/compute/task_translate.h"
+#include "handlers/compute/guest_texture.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -101,31 +102,6 @@ static void dump_registered_pipeline(lagfx_protocol_t *p, lagfx_task_entry_t *ta
         LAGFX_WARN("PSOREG #%u +%03x: %s", p->diag.pso_reg_serial, off, hx);
     }
 }
-
-/* Phase 6b: 0x25 CmdSetObjectAndPlacementList payload is
- * `{taskId: u32, objectId: u32}`
- * (see paravirt-re/library/apv-object-entry-parser-scoping-2026-05-17.md).
- * Insert the objectId into the per-task active-objects registry so
- * op_0x74 SetRenderPipelineState can query it before falling back to
- * the heap-VA lookup. Idempotent — duplicate objectIds are a no-op. */
-static void
-register_active_object(lagfx_task_entry_t *task, uint32_t object_id) {
-    if (!task) return;
-    /* Linear scan for dedup. The bounded set (64 entries) is fine for
-     * Apple's observed traffic (~10s of unique objectIds per task). */
-    for (uint32_t i = 0; i < task->active_objects.count; i++) {
-        if (task->active_objects.object_ids[i] == object_id) return;
-    }
-    uint32_t capacity = (uint32_t)(sizeof task->active_objects.object_ids
-                                   / sizeof task->active_objects.object_ids[0]);
-    if (task->active_objects.count >= capacity) {
-        LAGFX_WARN("register_active_object: task=%u registry full (%u); dropping objectId=0x%x",
-                   task->id, capacity, object_id);
-        return;
-    }
-    task->active_objects.object_ids[task->active_objects.count++] = object_id;
-}
-
 
 #define LAGFX_COMPUTE_DRAIN_MAX_CMDS 128u
 #define LAGFX_COMPUTE_MAX_CMD_BYTES  4096u
@@ -235,7 +211,11 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
         /* CmdExecIndirect2 on a compute channel — the inner stream is
          * where Metal commands live. See render-decoder-handlers.md. */
         case LAGFX_OP_EXEC_INDIRECT2:  /* 0x20 */
-            lagfx_compute_exec_cmdbuf(p, hdr);
+            /* CmdDeleteTask {u32 task} on child channels too. */
+            if (hdr->payload_size == 4u)
+                lagfx_task_delete_task(p, hdr);
+            else
+                lagfx_compute_exec_cmdbuf(p, hdr);
             break;
 
         /* Kext-side per-channel exec variant per
@@ -275,53 +255,66 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
                       (unsigned)p->current_chan_id, hdr->stamp,
                       (unsigned)hdr->payload_size);
             break;
-        case LAGFX_OP_SET_OBJECT_PLACEMENT:   /* 0x25 CmdSetObjectAndPlacementList */
-            /* Phase 6b — wire data captured 2026-05-28 confirmed
-             * payload = `{taskId: u32, objectId: u32}` (NOT the dual-
-             * array TLV ENTRY-007 anticipated). Decode the objectId
-             * and register it in the per-task active-objects set so
-             * op_0x74 can query active membership before doing the
-             * heap-VA lookup.
-             *
-             * Mislabeled enum kept for backwards-compatibility —
-             * 0x25 carries object+placement together, not just
-             * placement (command-buffer-format.md:255). */
-            LAGFX_LOG("compute: 0x25 CmdSetObjectAndPlacementList ch=%u stamp=0x%08x payload_size=%u",
-                      (unsigned)p->current_chan_id, hdr->stamp,
-                      (unsigned)hdr->payload_size);
-            dump_chev(p, hdr, "objects");
+        case LAGFX_OP_SET_OBJECT_PLACEMENT:   /* 0x25: really CmdDeleteResource */
+            /* {u32 task, u32 object}: the object is gone, and its id will be
+             * reused for a new one, so its registry entry (and the host copy
+             * it holds) must go too. We used to read this as an object
+             * registration and mark the id active (public PVG implementation:
+             * CHILD_OP_DELETE_RESOURCE; Codex saw an id change type after it). */
+            dump_chev(p, hdr, "delete-resource");
             if (hdr->payload && hdr->payload_size >= 8u) {
                 uint32_t task_id   = lagfx_le32(hdr->payload + 0);
                 uint32_t object_id = lagfx_le32(hdr->payload + 4);
                 lagfx_task_entry_t *task = lagfx_protocol_find_task(p, task_id);
-                if (task) {
-                    register_active_object(task, object_id);
-                    dump_registered_pipeline(p, task, object_id, hdr);
-                    LAGFX_LOG("compute: 0x25 registered objectId=0x%x in task=%u (active=%u)",
-                              object_id, task->id,
-                              task->active_objects.count);
-                } else {
-                    LAGFX_WARN("compute: 0x25 no live task=%u for objectId=0x%x",
-                               task_id, object_id);
-                }
+                if (task) dump_registered_pipeline(p, task, object_id, hdr);
+                lagfx_resource_unregister(&p->resources, object_id, task_id);
+                LAGFX_LOG("compute: 0x25 CmdDeleteResource task=%u object=0x%x", task_id, object_id);
             }
             break;
-        case LAGFX_OP_IOSURFACE_LOOKUP:       /* 0x28 */
-            /* Live evidence shows 0x28 on compute channels too — route
-             * to the real lookup handler so resource_registry stays
-             * in sync with the cross-task IOSurface lifecycle. */
-            lagfx_iosurface_lookup(p, hdr);
+        case LAGFX_OP_IOSURFACE_LOOKUP:       /* 0x28: really CmdDeleteObject */
+            /* {u32 task, record {u32 kind (0x3e8..), u32 length 12, u32 ref}}.
+             * The ref is in the serializer's per-kind space, not the object
+             * table's, so there is nothing to act on (public PVG
+             * implementation: CHILD_OP_DELETE_OBJECT). It used to go to the
+             * IOSurface lookup handler. */
+            if (hdr->payload && hdr->payload_size >= 16u)
+                LAGFX_LOG("compute: 0x28 CmdDeleteObject task=%u kind=0x%x ref=0x%x",
+                          lagfx_le32(hdr->payload), lagfx_le32(hdr->payload + 4),
+                          lagfx_le32(hdr->payload + 12));
             break;
-        case LAGFX_OP_CHANNEL_EVENT_34:       /* 0x34 */
-        case LAGFX_OP_CHANNEL_EVENT_35:       /* 0x35 */
-        case LAGFX_OP_CHANNEL_EVENT_36:       /* 0x36 */
-            /* ChannelEventMachine-adjacent (kext-internal scheduler
-             * pings). Log + ack. 0x37 is handled above as the
-             * per-channel CmdExecIndirect2. */
-            LAGFX_LOG("compute: channel_event 0x%02x ch=%u stamp=0x%08x payload_size=%u",
+        case LAGFX_OP_CHANNEL_EVENT_34:       /* 0x34 CmdInvalidateResources */
+        case LAGFX_OP_CHANNEL_EVENT_35:       /* 0x35 CmdSynchronizeResources */
+        case 0x3eu:                           /* CmdSynchronizeAndDiscardResources */
+        case LAGFX_OP_CHANNEL_EVENT_36:       /* 0x36 CmdDeleteIOSurfaceBacking2 */
+            /* 0x34: {u32 task, u32 count, count x {u32 object, u32 flags}}:
+             *       the objects' backing pages changed; re-read them.
+             * 0x35, 0x3e: {u32 task, u32 count, count x u32 object}: the guest
+             *       is about to read them with the CPU; flush GPU results.
+             * 0x36: logged only.
+             * (public PVG implementation, CHILD_OP_INVALIDATE_RESOURCES etc.) */
+            LAGFX_LOG("compute: resource op 0x%02x ch=%u stamp=0x%08x payload_size=%u",
                       (unsigned)hdr->opcode, (unsigned)p->current_chan_id,
                       hdr->stamp, (unsigned)hdr->payload_size);
             dump_chev(p, hdr, "event");
+            if (hdr->opcode != LAGFX_OP_CHANNEL_EVENT_36 && hdr->payload && hdr->payload_size >= 8u) {
+                uint32_t task_id = lagfx_le32(hdr->payload);
+                uint32_t count = lagfx_le32(hdr->payload + 4);
+                uint32_t stride = hdr->opcode == LAGFX_OP_CHANNEL_EVENT_34 ? 8u : 4u;
+                if (count > (hdr->payload_size - 8u) / stride) count = (hdr->payload_size - 8u) / stride;
+                lagfx_task_entry_t *task = lagfx_protocol_find_task(p, task_id);
+                for (uint32_t i = 0; i < count; i++) {
+                    uint32_t ref = lagfx_le32(hdr->payload + 8u + i * stride);
+                    if (hdr->opcode == LAGFX_OP_CHANNEL_EVENT_34) {
+                        lagfx_guest_texture_invalidate(p, task_id, ref);
+                    } else {
+#ifdef LAGFX_HAVE_VULKAN
+                        lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+                        if (task && dev && dev->vk && dev->vk->initialized)
+                            lagfx_guest_texture_synchronize(p, task, dev->vk, ref);
+#endif
+                    }
+                }
+            }
             if (getenv("LAGFX_PIPE_CREATE_TRACE") && p->diag.pso_reg_serial) {
                 LAGFX_WARN("PSOEV after=#%u reg=t%u/obj=0x%x/regstamp=0x%08x/regch=%u "
                            "event=0x%02x stamp=0x%08x ch=%u",

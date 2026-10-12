@@ -329,16 +329,15 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
                               struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                               const lagfx_texture_object_t *obj, uint32_t ref);
 
-/* The guest's memory is the texture: the CPU writes IOSurfaces and managed
- * textures (replaceRegion, Core Animation's text masks and password dots)
+/* The guest's memory is the texture: the CPU writes IOSurfaces, managed and
+ * shared textures (replaceRegion, Core Animation's text masks and password dots)
  * without any command, so their contents are re-read once per command
- * buffer unless the GPU copy is newer (kat tex-update). Render targets of
- * these kinds are written back after each command buffer, so re-reading
- * them is safe; shared-storage targets are not written back, and are left
- * alone. */
+ * buffer unless the GPU copy is newer (kat tex-update). Shared textures
+ * likewise. Render targets of all three kinds are written back after each
+ * command buffer, so re-reading them is safe. */
 static bool needs_refresh(const lagfx_task_entry_t *task, const lagfx_vk_iosurface_t *ios,
                           const lagfx_texture_object_t *obj) {
-    return (obj->surface_id != 0u || obj->storage == LAGFX_STORAGE_MANAGED)
+    return obj->storage != LAGFX_STORAGE_PRIVATE
            && !ios->gpu_drawn && ios->upload_gen != task->cmdbuf_gen + 1u;
 }
 
@@ -635,17 +634,17 @@ static bool write_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *
 }
 
 static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
-                          struct lagfx_vk_state *vk, uint32_t ref) {
+                          struct lagfx_vk_state *vk, uint32_t ref, bool any_storage) {
     lagfx_texture_object_t obj;
     const lagfx_task_entry_t *mem_task;
     if (!read_texture_object(p, task, ref, &obj, &mem_task)) return;
-    /* Managed textures and IOSurfaces only. Metal makes managed textures
-     * CPU-visible at an explicit synchronize, which is when the guest reads
-     * them; IOSurfaces are read by the CPU (and other processes) directly, so
-     * they're copied after every command buffer that wrote them. Other shared
-     * textures would need the same copy — too slow this way; they need
-     * host-mapped guest memory instead. */
-    if (obj.storage != LAGFX_STORAGE_MANAGED && obj.surface_id == 0u) {
+    /* Every CPU-visible texture: guest memory is the texture, and the guest
+     * reads it without telling us. Shared storage is coherent, so the CPU may
+     * read it as soon as the command buffer completes (no synchronize is
+     * sent: kat rt-shared-buffer); managed textures and IOSurfaces are read
+     * after a synchronize or directly. Private textures stay on the host.
+     * The copies cost time until guest memory is mapped into the host. */
+    if (!any_storage && obj.storage == LAGFX_STORAGE_PRIVATE) {
         stats.skipped_storage++;
         return;
     }
@@ -747,7 +746,33 @@ void lagfx_guest_texture_writeback(lagfx_protocol_t *p, lagfx_task_entry_t *task
                                    struct lagfx_vk_state *vk) {
     if (!p || !task || !vk) return;
     for (uint8_t i = 0; i < task->n_written_tex; i++)
-        writeback_one(p, task, vk, task->written_tex[i]);
+        writeback_one(p, task, vk, task->written_tex[i], false);
     task->n_written_tex = 0;
 }
+
+/* CmdSynchronizeResources (0x35) and SynchronizeAndDiscard (0x3e): the guest
+ * is about to read `ref` with the CPU (or unwire its pages), so a newer GPU
+ * copy must reach guest memory now, whatever the storage mode: shared
+ * render targets are otherwise never written back. */
+void lagfx_guest_texture_synchronize(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                     struct lagfx_vk_state *vk, uint32_t ref) {
+    if (!p || !task || !vk) return;
+    lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task->id);
+    if (!e || e->type != LAGFX_RESOURCE_TYPE_TEXTURE || !e->host_handle) return;
+    if (!((lagfx_vk_iosurface_t *)e->host_handle)->gpu_drawn) return;
+    writeback_one(p, task, vk, ref, true);
+}
 #endif /* LAGFX_HAVE_VULKAN */
+
+/* CmdInvalidateResources (0x34): the backing pages of `ref` changed, so guest
+ * memory is the truth and the host copy must be read again before its next
+ * use. */
+void lagfx_guest_texture_invalidate(lagfx_protocol_t *p, uint32_t task_id, uint32_t ref) {
+    if (!p) return;
+    lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task_id);
+    if (!e || e->type != LAGFX_RESOURCE_TYPE_TEXTURE) return;
+    e->backing_dirty = 1u;
+#ifdef LAGFX_HAVE_VULKAN
+    if (e->host_handle) ((lagfx_vk_iosurface_t *)e->host_handle)->gpu_drawn = 0u;
+#endif
+}

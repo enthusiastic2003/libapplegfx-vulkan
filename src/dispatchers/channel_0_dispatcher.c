@@ -116,7 +116,13 @@ static void dispatch_command(lagfx_protocol_t *p, const lagfx_cmd_header_t *hdr)
          * guide.md §1.1. Stage 20 inner walker lives in the compute
          * exec handler — reuse it. */
         case LAGFX_OP_EXEC_INDIRECT2:  /* 0x20 */
-            lagfx_compute_exec_cmdbuf(p, hdr);
+            /* On Tahoe root 0x20 is CmdDeleteTask {u32 task} (public PVG
+             * implementation, ROOT_OP_DELETE_TASK; every live one has had a
+             * 4-byte payload). Longer payloads keep the old reading. */
+            if (hdr->payload_size == 4u)
+                lagfx_task_delete_task(p, hdr);
+            else
+                lagfx_compute_exec_cmdbuf(p, hdr);
             break;
 
         /* === IOSurface family (0x26-0x2a) ============================

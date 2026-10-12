@@ -93,4 +93,15 @@ bool lagfx_guest_texture_info(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
 /* Remember that a pass stored into texture `ref` of `task`. */
 void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref);
 
+#ifdef LAGFX_HAVE_VULKAN
+/* CmdSynchronizeResources: copy a newer GPU copy of texture `ref` back to
+ * guest memory now, whatever its storage mode. */
+void lagfx_guest_texture_synchronize(lagfx_protocol_t *p, lagfx_task_entry_t *task,
+                                     struct lagfx_vk_state *vk, uint32_t ref);
+#endif
+
+/* CmdInvalidateResources: guest memory of texture `ref` changed; read it
+ * again before the host copy's next use. */
+void lagfx_guest_texture_invalidate(lagfx_protocol_t *p, uint32_t task_id, uint32_t ref);
+
 #endif /* LIBAPPLEGFX_HANDLERS_COMPUTE_GUEST_TEXTURE_H */

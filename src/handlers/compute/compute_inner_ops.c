@@ -207,6 +207,23 @@ static int op_set_compute_pipeline_state(lagfx_protocol_t *p, uint32_t enc,
     return 0;
 }
 
+/* 0x66 setColorStoreAction:atIndex: {u32 store action, u32 index}: a pass
+ * created with store action Unknown learns its real one at the end (public
+ * PVG implementation, ops/render.rs). We only marked a pass's target for
+ * write-back when the pass itself said Store, so these results never reached
+ * guest memory. */
+static int op_set_color_store_action(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                     const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 8u || task_id >= LAGFX_MAX_TASKS || !p->tasks[task_id].live) return 1;
+    lagfx_task_entry_t *task = &p->tasks[task_id];
+    uint32_t action = lagfx_le32(b), index = lagfx_le32(b + 4);
+    /* MTLStoreActionStore = 1, StoreAndMultisampleResolve = 3 */
+    if (index == 0u && (action == 1u || action == 3u) && task->render_pass_desc.target_ref)
+        lagfx_guest_texture_mark_written(task, task->render_pass_desc.target_ref);
+    return 0;
+}
+
 /* Encodings decoded with kat draw-probe (distinct values per field):
  *   0x02 drawPrimitives:vertexStart:vertexCount:instanceCount: (wide)
  *        {u64 start, u64 count, u64 instances, u32 prim}
@@ -2250,6 +2267,7 @@ static const lagfx_compute_inner_op_desc_t compute_inner_op_table[] = {
     { 0x0008, "DrawIndexedInstancedPrimitives64", op_draw_indexed_instanced_wide },
     { 0x001d, "DrawIndexedInstancedPrimitives16", op_draw_indexed_instanced_16 },
     { 0x0068, "SetDepthStencilState",            op_set_depth_stencil_state },
+    { 0x0066, "SetColorStoreAction",             op_set_color_store_action },
     { 0x0077, "SetStencilReference",             op_set_stencil_reference },
 };
 

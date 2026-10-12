@@ -938,6 +938,11 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                 return;
             }
             tgt->layout = (VkImageLayout)lay;
+            /* metal2vulkan refused or failed this draw. The legacy paths
+             * below can hang lavapipe on draws metal2vulkan can't do (a
+             * fence timeout froze a whole desktop session), so the draw is
+             * dropped; LAGFX_M2V_FALLBACK=1 restores the fallback. */
+            if (!getenv("LAGFX_M2V_FALLBACK")) return;
         }
     }
 #endif

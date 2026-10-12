@@ -1368,6 +1368,36 @@ static BOOL case_iosurface_planes(void) {
     return ok;
 }
 
+// Render into a texture made from a shared MTLBuffer, then read the buffer
+// with the CPU: shared render targets are not copied back after each command
+// buffer, so this depends on the guest's synchronize (0x35) before the read.
+static BOOL case_rt_shared_buffer(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_tri", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    NSUInteger align = [gDevice minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm];
+    NSUInteger bpr = ((kSize * 4 + align - 1) / align) * align;
+    id<MTLBuffer> b = [gDevice newBufferWithLength:bpr * kSize options:MTLResourceStorageModeShared];
+    memset(b.contents, 0x55, bpr * kSize);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:kSize height:kSize
+                                 mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [b newTextureWithDescriptor:td offset:0 bytesPerRow:bpr];
+    if (!t) { printf("  shared buffer texture refused\n"); return NO; }
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 1, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    if (!run_cb(cb)) return NO;
+    static bgra_t px[kSize * kSize];
+    for (NSUInteger y = 0; y < kSize; y++)
+        memcpy(&px[y * kSize], (uint8_t *)b.contents + y * bpr, kSize * 4);
+    return compare(px, ^bgra_t(int x, int y) { return in_tri(x, y) ? kRed : kBlue; }, tri_edge);
+}
+
 // Compute: out[i] = i * 3 + 1 into a shared buffer.
 static BOOL case_compute(void) {
     const NSUInteger n = 4096;
@@ -1692,6 +1722,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"tex-bufbig", case_tex_bufbig, YES},
     {"tex-update", case_tex_update, YES},
     {"iosurface-planes", case_iosurface_planes, YES},
+    {"rt-shared-buffer", case_rt_shared_buffer, YES},
     {"compute", case_compute, YES},
     {"probe", case_probe, NO},
     {"compute-props", case_compute_props, NO},
