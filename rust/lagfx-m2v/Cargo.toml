@@ -1,0 +1,24 @@
+# libapplegfx-vulkan's bridge to metal2vulkan (third_party/metal2vulkan): a C
+# interface over its translator, built as a static library and linked into
+# libapplegfx-vulkan by meson. Licensed like metal2vulkan, which it links.
+[package]
+name = "lagfx-m2v"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+metal2vulkan = { path = "../../third_party/metal2vulkan/crates/metal2vulkan", features = ["ash"] }
+ash = { version = "0.38", default-features = false, features = ["std"] }
+
+[profile.release]
+incremental = true
+debug = false
+panic = "abort"
+
+# Not part of metal2vulkan's workspace.
+[workspace]

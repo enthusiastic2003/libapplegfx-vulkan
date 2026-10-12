@@ -11,8 +11,11 @@
  * value} per field, fields left at their default omitted. Arrays are a u32
  * count followed by u32 offsets (relative to the array) of their records.
  *
- * Top-level key 0x08 is the offset, from the start of the top-level record, of
- * the colour attachment array. Each attachment record (matched against
+ * Top-level keys: 0x01 the vertex function's object id, 0x02 the fragment
+ * function's (absent: no fragment function), 0x03 the offset of the vertex
+ * descriptor, 0x08 the offset, from the start of the top-level record, of
+ * the colour attachment array. (Function ids matched against pipelines with
+ * known functions, tests/guest/kat.m.) Each attachment record (matched against
  * pipelines with known blend settings, tests/guest/kat.m `blend-probe`):
  *
  *   key  field                         default
@@ -31,6 +34,7 @@
 #define LIBAPPLEGFX_PROTOCOL_PIPELINE_DESCRIPTOR_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #define LAGFX_PSO_HEADER_LEN 16u
@@ -48,5 +52,10 @@ typedef struct {
  * number written (0 if the layout isn't recognised). */
 uint32_t lagfx_parse_pso_color_attachments(const uint8_t *blob, size_t len,
                                            lagfx_pso_color_attachment_t *out, uint32_t cap);
+
+/* The vertex and fragment function object ids of a pipeline object's data
+ * (fragment 0 = none). False if the layout isn't recognised. */
+bool lagfx_parse_pso_functions(const uint8_t *blob, size_t len, uint32_t *vertex_fn,
+                               uint32_t *fragment_fn);
 
 #endif /* LIBAPPLEGFX_PROTOCOL_PIPELINE_DESCRIPTOR_H */

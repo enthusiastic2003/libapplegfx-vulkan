@@ -82,19 +82,51 @@ else
   lagfx_deps = []
 endif
 
+# --- metal2vulkan bridge (rust/lagfx-m2v, third_party/metal2vulkan) ---------
+# The Metal shader translator, a Rust crate kept as a git submodule, reached
+# through a small C interface (src/m2v/lagfx_m2v.h). Built when cargo and the
+# submodule are present; otherwise the old translator is used alone.
+lagfx_link = []
+lagfx_link_args = []
+lagfx_link_depends = []
+cargo = find_program('cargo', required : false)
+if cargo.found() and fs.is_file(meson.current_source_dir() / 'third_party' / 'metal2vulkan' / 'Cargo.toml')
+  m2v_lib = custom_target('lagfx-m2v',
+    output : 'liblagfx_m2v.a',
+    command : [files('rust/build-m2v.sh'),
+               meson.current_source_dir() / 'rust' / 'lagfx-m2v' / 'Cargo.toml',
+               meson.current_build_dir() / 'cargo-target', '@OUTPUT@'],
+    build_always_stale : true,
+    build_by_default : true)
+  # Linked into the shared library (what QEMU loads) by path: meson can't fold
+  # a custom target's archive into the installed static library. Executables
+  # built here take it through libapplegfx_vulkan_dep.
+  lagfx_link += m2v_lib
+  lagfx_link_args += [m2v_lib.full_path()]
+  lagfx_link_depends += m2v_lib
+  cc = meson.get_compiler('c')
+  lagfx_deps += [dependency('threads'), cc.find_library('dl'), cc.find_library('m'),
+                 cc.find_library('rt'), cc.find_library('util')]
+  add_project_arguments('-DLAGFX_HAVE_M2V=1', language : 'c')
+  message('metal2vulkan bridge enabled.')
+endif
+
 # --- Library --------------------------------------------------------------
 libapplegfx_vulkan = both_libraries('applegfx-vulkan',
   lagfx_sources,
   include_directories : [include_dir, internal_include_dir,
                          shader_catalog_build_inc],
   dependencies : lagfx_deps,
+  link_args : lagfx_link_args,
+  link_depends : lagfx_link_depends,
   version : meson.project_version(),
   soversion : version_major,
   gnu_symbol_visibility : 'hidden',
   install : true)
 
 libapplegfx_vulkan_dep = declare_dependency(
-  link_with : libapplegfx_vulkan.get_static_lib(),
+  link_with : [libapplegfx_vulkan.get_static_lib()] + lagfx_link,
+  dependencies : lagfx_deps,
   include_directories : include_dir)
 
 # pkg-config file so downstream consumers (mos-qemu) can locate us.

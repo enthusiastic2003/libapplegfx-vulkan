@@ -78,3 +78,14 @@ uint32_t lagfx_parse_pso_color_attachments(const uint8_t *blob, size_t len,
     }
     return got;
 }
+
+bool lagfx_parse_pso_functions(const uint8_t *blob, size_t len, uint32_t *vertex_fn,
+                               uint32_t *fragment_fn) {
+    if (!blob || len < LAGFX_PSO_HEADER_LEN + 1u || rd32(blob) != 0x0eu) return false;
+    record_t top;
+    if (!parse_record(blob, len, LAGFX_PSO_HEADER_LEN, &top) || !((top.present >> 1) & 1u))
+        return false;
+    if (vertex_fn) *vertex_fn = top.value[1];
+    if (fragment_fn) *fragment_fn = field(&top, 2, 0);
+    return true;
+}

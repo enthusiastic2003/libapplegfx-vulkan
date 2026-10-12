@@ -49,6 +49,9 @@
  */
 
 #include "instance.h"
+#ifdef LAGFX_HAVE_M2V
+#include "m2v/lagfx_m2v.h"
+#endif
 #include "command.h"
 #include "pipeline.h"
 #include "composite.h"
@@ -549,9 +552,17 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
         .queueCount       = 1,
         .pQueuePriorities = &priority,
     };
+#ifdef LAGFX_HAVE_M2V
+    /* metal2vulkan is told the device enables every core feature it supports
+     * (lagfx_m2v_device_new): enable exactly that, the probed chain itself. */
+    void *enable_chain = &probe2;
+    (void)feat2;
+#else
+    void *enable_chain = &feat2;
+#endif
     VkDeviceCreateInfo dci = {
         .sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext                   = &feat2,
+        .pNext                   = enable_chain,
         .queueCreateInfoCount    = 1,
         .pQueueCreateInfos       = &qci,
         .enabledExtensionCount   = wanted_dev_n,
@@ -565,6 +576,17 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
         return LAGFX_ERR_VULKAN_INIT;
     }
 
+#ifdef LAGFX_HAVE_M2V
+    {
+        char err[256] = "";
+        s->m2v = lagfx_m2v_device_new((const void *)vkGetInstanceProcAddr,
+                                      (uint64_t)(uintptr_t)s->instance,
+                                      (uint64_t)(uintptr_t)s->phys_device,
+                                      VK_API_VERSION_1_3, err, sizeof err);
+        if (!s->m2v)
+            LAGFX_WARN("vk_init: metal2vulkan unavailable: %s", err);
+    }
+#endif
     s->have_dynamic_rendering      = have_dyn_rendering_feature;
     s->have_synchronization2       = have_synchronization2;
     s->have_timeline_semaphore     = have_timeline_semaphore_feat;
@@ -657,6 +679,10 @@ void lagfx_vk_shutdown(struct lagfx_vk_state *state) {
     lagfx_vk_composite_shutdown(state);
     lagfx_vk_pipeline_shutdown(state);
     lagfx_vk_command_pool_destroy(state);
+#ifdef LAGFX_HAVE_M2V
+    lagfx_m2v_device_free((lagfx_m2v_device_t *)state->m2v);
+    state->m2v = NULL;
+#endif
     if (state->device != VK_NULL_HANDLE) {
         vkDestroyDevice(state->device, NULL);
     }

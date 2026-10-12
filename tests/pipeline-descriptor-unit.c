@@ -57,9 +57,40 @@ static size_t make(uint8_t *b, const uint32_t *kv, int n) {
     return at;
 }
 
+/* Function ids: a top-level record {08 -> 0x14, 01 -> vertex, 02 -> fragment},
+ * the shape of kat's `triangle` pipeline. */
+static void test_functions(void) {
+    uint8_t b[64] = {0};
+    put32(b, 0, 0x0e);
+    put32(b, 4, 0x3c);
+    size_t at = 16;
+    b[at++] = 3;
+    at = field(b, at, 8, 0x14);
+    at = field(b, at, 1, 2);
+    at = field(b, at, 2, 1);
+    uint32_t v = 0, f = 0;
+    CHECK(lagfx_parse_pso_functions(b, sizeof b, &v, &f));
+    CHECK(v == 2 && f == 1);
+    /* no fragment function */
+    memset(b + 16, 0, sizeof b - 16);
+    at = 16;
+    b[at++] = 1;
+    at = field(b, at, 1, 7);
+    CHECK(lagfx_parse_pso_functions(b, sizeof b, &v, &f));
+    CHECK(v == 7 && f == 0);
+    /* no vertex function: not recognised */
+    b[17] = 2;
+    CHECK(!lagfx_parse_pso_functions(b, sizeof b, &v, &f));
+    /* not a pipeline object */
+    put32(b, 0, 0x0d);
+    CHECK(!lagfx_parse_pso_functions(b, sizeof b, &v, &f));
+}
+
 int main(void) {
     uint8_t b[256];
     lagfx_pso_color_attachment_t a[8];
+
+    test_functions();
 
     size_t len = make(b, NULL, 0);                               /* blending off */
     CHECK(lagfx_parse_pso_color_attachments(b, len, a, 8) == 1);

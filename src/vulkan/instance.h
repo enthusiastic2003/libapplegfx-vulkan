@@ -45,6 +45,9 @@ struct lagfx_vk_state {
      * accepted at vkCreateDevice time. Used by later phases to decide
      * whether to take a fast path (shader_object, dynamic_rendering)
      * or fall back. */
+    /* metal2vulkan's description of this device (lagfx_m2v_device_t), NULL
+     * when the bridge isn't built or failed. */
+    void *m2v;
     bool have_dynamic_rendering;
     bool have_synchronization2;
     bool have_timeline_semaphore;

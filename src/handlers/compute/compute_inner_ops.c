@@ -59,6 +59,10 @@
 #include "air/bitcode_reader.h"
 #include "air2spv/translate.h"
 #include "air2spirv/metallib_extract.h"
+#include "protocol/vertex_descriptor.h"
+#ifdef LAGFX_HAVE_M2V
+#include "m2v/lagfx_m2v.h"
+#endif
 
 #ifdef LAGFX_HAVE_VULKAN
 #  include <vulkan/vulkan.h>
@@ -71,6 +75,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <stdlib.h>
 
 typedef int (*lagfx_compute_inner_op_fn)(lagfx_protocol_t *p,
@@ -1220,6 +1225,59 @@ static int op_set_vertex_buffer_offset(lagfx_protocol_t *p,
 
 /* === Group D — Pipeline + scissor/viewport (0x74, 0x75, 0x82) == */
 
+#ifdef LAGFX_HAVE_M2V
+/* Compile a pipeline's two stage libraries with metal2vulkan and log the
+ * outcome (LAGFX_M2V; first step of moving render pipelines to it). */
+static void m2v_compile_probe(lagfx_protocol_t *p, lagfx_task_entry_t *task, uint32_t reference,
+                              void *m2v, const uint8_t *vlib, size_t vlen,
+                              const uint8_t *flib, size_t flen) {
+    lagfx_m2v_render_desc_t d = {
+        .vertex_lib = vlib, .vertex_lib_len = vlen,
+        .fragment_lib = flib, .fragment_lib_len = flib ? flen : 0u,
+        .color_format = 80u /* BGRA8Unorm */, .write_mask = 0xfu,
+        .src_rgb = 1u, .src_alpha = 1u,
+    };
+    if (task->pending_pipeline.has_blend) {
+        const lagfx_pso_color_attachment_t *b = &task->pending_pipeline.blend;
+        if (b->pixel_format) d.color_format = b->pixel_format;
+        d.blending = b->blending;
+        d.src_rgb = b->src_rgb; d.dst_rgb = b->dst_rgb; d.rgb_op = b->rgb_op;
+        d.src_alpha = b->src_alpha; d.dst_alpha = b->dst_alpha; d.alpha_op = b->alpha_op;
+        d.write_mask = b->write_mask;
+    }
+    uint8_t blob[512];
+    lagfx_vtxdesc_attr_t va[8];
+    lagfx_vtxdesc_layout_t vl[8];
+    uint32_t nl = 0;
+    uint32_t bl = lagfx_read_pso_blob(p, task, reference, blob, sizeof blob, NULL);
+    uint32_t na = bl ? lagfx_parse_vertex_descriptor(blob, bl, va, 8u, vl, 8u, &nl) : 0u;
+    lagfx_m2v_vertex_attribute_t ma[8];
+    lagfx_m2v_vertex_layout_t ml[8];
+    for (uint32_t i = 0; i < na; i++)
+        ma[i] = (lagfx_m2v_vertex_attribute_t){ va[i].index, va[i].fmt, va[i].off, va[i].bufidx };
+    for (uint32_t i = 0; i < nl; i++)
+        ml[i] = (lagfx_m2v_vertex_layout_t){ vl[i].index, vl[i].stride, 1u /* PerVertex */, 1u };
+    if (na) {
+        d.has_vertex_descriptor = 1u;
+        d.n_attributes = na; d.attributes = ma;
+        d.n_layouts = nl; d.layouts = ml;
+    }
+    char err[512] = "";
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    lagfx_m2v_pipeline_t *mp = lagfx_m2v_compile_render((lagfx_m2v_device_t *)m2v, &d, err, sizeof err);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (mp) {
+        LAGFX_WARN("M2V pipe=0x%x PASS %.1f ms (%u stages, vtxdesc attrs=%u)", reference, ms,
+                   lagfx_m2v_pipeline_stage_count(mp), na);
+        lagfx_m2v_pipeline_free(mp);
+    } else {
+        LAGFX_WARN("M2V pipe=0x%x FAIL %.1f ms: %s", reference, ms, err);
+    }
+}
+#endif
+
 static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                                            uint32_t          encoder_type,
                                            uint32_t          task_id,
@@ -1350,7 +1408,19 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
         uint8_t cand_list[16];
         size_t n_cand = lagfx_lookup_pipeline_function_ref_list(p, task, reference,
                                                                 cand_list, 16);
-        bool lookup_ok = (n_cand > 0u);
+        /* The pipeline object names its vertex and fragment functions
+         * (protocol/pipeline_descriptor.h); the scan above is the fallback.
+         * The scan alone paired stages wrongly whenever a pipeline listed
+         * several functions (ViewportToNDC with UberCompositeFragment). */
+        uint32_t named_fn[2] = { 0, 0 };
+        {
+            uint8_t pb[512];
+            uint32_t pl_len = lagfx_read_pso_blob(p, task, reference, pb, sizeof pb, NULL);
+            if (!pl_len || !lagfx_parse_pso_functions(pb, pl_len, &named_fn[0], &named_fn[1])
+                || getenv("LAGFX_SCAN_PSO_FUNCTIONS"))
+                named_fn[0] = named_fn[1] = 0;
+        }
+        bool lookup_ok = (n_cand > 0u) || named_fn[0] != 0u;
         if (getenv("LAGFX_HEAPDUMP")) {
             char lb[80]; size_t lp = 0;
             for (size_t li = 0; li < n_cand && lp + 6 < sizeof(lb); li++)
@@ -1377,6 +1447,10 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
              * same arg order the translator assigns sequential bindings. */
             lagfx_air_arg_binding_t stage_ab[2][16];
             size_t stage_nab[2] = { 0, 0 };
+            /* Each stage's library, kept for metal2vulkan (LAGFX_M2V). */
+            uint8_t *m2v_lib[2] = { NULL, NULL };
+            size_t   m2v_len[2] = { 0, 0 };
+            const bool m2v_on = getenv("LAGFX_M2V") && dev_with_vk->vk->m2v;
             task->pending_pipeline.has_constexpr_sampler = 0;
 
             /* Inline helper: read metallib at vert/frag ref → extract
@@ -1393,10 +1467,18 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                  * lists (cand_list) and bind this stage from whichever metallib
                  * actually contains it. */
                 uint8_t *mlib_buf = NULL;
+                size_t mlib_buf_len = 0;
                 lagfx_metallib_function_t fns[8] = {0};
                 const lagfx_metallib_function_t *fn = NULL;
-                for (size_t ci = 0; ci < n_cand && !fn; ci++) {
-                    uint8_t fn_ref = cand_list[ci];
+                uint8_t stage_cand[16];
+                size_t n_stage_cand = 0;
+                if (named_fn[stage] != 0u && named_fn[stage] <= 0xffu)
+                    stage_cand[n_stage_cand++] = (uint8_t)named_fn[stage];
+                else
+                    for (size_t ci = 0; ci < n_cand && n_stage_cand < 16u; ci++)
+                        stage_cand[n_stage_cand++] = cand_list[ci];
+                for (size_t ci = 0; ci < n_stage_cand && !fn; ci++) {
+                    uint8_t fn_ref = stage_cand[ci];
                     if (fn_ref == 0u) continue;
                     uint64_t mlib_gpa = 0; uint32_t mlib_len = 0; uint64_t mlib_va = 0;
                     if (!lagfx_lookup_function_bytes(p, task, fn_ref, &mlib_gpa, &mlib_len, &mlib_va))
@@ -1464,6 +1546,7 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                     /* Keep this metallib + its function table alive for translate. */
                     memcpy(fns, tmpf, sizeof(fns));
                     mlib_buf = buf;
+                    mlib_buf_len = mlib_len;
                     for (size_t i = 0; i < fn_count && i < 8; i++)
                         if (fns[i].stage == want) { fn = &fns[i]; break; }
                 }
@@ -1474,7 +1557,7 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                     break;
                 }
 
-                if (getenv("LAGFX_DRAWMAP"))
+                if (getenv("LAGFX_DRAWMAP") || getenv("LAGFX_M2V"))
                     LAGFX_WARN("PIPEFN pipe=0x%x %s %s", reference,
                                stage == 0 ? "vtx" : "frag", fn->name);
                 /* Parse AIR + translate to SPIR-V. */
@@ -1532,7 +1615,12 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                 };
                 VkShaderModule mod = VK_NULL_HANDLE;
                 VkResult vr = vkCreateShaderModule(vk_device, &smci, NULL, &mod);
-                free(mlib_buf);
+                if (m2v_on) {
+                    m2v_lib[stage] = mlib_buf;
+                    m2v_len[stage] = mlib_buf_len;
+                } else {
+                    free(mlib_buf);
+                }
                 if (vr != VK_SUCCESS) {
                     LAGFX_WARN("op_0x74 P6a: vkCreateShaderModule failed vr=%d", (int)vr);
                     free(spv);
@@ -1561,6 +1649,14 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                         LAGFX_LOG("op_0x74 DUMP_SPV wrote %s (%zu B)", path, spv_sz); }
                 }
             }
+
+#ifdef LAGFX_HAVE_M2V
+            if (m2v_on && m2v_lib[0])
+                m2v_compile_probe(p, task, reference, dev_with_vk->vk->m2v,
+                                  m2v_lib[0], m2v_len[0], m2v_lib[1], m2v_len[1]);
+#endif
+            free(m2v_lib[0]);
+            free(m2v_lib[1]);
 
             /* Both stages successful → commit to pending_pipeline.
              * If only one succeeded, destroy it and fall back. */
