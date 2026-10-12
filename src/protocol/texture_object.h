@@ -23,6 +23,15 @@
  *   +0x68  u16  array length (3 for WindowServer's 1D-array colour lookup table)
  *   +0x6a  u16  MTLResourceOptions (storage mode in bits 4..7)
  *
+ * A texture made from a buffer (newTextureWithDescriptor:offset:bytesPerRow:,
+ * slot type 0x08) has the buffer's memory from a byte offset (kat tex-buffer):
+ *
+ *   +0x08  u32  the object's own id
+ *   +0x0c  u32  the buffer's object id
+ *   +0x10  u64  byte offset into the buffer
+ *   +0x18  u64  bytes per row
+ *   +0x20  descriptor, as at +0x54 above (width +0x24, height +0x28, ...)
+ *
  * A texture made from an IOSurface (slot type 0x05) has no placement of its
  * own: it names the surface, and the descriptor sits 0x40 bytes earlier.
  *
@@ -55,6 +64,7 @@
 #define LAGFX_TEXTURE_OBJECT_MIN_LEN 0x70u
 #define LAGFX_IOSURFACE_TEXTURE_MIN_LEN 0x30u
 #define LAGFX_IOSURFACE_RECORD_LEN 0x24u
+#define LAGFX_BUFFER_TEXTURE_MIN_LEN 0x38u
 
 /* MTLStorageMode */
 #define LAGFX_STORAGE_SHARED   0u
@@ -70,7 +80,9 @@ typedef struct {
     uint32_t usage;           /* MTLTextureUsage */
     uint32_t storage;         /* MTLStorageMode */
     uint32_t n_place;
-    struct { uint64_t size, page; } place[2];
+    struct { uint64_t size, page; } place[4];
+    uint64_t base_offset;     /* byte offset of texel (0,0) in the placement */
+    uint32_t buffer_ref;      /* buffer-backed: the buffer's object id, else 0 */
     uint32_t surface_id;      /* IOSurface-backed: the surface's id, else 0 */
 } lagfx_texture_object_t;
 
@@ -89,6 +101,10 @@ bool lagfx_parse_texture_object(const uint8_t *b, size_t len, lagfx_texture_obje
  * empty; lagfx_texture_object_attach_surface fills them. */
 bool lagfx_parse_iosurface_texture_object(const uint8_t *b, size_t len,
                                           lagfx_texture_object_t *out);
+
+/* Decode a buffer texture object (slot type 0x08). Leaves the placement
+ * empty: it is the buffer's (buffer_ref), from base_offset. */
+bool lagfx_parse_buffer_texture_object(const uint8_t *b, size_t len, lagfx_texture_object_t *out);
 
 bool lagfx_parse_iosurface_record(const uint8_t *b, size_t len, lagfx_iosurface_record_t *out);
 

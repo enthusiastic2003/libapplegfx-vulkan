@@ -72,6 +72,31 @@ bool lagfx_parse_iosurface_texture_object(const uint8_t *b, size_t len,
     return true;
 }
 
+bool lagfx_parse_buffer_texture_object(const uint8_t *b, size_t len, lagfx_texture_object_t *out) {
+    if (!b || !out || len < LAGFX_BUFFER_TEXTURE_MIN_LEN) return false;
+    memset(out, 0, sizeof(*out));
+    out->buffer_ref    = rd32(b + 0x0c);
+    out->base_offset   = rd64(b + 0x10);
+    uint64_t bpr       = rd64(b + 0x18);
+    out->usage         = b[0x21];
+    out->pixel_format  = rd16(b + 0x22);
+    out->width         = rd32(b + 0x24);
+    out->height        = rd32(b + 0x28);
+    out->depth         = rd32(b + 0x2c);
+    out->texture_type  = b[0x20] >= 0x40u ? b[0x20] - 0x40u : 2u;
+    out->mip_levels    = rd16(b + 0x30);
+    out->sample_count  = rd16(b + 0x32);
+    out->array_length  = rd16(b + 0x34);
+    out->storage       = (rd16(b + 0x36) >> 4) & 0xfu;
+    if (out->buffer_ref == 0u || (b[0x20] & 0xf0u) != 0x40u) return false;
+    if (out->width == 0u || out->height == 0u || out->width > 16384u || out->height > 16384u)
+        return false;
+    if (out->pixel_format == 0u || out->storage > LAGFX_STORAGE_PRIVATE) return false;
+    if (bpr < out->width || bpr > 0xffffffffull) return false;
+    out->bytes_per_row = (uint32_t)bpr;
+    return true;
+}
+
 bool lagfx_parse_iosurface_record(const uint8_t *b, size_t len, lagfx_iosurface_record_t *out) {
     if (!b || !out || len < LAGFX_IOSURFACE_RECORD_LEN) return false;
     memset(out, 0, sizeof(*out));

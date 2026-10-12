@@ -90,6 +90,114 @@ typedef struct {
 
 /* === Group A — Draw opcodes (0x01, 0x03, 0x06, 0x07) ========== */
 
+/* Record a draw in the task's pending state and emit it. */
+typedef struct {
+    bool indexed;
+    uint32_t prim, count, instances, base_instance;
+    int32_t start;                 /* vertex start, or base vertex when indexed */
+    uint32_t index_type, index_ref;
+    uint64_t index_offset;
+} draw_args_t;
+
+static int queue_draw(lagfx_protocol_t *p, uint32_t task_id, const char *name,
+                      const draw_args_t *a) {
+    if (task_id >= LAGFX_MAX_TASKS || !p->tasks[task_id].live) {
+        LAGFX_WARN("compute_inner: %s task_id=%u not live", name, task_id);
+        return 1;
+    }
+    lagfx_task_entry_t *task = &p->tasks[task_id];
+    task->pending_draw.valid = true;
+    task->pending_draw.indexed = a->indexed;
+    task->pending_draw.primitive_type = a->prim;
+    task->pending_draw.index_count = a->count;
+    task->pending_draw.base_vertex = a->start;
+    task->pending_draw.instance_count = a->instances ? a->instances : 1u;
+    task->pending_draw.first_instance = a->base_instance;
+    if (a->indexed) {
+        task->pending_draw.index_type = a->index_type;
+        task->pending_draw.index_buffer_ref = a->index_ref;
+        task->pending_draw.index_buffer_offset = (uint32_t)a->index_offset;
+    }
+    LAGFX_LOG("compute_inner: %s prim=%u count=%u start=%d instances=%u base_instance=%u indexed=%d",
+              name, a->prim, a->count, a->start, a->instances, a->base_instance, a->indexed);
+#ifdef LAGFX_HAVE_VULKAN
+    lagfx_emit_pending_draw(p, task, name, a->count);
+#endif
+    task->pending_draw.first_instance = 0u;
+    return 0;
+}
+
+/* Encodings decoded with kat draw-probe (distinct values per field):
+ *   0x02 drawPrimitives:vertexStart:vertexCount:instanceCount: (wide)
+ *        {u64 start, u64 count, u64 instances, u32 prim}
+ *   0x04 ...instanceCount:baseInstance: (wide)
+ *        {u64 start, u64 count, u64 instances, u64 baseInstance, u32 prim}
+ *   0x05 ...instanceCount:baseInstance: (compact)
+ *        {u16 start, u16 count, u16 instances, u16 baseInstance, u32 prim}
+ *   0x1d drawIndexedPrimitives:...instanceCount:baseVertex:baseInstance:
+ *        {u16 prim, u16 indexType, u32 buffer, u16 offset, u16 count,
+ *         u16 instances, i16 baseVertex, u32 baseInstance}
+ *   (0x10 / 0x11 are the indirect forms; not handled yet.) */
+static int op_draw_instanced_64(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 28u) return 1;
+    draw_args_t a = { .start = (int32_t)lagfx_le64(b), .count = (uint32_t)lagfx_le64(b + 8),
+                      .instances = (uint32_t)lagfx_le64(b + 16), .prim = lagfx_le32(b + 24) };
+    return queue_draw(p, task_id, "op_0x02", &a);
+}
+
+static int op_draw_base_instance_64(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                    const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 36u) return 1;
+    draw_args_t a = { .start = (int32_t)lagfx_le64(b), .count = (uint32_t)lagfx_le64(b + 8),
+                      .instances = (uint32_t)lagfx_le64(b + 16),
+                      .base_instance = (uint32_t)lagfx_le64(b + 24), .prim = lagfx_le32(b + 32) };
+    return queue_draw(p, task_id, "op_0x04", &a);
+}
+
+static int op_draw_base_instance_16(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                    const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 12u) return 1;
+    draw_args_t a = { .start = (int32_t)lagfx_le16(b), .count = lagfx_le16(b + 2),
+                      .instances = lagfx_le16(b + 4), .base_instance = lagfx_le16(b + 6),
+                      .prim = lagfx_le32(b + 8) };
+    return queue_draw(p, task_id, "op_0x05", &a);
+}
+
+static int op_draw_indexed_instanced_16(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                                        const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 20u) return 1;
+    draw_args_t a = { .indexed = true, .prim = lagfx_le16(b), .index_type = lagfx_le16(b + 2),
+                      .index_ref = lagfx_le32(b + 4), .index_offset = lagfx_le16(b + 8),
+                      .count = lagfx_le16(b + 10), .instances = lagfx_le16(b + 12),
+                      .start = (int16_t)lagfx_le16(b + 14), .base_instance = lagfx_le32(b + 16) };
+    return queue_draw(p, task_id, "op_0x1d", &a);
+}
+
+/* 0x09: the draw the lock screen clock's renderer (a third process, with
+ * path_distance / path_interior pipelines) issues after each pipeline change.
+ * No draw in kat draw-probe produces it, and its first field is only ever 3
+ * or 4: likely drawPatches (quadratic / cubic control points), not yet
+ * confirmed. Drawing it as plain primitives gives wrong geometry under both
+ * readings tried, so it is only drawn with LAGFX_DRAW09=1:
+ *   {u32 prim?, u32 instances?, u16 count (+ 2 unknown bytes), u32 start?} */
+static int op_draw_0x09(lagfx_protocol_t *p, uint32_t enc, uint32_t task_id,
+                        const uint8_t *b, size_t len) {
+    (void)enc;
+    if (len < 16u || !getenv("LAGFX_DRAW09")) return 1;
+    draw_args_t a = { .prim = lagfx_le32(b), .instances = lagfx_le32(b + 4),
+                      .count = lagfx_le16(b + 8), .start = (int32_t)lagfx_le32(b + 12) };
+    if (getenv("LAGFX_DRAW09_START_IS_BASE_INSTANCE")) {
+        a.base_instance = (uint32_t)a.start;
+        a.start = 0;
+    }
+    return queue_draw(p, task_id, "op_0x09", &a);
+}
+
 static int op_draw_primitives_16(lagfx_protocol_t *p,
                                     uint32_t          encoder_type,
                                     uint32_t          task_id,
@@ -2018,6 +2126,11 @@ static const lagfx_compute_inner_op_desc_t compute_inner_op_table[] = {
     { 0x006f, "SetFragmentBufferOffset",         op_set_fragment_buffer_offset },
     { 0x0001, "DrawPrimitives16",                op_draw_primitives_16 },
     { 0x0000, "DrawPrimitives64",                op_draw_primitives_64 },
+    { 0x0002, "DrawInstancedPrimitives64",       op_draw_instanced_64 },
+    { 0x0004, "DrawBaseInstancePrimitives64",    op_draw_base_instance_64 },
+    { 0x0005, "DrawBaseInstancePrimitives16",    op_draw_base_instance_16 },
+    { 0x0009, "DrawPrimitives0x09",              op_draw_0x09 },
+    { 0x001d, "DrawIndexedInstancedPrimitives16", op_draw_indexed_instanced_16 },
 };
 
 #define LAGFX_COMPUTE_INNER_OP_COUNT \

@@ -77,6 +77,23 @@ static bool attach_surface(lagfx_protocol_t *p, lagfx_texture_object_t *obj,
         return false;
     }
     *mem_task = t0;
+    if (getenv("LAGFX_SURFLOG")) {
+        /* once per (surface, page): the raw record */
+        static uint64_t seen_r[256];
+        static unsigned nr;
+        uint64_t key = ((uint64_t)obj->surface_id << 32) | rec.page;
+        bool dup = false;
+        for (unsigned k = 0; k < 256u; k++) dup |= seen_r[k] == key;
+        if (!dup) {
+            seen_r[nr++ % 256u] = key;
+            char hx[3 * LAGFX_IOSURFACE_RECORD_LEN + 1];
+            size_t hn = 0;
+            for (unsigned k = 0; k < sizeof b; k++)
+                hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", b[k]);
+            LAGFX_WARN("SURFREC id=%u tex %ux%u fmt %u: %s", obj->surface_id, obj->width,
+                       obj->height, obj->pixel_format, hx);
+        }
+    }
     if (getenv("LAGFX_DUMP_WB")) {
         /* once per surface id: where its memory is (guest physical) */
         static uint64_t seen[64];
@@ -136,6 +153,37 @@ uint8_t *lagfx_iosurface_read_pixels(lagfx_protocol_t *p, uint32_t surface_id,
 
 /* Decode texture object `ref` of `task`. *mem_task receives the task whose
  * address space holds the texels (task 0 for IOSurfaces). */
+/* A buffer texture's memory is its buffer's: up to four {u64 size, u32 page,
+ * u32 flags} entries, flag bit 16 on the last. */
+static bool attach_buffer(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
+                          lagfx_texture_object_t *obj) {
+    uint8_t type = 0, d[64];
+    uint64_t va = 0, gpa = 0;
+    if (!lagfx_resolve_object_data(p, task, obj->buffer_ref, &type, &va, &gpa) || va == 0u
+        || !lagfx_task_read_virtual(p, task, va, sizeof d, d))
+        return false;
+    uint64_t total = 0;
+    for (uint32_t e = 0; e < 4u; e++) {
+        uint64_t size = lagfx_le64(d + e * 16u);
+        uint32_t page = lagfx_le32(d + e * 16u + 8u), flags = lagfx_le32(d + e * 16u + 12u);
+        if (size == 0u || page == 0u) break;
+        obj->place[obj->n_place].size = size;
+        obj->place[obj->n_place].page = page;
+        obj->n_place++;
+        total += size;
+        if (flags & 0x10000u) break;
+    }
+    uint64_t need = obj->base_offset + (uint64_t)obj->bytes_per_row * (obj->height - 1u)
+                  + (uint64_t)obj->width * lagfx_metal_pixel_format_bytes(obj->pixel_format);
+    if (obj->n_place == 0u || need > total) {
+        LAGFX_WARN("guest_texture: buffer 0x%x (%llu bytes in %u entries) can't hold the texture "
+                   "(%llu bytes)", obj->buffer_ref, (unsigned long long)total, obj->n_place,
+                   (unsigned long long)need);
+        return false;
+    }
+    return true;
+}
+
 static bool read_texture_object(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
                                 uint32_t ref, lagfx_texture_object_t *obj,
                                 const lagfx_task_entry_t **mem_task) {
@@ -148,6 +196,12 @@ static bool read_texture_object(lagfx_protocol_t *p, const lagfx_task_entry_t *t
         return lagfx_task_read_virtual(p, task, va, sizeof b, b)
                && lagfx_parse_iosurface_texture_object(b, sizeof b, obj)
                && attach_surface(p, obj, mem_task);
+    }
+    if (type == 0x08u) {
+        uint8_t b[LAGFX_BUFFER_TEXTURE_MIN_LEN];
+        return lagfx_task_read_virtual(p, task, va, sizeof b, b)
+               && lagfx_parse_buffer_texture_object(b, sizeof b, obj)
+               && attach_buffer(p, task, obj);
     }
     if (type != 0x02u && type != 0x03u && type != 0x0cu) return false;
     uint8_t b[LAGFX_TEXTURE_OBJECT_MIN_LEN];
@@ -170,7 +224,7 @@ static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_
     VkFormat fmt = lagfx_metal_pixel_format_to_vk(obj->pixel_format);
     /* Object ids are reused for new objects; the texture's memory location
      * tells an entry for a new texture from a stale one. */
-    uint64_t where = obj->n_place ? obj->place[0].page << 12 : 0u;
+    uint64_t where = obj->n_place ? (obj->place[0].page << 12) + obj->base_offset : 0u;
     lagfx_resource_entry_t *e = lagfx_resource_lookup(&p->resources, ref, task->id);
     if (e && e->type == LAGFX_RESOURCE_TYPE_TEXTURE && e->host_handle) {
         lagfx_vk_iosurface_t *cur = (lagfx_vk_iosurface_t *)e->host_handle;
@@ -236,6 +290,15 @@ static void dump_image(const char *kind, const lagfx_task_entry_t *task, uint32_
         for (uint32_t x = 0; x < obj->width; x++) {
             const uint8_t *q = px + (size_t)y * stride + (size_t)x * 4u;
             uint8_t rgb[3] = { q[2], q[1], q[0] };
+            if (obj->pixel_format == 94u || obj->pixel_format == 90u) {
+                /* 10-bit channels, low bits first: B,G,R (94) or R,G,B (90) */
+                uint32_t v = lagfx_le32(q);
+                uint8_t c0 = (uint8_t)((v >> 2) & 0xffu), c1 = (uint8_t)((v >> 12) & 0xffu),
+                        c2 = (uint8_t)((v >> 22) & 0xffu);
+                rgb[0] = obj->pixel_format == 94u ? c2 : c0;
+                rgb[1] = c1;
+                rgb[2] = obj->pixel_format == 94u ? c0 : c2;
+            }
             fwrite(rgb, 1, 3, f);
         }
     fclose(f);
@@ -284,6 +347,7 @@ static bool read_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *t
                                 const lagfx_texture_object_t *obj, uint64_t off,
                                 uint8_t *dst, uint64_t len) {
     uint64_t base = 0;
+    off += obj->base_offset;
     for (uint32_t e = 0; e < obj->n_place && len > 0u; e++) {
         uint64_t esize = obj->place[e].size;
         if (off >= base + esize) { base += esize; continue; }
@@ -523,6 +587,7 @@ static bool write_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *
     lagfx_device_t *dev = (lagfx_device_t *)p->dev;
     if (!dev->desc.shell.write_memory) return false;
     uint64_t base = 0;
+    off += obj->base_offset;
     for (uint32_t e = 0; e < obj->n_place && len > 0u; e++) {
         uint64_t esize = obj->place[e].size;
         if (off >= base + esize) { base += esize; continue; }

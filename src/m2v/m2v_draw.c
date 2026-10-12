@@ -1048,7 +1048,8 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
     }
     lagfx_m2v_draw_t *dr = lagfx_m2v_plan_draw((lagfx_m2v_device_t *)vk->m2v, mp->pipe, st,
                                                vertex_start, vertex_count,
-                                               instance_count ? instance_count : 1u, 0u, ixp,
+                                               instance_count ? instance_count : 1u,
+                                               task->pending_draw.first_instance, ixp,
                                                err, sizeof err);
     if (!dr && strstr(err, "MissingDeviceAddress")) {
         /* the shader reads buffers by address: give every bound buffer a host
@@ -1066,7 +1067,8 @@ bool lagfx_m2v_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task, struct lagfx_
             }
         err[0] = 0;
         dr = lagfx_m2v_plan_draw((lagfx_m2v_device_t *)vk->m2v, mp->pipe, st, vertex_start,
-                                 vertex_count, instance_count ? instance_count : 1u, 0u, ixp,
+                                 vertex_count, instance_count ? instance_count : 1u,
+                                               task->pending_draw.first_instance, ixp,
                                  err, sizeof err);
     }
     if (!dr) {

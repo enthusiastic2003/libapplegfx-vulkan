@@ -503,6 +503,72 @@ static BOOL case_tex_nearest(void) {
     return compare(px, pattern_blocks, nil);
 }
 
+// Name-only probe: instanced draws with distinct field values, to decode
+// their commands (LAGFX_OPTASK=<kat task> on the host):
+//   A: TriangleStrip, vertexStart 5, vertexCount 7, instanceCount 3
+//   B: Triangle, vertexStart 6, vertexCount 9, instanceCount 4, baseInstance 2
+//   C: Line, vertexStart 0x105, vertexCount 0x207, instanceCount 0x30a
+//   D-F: see below
+static BOOL case_draw_probe(void) {
+    id<MTLRenderPipelineState> ps = make_pipeline(@"vs_quad", @"fs_red", nil, nil);
+    if (!ps) return NO;
+    id<MTLTexture> t = make_target();
+    id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc =
+        [cb renderCommandEncoderWithDescriptor:clear_pass(t, MTLClearColorMake(0, 0, 0, 1))];
+    [enc setRenderPipelineState:ps];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:5 vertexCount:7 instanceCount:3];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:6 vertexCount:9 instanceCount:4
+           baseInstance:2];
+    [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0x105 vertexCount:0x207
+          instanceCount:0x30a];
+    // D: start past 16 bits; E: count and base instance past 16 bits
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0x12345 vertexCount:6 instanceCount:3];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:2 vertexCount:0x10004
+          instanceCount:5 baseInstance:0x10007];
+    // F: indexed with instances, base vertex and base instance
+    id<MTLBuffer> ib = [gDevice newBufferWithLength:0x1000 options:MTLResourceStorageModeShared];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:MTLIndexTypeUInt16
+                   indexBuffer:ib indexBufferOffset:0x40 instanceCount:3 baseVertex:5
+                  baseInstance:7];
+    // I: plain (no instance count); J: instance count 1
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0x13 vertexCount:0x3f];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:7 vertexCount:5 instanceCount:1];
+    // G: indirect (arguments in a buffer at 0x30); H: indexed indirect (args at 0x50)
+    id<MTLBuffer> args = [gDevice newBufferWithLength:0x100 options:MTLResourceStorageModeShared];
+    [enc drawPrimitives:MTLPrimitiveTypeLineStrip indirectBuffer:args indirectBufferOffset:0x30];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypePoint indexType:MTLIndexTypeUInt32 indexBuffer:ib
+             indexBufferOffset:0x44 indirectBuffer:args indirectBufferOffset:0x50];
+    [enc endEncoding];
+    return run_cb(cb);
+}
+
+// A texture made from a buffer at an offset that isn't page-aligned (a linear
+// texture: newTextureWithDescriptor:offset:bytesPerRow:), with a row pitch
+// wider than the image. Prints the offset and pitch for decoding the object.
+static BOOL case_tex_buffer(void) {
+    NSUInteger align = [gDevice minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGRA8Unorm];
+    NSUInteger off = 3 * align, bpr = ((kPat * 4 + 2 * align - 1) / align) * align;
+    printf("  alignment %lu, offset 0x%lx, bytes per row 0x%lx\n", (unsigned long)align,
+           (unsigned long)off, (unsigned long)bpr);
+    id<MTLBuffer> b = [gDevice newBufferWithLength:0x10000 options:MTLResourceStorageModeShared];
+    memset(b.contents, 0x33, 0x10000);
+    fill_pattern((uint8_t *)b.contents + off, bpr);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:kPat height:kPat
+                                 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> src = [b newTextureWithDescriptor:td offset:off bytesPerRow:bpr];
+    if (!src) return NO;
+    static bgra_t px[kSize * kSize];
+    if (!draw_quad(make_pipeline(@"vs_quad", @"fs_tex_nearest", nil, nil),
+                   MTLClearColorMake(0, 0, 0, 1),
+                   ^(id<MTLRenderCommandEncoder> e) { [e setFragmentTexture:src atIndex:0]; }, px))
+        return NO;
+    return compare(px, pattern_blocks, nil);
+}
+
 // Pixel coordinates (normalizedCoordinates = NO, ClampToZero) through a sampler
 // state object, as WindowServer's final full-screen pass samples its composite.
 static BOOL case_tex_pixel(void) {
@@ -950,6 +1016,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"load", case_load, YES},
     {"blit-copy", case_blit_copy, YES},
     {"tex-nearest", case_tex_nearest, YES},
+    {"tex-buffer", case_tex_buffer, YES},
     {"tex-linear", case_tex_linear, YES},
     {"tex-pixel", case_tex_pixel, YES},
     {"blend-alpha", case_blend_alpha, YES},
@@ -963,6 +1030,7 @@ static const struct { const char *name; BOOL (*fn)(void); BOOL in_all; } kCases[
     {"iosurface-probe", case_iosurface_probe, NO},
     {"type-probe", case_type_probe, NO},
     {"blit-probe", case_blit_probe, NO},
+    {"draw-probe", case_draw_probe, NO},
 };
 #define kNumCases (sizeof kCases / sizeof kCases[0])
 

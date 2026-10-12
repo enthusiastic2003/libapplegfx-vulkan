@@ -202,6 +202,24 @@ static size_t inner_walk_segment(lagfx_protocol_t *p,
                     (unsigned)encoder_type, (unsigned)(opcode_full & 0xffffu),
                     (unsigned)opcode_byte, total_len, off);
 
+        {
+            /* LAGFX_OPTASK=<id> or >N: log one task's (tasks above N) inner commands (first 600) */
+            const char *ot = getenv("LAGFX_OPTASK");
+            static unsigned n_ot;
+            bool want = ot && (ot[0] == '*' || (task && (ot[0] == '>' ? task->id > (uint32_t)strtoul(ot + 1, NULL, 0)
+                                         : task->id == (uint32_t)strtoul(ot, NULL, 0))));
+            if (want && n_ot < 20000u) {
+                n_ot++;
+                char hx[3 * 40 + 1];
+                size_t hn = 0;
+                const uint8_t *bb = segment_bytes + off + 8u;
+                for (uint32_t k = 0; k + 8u < total_len && k < 40u; k++)
+                    hn += (size_t)snprintf(hx + hn, sizeof hx - hn, "%02x ", bb[k]);
+                hx[hn] = 0;
+                LAGFX_WARN("OPTASK t%u enc=%u op=0x%04x len=%u: %s", task ? task->id : 0xffffffffu,
+                           (unsigned)encoder_type, (unsigned)(opcode & 0xffffu), total_len, hx);
+            }
+        }
         const uint8_t *body = segment_bytes + off + 8u;
         size_t body_len = total_len - 8u;
         (void)stamp;  /* dispatchers may need the stamp later */

@@ -140,6 +140,20 @@ int main(void) {
 
     test_iosurface();
 
+    /* a buffer texture (slot type 0x08) as kat tex-buffer made it: 8x8 BGRA8
+     * at offset 0x300 of buffer 1, 0x200 bytes per row */
+    static const uint8_t bt[0x38] = {
+        0x09, 0, 0, 0, 0x40, 0, 0, 0, 0x02, 0, 0, 0, 0x01, 0, 0, 0,
+        0x00, 0x03, 0, 0, 0, 0, 0, 0, 0x00, 0x02, 0, 0, 0, 0, 0, 0,
+        0x42, 0x01, 0x50, 0x00, 0x08, 0, 0, 0, 0x08, 0, 0, 0, 0x01, 0, 0, 0,
+        0x01, 0, 0x01, 0, 0x01, 0, 0, 0,
+    };
+    CHECK(lagfx_parse_buffer_texture_object(bt, sizeof bt, &t));
+    CHECK(t.buffer_ref == 1 && t.base_offset == 0x300 && t.bytes_per_row == 0x200);
+    CHECK(t.width == 8 && t.height == 8 && t.pixel_format == 80 && t.texture_type == 2);
+    CHECK(t.storage == LAGFX_STORAGE_SHARED && t.n_place == 0);
+    CHECK(!lagfx_parse_buffer_texture_object(bt, 0x30, &t));
+
     if (failures) return 1;
     printf("texture-object-unit: OK\n");
     return 0;
