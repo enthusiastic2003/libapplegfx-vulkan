@@ -309,6 +309,9 @@ void lagfx_display_free(lagfx_display_t *display) {
     /* Destroy thread-safety mutex. */
     pthread_mutex_destroy(&display->rt_lock);
 
+    free(display->presented);
+    display->presented = NULL;
+
     /* Clean up fallback pixels buffer. */
     if (display->fallback_pixels) {
         free(display->fallback_pixels);
@@ -332,6 +335,21 @@ lagfx_coord_t lagfx_display_cursor_position(lagfx_display_t *display) {
         return (lagfx_coord_t){ 0, 0 };
     }
     return display->cursor_pos;
+}
+
+void lagfx_display_set_presented(lagfx_display_t *display, uint8_t *px,
+                                 uint32_t w, uint32_t h) {
+    if (!display || display->magic != LAGFX_DISPLAY_MAGIC || !px) {
+        free(px);
+        return;
+    }
+    LAGFX_DISPLAY_RT_LOCK(display);
+    free(display->presented);
+    display->presented = px;
+    display->presented_w = w;
+    display->presented_h = h;
+    LAGFX_DISPLAY_RT_UNLOCK(display);
+    set_frame_ready(display);
 }
 
 lagfx_status_t lagfx_display_read_frame(lagfx_display_t *display,
@@ -378,6 +396,21 @@ lagfx_status_t lagfx_display_read_frame(lagfx_display_t *display,
         if (rf_log) LAGFX_TRACE("read_frame[#%u]: NO_FRAME (flag clear)", rf_calls);
         return LAGFX_ERR_NO_FRAME;
     }
+
+    /* The guest's presented frame wins over every other path. */
+    LAGFX_DISPLAY_RT_LOCK(display);
+    if (display->presented && dst) {
+        size_t row = (size_t)display->presented_w * 4u;
+        size_t bytes = row * display->presented_h;
+        memcpy(dst, display->presented, bytes < dst_size_bytes ? bytes : dst_size_bytes);
+        if (stride_out) *stride_out = row;
+        if (new_frame_out) *new_frame_out = true;
+        display->new_frame_ready = false;
+        display->has_frame = 1;
+        LAGFX_DISPLAY_RT_UNLOCK(display);
+        return LAGFX_OK;
+    }
+    LAGFX_DISPLAY_RT_UNLOCK(display);
 
     /* SETTLE-LATCH (GOAL-M2z): the guest recomposites in bursts of draws with
      * no trailing present/swap (FRAME_ON_SWAP found ZERO swap ops post-boot),

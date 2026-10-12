@@ -36,7 +36,7 @@
  *   +0x18  u32  width
  *   +0x1c  u32  height
  *   +0x20  u16  bytes per row
- *   +0x22  u16  bytes per element
+ *   +0x23  u8   bytes per element (+0x22 has been 0)
  *
  * Matched against surfaces of known size and row stride
  * (tests/guest/kat.m, `kat iosurface-probe`).

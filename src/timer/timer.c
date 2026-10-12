@@ -13,8 +13,9 @@
 #include "../device.h"
 #include "../protocol/state.h"
 #include "../vulkan/iosurface.h"
-#include <stdlib.h>
 #endif
+#include <stdatomic.h>
+#include <stdlib.h>
 
 #define LAGFX_MAX_DISPLAYS 8u
 
@@ -91,13 +92,25 @@ bool lagfx_timer_tick_vblank(
         LAGFX_LOG("timer_tick_vblank: display[%u] ss[+0x104]=%08X", i, enabled_mask);
 
         /* Check if display just enabled (ss[+0x104] == 0xC). */
-        if (enabled_mask == 0xCu && !(dev->display_ss_enabled & (1u << i))) {
+        bool enabled = enabled_mask != 0u;
+        if (enabled && !(dev->display_ss_enabled & (1u << i))) {
             /* CRITICAL: Raise online IRQ IMMEDIATELY. Do NOT defer or wait. */
 
-            /* Set online pending bit (ss[+0x100]=0x4). */
-            uint32_t pending = 0x4u;
+            /* Post the connect event: bit 2 in the display's pending events
+             * (ss[+0x100]); the guest answers by reading the page's mode and
+             * setting up the display pipe. LAGFX_SS_EVENT overrides the bits
+             * (bit 3 is the other event the guest enables). */
+            const char *ev = getenv("LAGFX_SS_EVENT");
+            uint32_t pending = ev ? (uint32_t)strtoul(ev, NULL, 0) : 0x4u;
             if (write_memory(shell_opaque, ss_gpa + 0x100u, sizeof(pending), &pending)) {
                 irq_raised = true;
+                /* The guest only looks at a display's events when its bit is
+                 * set in the mask it reads at BAR0+0x1014. */
+                lagfx_protocol_t *pp = (lagfx_protocol_t *)dev->protocol_state;
+                atomic_fetch_or_explicit(&pp->pending_displays_bitmask, 1u << i,
+                                         memory_order_release);
+                LAGFX_LOG("display[%u]: guest enabled events 0x%x, posted 0x%x",
+                          i, enabled_mask, pending);
 
                 LAGFX_LOG("timer_tick_vblank: display[%u] enabled (ss[+0x104]=0xC), "
                           "raised IRQ vec=0 IMMEDIATELY", i);

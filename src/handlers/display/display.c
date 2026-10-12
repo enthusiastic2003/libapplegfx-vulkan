@@ -16,8 +16,10 @@
 #include "../../vulkan/iosurface.h"
 #include "../../protocol/resource_registry.h"
 #include "../compute/compute_draw_internal.h"  /* lagfx_texture_realize */
+#include "../compute/guest_texture.h"           /* lagfx_iosurface_read_pixels */
 #endif
 
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -422,19 +424,62 @@ lagfx_handler_status_t lagfx_display_vchan_setup_shared_state(
     lagfx_put_le16(blob + 0x01a, 64u);                /* cursor_max_h */
     lagfx_put_le32(blob + 0x01c, 0u);                 /* resp_code */
     lagfx_put_le32(blob + 0x020, w * h * bpp);        /* fb_len */
-    lagfx_put_le32(blob + 0x100, 0x4u);               /* pending_online_bit */
-    lagfx_put_le32(blob + 0x104, 0xCu);               /* online_event_enabled */
+    /* +0x100 (pending events, host) and +0x104 (enabled events, written by
+     * the guest) start at zero; the vblank timer posts the connect event once
+     * the guest has enabled events (timer/timer.c). */
     lagfx_put_le16(blob + 0x208, 1u);                 /* numPixelFormats */
 
     /* Pixel-format record at +0x210 — {u32 width, u32 height, fourcc
      * 'BGRA', u32 unverified=0}. PGDisplayNub-presentSurface.annotated.asm
      * line 213 confirms ARGB / BGRA are the only accepted formats. */
-    lagfx_put_le32(blob + 0x210, w);
-    lagfx_put_le32(blob + 0x214, h);
+    /* Mode record: u16 width, u16 height, u16 (unknown, 0), u16 refresh Hz
+     * — offsets matched against the timing the guest builds from them (its
+     * EDID DisplayID detailed timing). */
+    lagfx_put_le16(blob + 0x210, (uint16_t)w);
+    lagfx_put_le16(blob + 0x212, (uint16_t)h);
+    lagfx_put_le16(blob + 0x216, 60u);
     blob[0x218] = 'B';
     blob[0x219] = 'G';
     blob[0x21a] = 'R';
     blob[0x21b] = 'A';
+
+    /* Experiment: LAGFX_SS_POKE="off=val,..." overrides u32 words of the page
+     * (hex or decimal, off < 0x220). */
+    const char *poke = getenv("LAGFX_SS_POKE");
+    while (poke && *poke) {
+        char *end;
+        unsigned long off = strtoul(poke, &end, 0);
+        if (*end != '=') break;
+        unsigned long val = strtoul(end + 1, &end, 0);
+        if (off + 4u <= SS_BLOB_BYTES) {
+            lagfx_put_le32(blob + off, (uint32_t)val);
+            LAGFX_WARN("SS_POKE display[%u] +0x%lx = 0x%lx", display_index, off, val);
+        }
+        poke = (*end == ',') ? end + 1 : NULL;
+    }
+
+    /* Experiment (LAGFX_SS_PATTERN=start-end): write the whole page: our
+     * fields as above, and in [start, end) every u16 that is zero gets
+     * 0x200 + offset/2 (unique, 512..2559), except the event words
+     * +0x100..+0x107 and the guest's +0xe00 word. Values the guest then
+     * reports (mode size etc.) name the offsets it read. */
+    const char *pat = getenv("LAGFX_SS_PATTERN");
+    if (pat) {
+        char *end;
+        uint32_t lo = (uint32_t)strtoul(pat, &end, 0);
+        uint32_t hi = (*end == '-') ? (uint32_t)strtoul(end + 1, NULL, 0) : 4096u;
+        uint8_t pg[4096] = { 0 };
+        memcpy(pg, blob, SS_BLOB_BYTES);
+        for (uint32_t o = lo & ~1u; o < hi && o < sizeof pg; o += 2u) {
+            if ((o >= 0x100u && o < 0x108u) || (o >= 0xe00u && o < 0xe04u)) continue;
+            if (pg[o] == 0u && pg[o + 1] == 0u)
+                lagfx_put_le16(pg + o, (uint16_t)(0x200u + o / 2u));
+        }
+        if (!dev->desc.shell.write_memory(dev->desc.shell.opaque, ss_gpa, sizeof pg, pg))
+            return LAGFX_HANDLER_ERR_INTERNAL;
+        LAGFX_WARN("SS_PATTERN display[%u] [0x%x, 0x%x) written", display_index, lo, hi);
+        return LAGFX_HANDLER_OK;
+    }
 
     if (!dev->desc.shell.write_memory(dev->desc.shell.opaque, ss_gpa,
                                        SS_BLOB_BYTES, blob)) {
@@ -473,6 +518,22 @@ lagfx_handler_status_t lagfx_display_vchan_display_submit(
               display_index, arg2, hdr->stamp);
 
     lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+
+    /* Experiment (LAGFX_REPLY_EVENT=bits): answer this command by posting
+     * those event bits in the display's shared page (+0x100) and raising the
+     * display interrupt. */
+    const char *rev = getenv("LAGFX_REPLY_EVENT");
+    if (rev && dev && display_index < 16u && dev->display_ss_gpa[display_index]
+        && dev->desc.shell.write_memory) {
+        uint32_t bits = (uint32_t)strtoul(rev, NULL, 0);
+        dev->desc.shell.write_memory(dev->desc.shell.opaque,
+                                     dev->display_ss_gpa[display_index] + 0x100u, 4, &bits);
+        atomic_fetch_or_explicit(&p->pending_displays_bitmask, 1u << display_index,
+                                 memory_order_release);
+        if (dev->desc.shell.raise_interrupt)
+            dev->desc.shell.raise_interrupt(dev->desc.shell.opaque, 0u);
+        LAGFX_WARN("HOTPLUG display[%u]: op 0x02 answered with event 0x%x", display_index, bits);
+    }
 
     /* One-shot registry census: dump EVERY registered backing (not just
      * draw-sampled ones) with size + a raw-GPA content probe, to locate a
@@ -714,6 +775,33 @@ lagfx_handler_status_t lagfx_display_vchan_present(
     LAGFX_LOG("vchan_present: display[%u] surface=0x%x plane=%u stamp=0x%08x",
               display_index, surface_id, plane_id, hdr->stamp);
 
+    /* The surface's memory holds the finished frame (IOSurfaces are written
+     * back after each command buffer): show it. */
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    uint32_t w = 0, h = 0;
+    uint8_t *px = lagfx_iosurface_read_pixels(p, surface_id, &w, &h);
+    const char *dd = getenv("LAGFX_DUMP_WB");
+    if (px && dd) {
+        /* debug: the presented frame, as <dir>/present-s<surface>.ppm */
+        char path[512];
+        snprintf(path, sizeof path, "%s/present-s%u.ppm", dd, surface_id);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P6\n%u %u\n255\n", w, h);
+            for (size_t k = 0; k < (size_t)w * h; k++) {
+                uint8_t rgb[3] = { px[4 * k + 2], px[4 * k + 1], px[4 * k] };
+                fwrite(rgb, 1, 3, f);
+            }
+            fclose(f);
+        }
+    }
+    if (px && dev && display_index < LAGFX_MAX_DISPLAYS && dev->displays[display_index]) {
+        lagfx_display_set_presented(dev->displays[display_index], px, w, h);
+        LAGFX_LOG("vchan_present: display[%u] showing surface %u (%ux%u)",
+                  display_index, surface_id, w, h);
+        return LAGFX_HANDLER_OK;
+    }
+    free(px);
     lagfx_display_present_surface_by_id(p, display_index, surface_id, "vchan_present");
 
     return LAGFX_HANDLER_OK;

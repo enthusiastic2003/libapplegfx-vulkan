@@ -37,6 +37,7 @@
 #include "../vulkan/iosurface.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -320,6 +321,12 @@ int lagfx_blit_inner_dispatch(lagfx_protocol_t *p,
             pos += (size_t)wrote;
         }
         words[pos] = '\0';
+        /* LAGFX_DUMP_BLIT=1: at warn level */
+        if (getenv("LAGFX_DUMP_BLIT"))
+            LAGFX_WARN("BLITOP op=0x%03x (%s) len=%zu %s w[%s]",
+                       (unsigned)(d->opcode & 0xfffu), d->name, len,
+                       d->handler == op_ack_stub ? "ACK-ONLY" : "EXEC", words);
+        else
         LAGFX_LOG("BLITOP op=0x%03x (%s) len=%zu %s w[%s]",
                   (unsigned)(d->opcode & 0xfffu), d->name, len,
                   d->handler == op_ack_stub ? "ACK-ONLY" : "EXEC", words);

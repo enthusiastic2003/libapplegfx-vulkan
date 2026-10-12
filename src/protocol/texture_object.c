@@ -73,7 +73,7 @@ bool lagfx_parse_iosurface_record(const uint8_t *b, size_t len, lagfx_iosurface_
     out->width             = rd32(b + 0x18);
     out->height            = rd32(b + 0x1c);
     out->bytes_per_row     = rd16(b + 0x20);
-    out->bytes_per_element = rd16(b + 0x22);
+    out->bytes_per_element = b[0x23];
     if (out->size == 0u || out->page == 0u || out->width == 0u || out->height == 0u)
         return false;
     if (out->bytes_per_row < out->width) return false;

@@ -113,6 +113,12 @@ struct lagfx_display {
     size_t fallback_stride;
     size_t fallback_bytes;
 
+    /* The frame the guest last presented (display-channel op 0x06): the
+     * surface's pixels, BGRA, rows of presented_w * 4 bytes. Takes priority
+     * over every other path in lagfx_display_read_frame. Guarded by rt_lock. */
+    uint8_t *presented;
+    uint32_t presented_w, presented_h;
+
     /* Scanout buffer info from CmdDisplaySwapMapping (opcode 0x12).
       * The kext may send arg2=0 in vchan_display_submit if it expects
       * us to use the last-seen swap mapping. Fields are populated when
@@ -191,5 +197,10 @@ void lagfx_display_signal_frame_ready(lagfx_display_t *display);
 /* Alpha-blend the captured guest cursor glyph over the composited rt
  * (loadOp=LOAD). No-op without a captured glyph / visible state. */
 lagfx_status_t lagfx_display_overlay_cursor(lagfx_display_t *display);
+
+/* Show `px` (BGRA, w * 4 bytes per row; ownership passes to the display) as
+ * the guest's presented frame and signal the shell. */
+void lagfx_display_set_presented(lagfx_display_t *display, uint8_t *px,
+                                 uint32_t w, uint32_t h);
 
 #endif /* LIBAPPLEGFX_DISPLAY_INTERNAL_H */

@@ -63,7 +63,7 @@ static void make_surface(uint8_t *b, uint64_t size, uint32_t page, uint32_t w, u
     put32(b, 0x18, w);
     put32(b, 0x1c, h);
     put16(b, 0x20, bpr);
-    put16(b, 0x22, 4);
+    b[0x23] = 4;
 }
 
 static void test_iosurface(void) {

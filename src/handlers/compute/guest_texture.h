@@ -57,6 +57,11 @@ void lagfx_guest_texture_writeback(lagfx_protocol_t *p, lagfx_task_entry_t *task
                                    struct lagfx_vk_state *vk);
 #endif
 
+/* Read IOSurface `surface_id` (4 bytes per element) from its memory in task 0
+ * into a new buffer of width * 4-byte rows (caller frees). NULL on failure. */
+uint8_t *lagfx_iosurface_read_pixels(lagfx_protocol_t *p, uint32_t surface_id,
+                                     uint32_t *out_w, uint32_t *out_h);
+
 /* Remember that a pass stored into texture `ref` of `task`. */
 void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref);
 

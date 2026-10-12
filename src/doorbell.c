@@ -24,6 +24,7 @@
 #include "protocol/state.h"
 #include "common/log.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* === Door Registry ================================================
@@ -262,10 +263,15 @@ void doorbell_handle_write(void *protocol_state, uint64_t offset, uint32_t value
 uint32_t doorbell_handle_read(void *protocol_state, uint64_t offset) {
     lagfx_protocol_t *p = (lagfx_protocol_t *)protocol_state;
 
-    /* Capability gate — modern paravirt path indicator */
+    /* Display port count (the guest kernel logs "DisplayPortCount
+     * configuration (N)" from it and caps it at 8). Upstream returned 9 as
+     * a "capability gate", which gave the guest eight displays. LAGFX_DISPLAY_PORTS
+     * overrides. */
     if (offset == 0x122cu) {
-        LAGFX_TRACE("doorbell: read off=0x122c cap_gate → 9");
-        return 9u;
+        const char *e = getenv("LAGFX_DISPLAY_PORTS");
+        uint32_t n = e ? (uint32_t)strtoul(e, NULL, 0) : 1u;
+        LAGFX_TRACE("doorbell: read off=0x122c display ports → %u", n);
+        return n;
     }
 
     /* Display bitmask — atomic xchg-and-clear with acquire ordering.
@@ -277,6 +283,7 @@ uint32_t doorbell_handle_read(void *protocol_state, uint64_t offset) {
                                        0u, memory_order_acquire)
             : 0u;
         LAGFX_TRACE("doorbell: read off=0x1014 display_bitmask → 0x%x (cleared)", mask);
+        if (mask) LAGFX_LOG("doorbell: guest read display mask 0x%x", mask);
         return mask;
     }
 

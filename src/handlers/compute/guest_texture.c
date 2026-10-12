@@ -9,12 +9,14 @@
 
 #include "guest_texture.h"
 
+#include "common/le.h"
 #include "common/log.h"
 #include "device.h"
 #include "protocol/object_resolver.h"
 #include "protocol/resource_registry.h"
 #include "task_translate.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -75,7 +77,61 @@ static bool attach_surface(lagfx_protocol_t *p, lagfx_texture_object_t *obj,
         return false;
     }
     *mem_task = t0;
+    if (getenv("LAGFX_DUMP_WB")) {
+        /* once per surface id: where its memory is (guest physical) */
+        static uint64_t seen[64];
+        uint64_t key = ((uint64_t)obj->surface_id << 32) | rec.page;
+        bool dup = false;
+        for (unsigned k = 0; k < 64u; k++) dup |= seen[k] == key;
+        static unsigned n;
+        if (!dup) {
+            seen[n++ % 64u] = key;
+            uint64_t gpa = 0;
+            lagfx_task_translate(p, t0, rec.page << 12, &gpa);
+            LAGFX_WARN("SURFACE %u: %ux%u bpr %u fourcc 0x%08x size 0x%llx task0 va 0x%llx gpa 0x%llx",
+                       obj->surface_id, rec.width, rec.height, rec.bytes_per_row, rec.fourcc,
+                       (unsigned long long)rec.size, (unsigned long long)(rec.page << 12),
+                       (unsigned long long)gpa);
+        }
+    }
     return true;
+}
+
+uint8_t *lagfx_iosurface_read_pixels(lagfx_protocol_t *p, uint32_t surface_id,
+                                     uint32_t *out_w, uint32_t *out_h) {
+    lagfx_task_entry_t *t0 = p ? lagfx_protocol_find_task(p, 0u) : NULL;
+    uint8_t type = 0;
+    uint64_t va = 0, gpa = 0;
+    uint8_t b[LAGFX_IOSURFACE_RECORD_LEN];
+    lagfx_iosurface_record_t rec;
+    memset(&rec, 0, sizeof rec);
+    memset(b, 0, sizeof b);
+    bool found = t0 && lagfx_resolve_object_data(p, t0, surface_id, &type, &va, &gpa) && va != 0u;
+    bool read = found && lagfx_task_read_virtual(p, t0, va, sizeof b, b);
+    bool parsed = read && lagfx_parse_iosurface_record(b, sizeof b, &rec);
+    if (!found || type != 0x04u || !parsed || rec.bytes_per_element != 4u) {
+        LAGFX_WARN("iosurface: surface %u not readable (found=%d type=0x%02x read=%d parsed=%d "
+                   "%ux%u bpr %u bpe %u size 0x%llx fourcc 0x%08x)",
+                   surface_id, found, type, read, parsed, lagfx_le32(b + 0x18),
+                   lagfx_le32(b + 0x1c), (unsigned)(b[0x20] | b[0x21] << 8),
+                   (unsigned)(b[0x22] | b[0x23] << 8), (unsigned long long)lagfx_le64(b),
+                   lagfx_le32(b + 0x0c));
+        return NULL;
+    }
+    size_t row = (size_t)rec.width * 4u;
+    uint8_t *px = malloc(row * rec.height);
+    if (!px) return NULL;
+    for (uint32_t y = 0; y < rec.height; y++) {
+        if (!lagfx_task_read_virtual(p, t0, (rec.page << 12) + (uint64_t)y * rec.bytes_per_row,
+                                     (uint32_t)row, px + (size_t)y * row)) {
+            LAGFX_WARN("iosurface: surface %u row %u unreadable", surface_id, y);
+            free(px);
+            return NULL;
+        }
+    }
+    *out_w = rec.width;
+    *out_h = rec.height;
+    return px;
 }
 
 /* Decode texture object `ref` of `task`. *mem_task receives the task whose
@@ -154,6 +210,28 @@ static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_
               task->id, ref, obj->width, obj->height, obj->pixel_format, obj->storage,
               obj->bytes_per_row);
     return ios;
+}
+
+/* LAGFX_DUMP_WB=<dir>: save each written-back (wb-) and uploaded (up-) image
+ * of a 4-byte format, read as BGRA, as <dir>/<kind>-t<task>-r<ref>-s<surface>.ppm
+ * (surface 0: not an IOSurface); the latest wins. */
+static void dump_image(const char *kind, const lagfx_task_entry_t *task, uint32_t ref,
+                       const lagfx_texture_object_t *obj, const uint8_t *px, size_t stride) {
+    const char *dir = getenv("LAGFX_DUMP_WB");
+    if (!dir || lagfx_metal_pixel_format_bytes(obj->pixel_format) != 4u) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s-t%u-r%x-s%u.ppm", dir, kind, task->id, ref,
+             obj->surface_id);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%u %u\n255\n", obj->width, obj->height);
+    for (uint32_t y = 0; y < obj->height; y++)
+        for (uint32_t x = 0; x < obj->width; x++) {
+            const uint8_t *q = px + (size_t)y * stride + (size_t)x * 4u;
+            uint8_t rgb[3] = { q[2], q[1], q[0] };
+            fwrite(rgb, 1, 3, f);
+        }
+    fclose(f);
 }
 
 static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
@@ -243,6 +321,7 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
                    (unsigned long long)(obj->n_place ? obj->place[0].page : 0u), ok, nz,
                    tight * obj->height, px[0], px[1], px[2], px[3]);
     }
+    if (ok) dump_image("up", task, ref, obj, px, tight);
     if (ok) ok = lagfx_vk_iosurface_upload_pixels(vk, ios, px, tight * obj->height) == LAGFX_OK;
     free(px);
     stats.uploads++;
@@ -417,6 +496,7 @@ static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     }
     ios->layout = rt.layout;
     if (stride == 0u) stride = tight;
+    dump_image("wb", task, ref, &obj, px, stride);
     bool ok = true;
     for (uint32_t y = 0; y < obj.height && ok; y++)
         ok = write_texture_memory(p, mem_task, &obj, (uint64_t)y * obj.bytes_per_row,

@@ -1117,6 +1117,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                           && task->pending_pipeline.descriptor_set_layout != 0
                           && task->pending_pipeline.pipeline_layout != 0;
     lagfx_status_t st = LAGFX_OK;
+    const char *drawpath = "none";   /* LAGFX_DRAWMAP outcome tag */
 
     /* NOTE: the earlier "guest bound a texture but reflection has no
      * SAMPLED_IMAGE → skip" gate was REMOVED — it was backwards. A shader whose
@@ -1195,7 +1196,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
      * pipeline ref, translate + resource status. Maps the wallpaper pass's
      * draw (target view 0x17/0x32) to its execution outcome. Gated. */
     if (getenv("LAGFX_DRAWMAP")) {
-        LAGFX_LOG("DRAWMAP t%u tgt=0x%x route=%s pipe=0x%x xlated=%d res_using=%d "
+        LAGFX_WARN("DRAWMAP t%u tgt=0x%x route=%s pipe=0x%x xlated=%d res_using=%d "
                   "nbind=%u nvtx=%u verts=%u scissor=%ux%u",
                   task->id, task->render_pass_desc.target_ref,
                   (active_rt == &perpass_rt) ? "perpass" : "scanout",
@@ -1210,7 +1211,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     /* PASSGRAPH: the dependency DAG. Each draw WRITES target_ref and READS the
      * bound fragment_textures — dump both edges so the forest-source chain and
      * the terminal (target=scanout) pass are visible in one boot. Gated. */
-    if (getenv("LAGFX_PASSGRAPH")) {
+    if (getenv("LAGFX_PASSGRAPH") || getenv("LAGFX_DRAWMAP")) {
         char rd[128]; size_t rn = 0; uint32_t nread = 0;
         for (uint32_t s = 0; s < LAGFX_MAX_BINDING_SLOTS && rn + 8 < sizeof(rd); s++) {
             if (!task->bindings.fragment_textures[s].valid) continue;
@@ -1219,7 +1220,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
             nread++;
         }
         if (rn == 0) { rd[0] = '-'; rd[1] = 0; }
-        LAGFX_LOG("PASSGRAPH t%u WRITES tgt=0x%x pipe=0x%x xlated=%d READS[%u]=%s scissor=%ux%u",
+        LAGFX_WARN("PASSGRAPH t%u WRITES tgt=0x%x pipe=0x%x xlated=%d READS[%u]=%s scissor=%ux%u",
                   task->id, task->render_pass_desc.target_ref,
                   task->pending_pipeline.reference,
                   task->pending_pipeline.translated ? 1 : 0,
@@ -1262,7 +1263,9 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
             /* With vertex input on but no real vertex data, SKIP the draw
              * (st != OK) to avoid the unbound-attribute lavapipe fault — don't
              * signal a frame for a draw that didn't happen. */
+            drawpath = "bound";
             if (vtx_input_on && vbuf == VK_NULL_HANDLE) {
+                drawpath = "bound-novbuf";
                 st = LAGFX_ERR_INVALID_ARG;
             } else {
                 st = lagfx_vk_draw_record_and_submit_bound(
@@ -1325,6 +1328,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
             }
             vkFreeDescriptorSets(device, dev_with_vk->vk->draw_desc_pool, 1, &ds);
         } else {
+            drawpath = "bound-nodescset";
             LAGFX_WARN("%s P6b: descriptor-set build failed for ref=0x%x — skipping draw (no crash)",
                        op, task->pending_pipeline.reference);
         }
@@ -1332,6 +1336,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
         /* Resource-free TRANSLATED pipeline WITH vertex input: real geometry
          * from the bound vertex buffer, no descriptor set (empty layout). This
          * is the SkyLight ref=0x14/0x1d case — stage-in attrs, no [[buffer]]. */
+        drawpath = "vtx";
         st = lagfx_vk_draw_record_and_submit_bound(
             dev_with_vk->vk, pipeline, VK_NULL_HANDLE, VK_NULL_HANDLE,
             active_rt, false, vc, 1, 0, 0, 0, vbuf, regionp);
@@ -1348,12 +1353,14 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
         }
     } else if (vtx_input_on) {
         /* vtx-input pipeline but no real vertex data → skip (no unbound fault). */
+        drawpath = "vtx-novbuf";
         LAGFX_LOG("%s VTX: ref=0x%x no real vertex data — skip (no crash)",
                   op, task->pending_pipeline.reference);
     } else if (task->pending_pipeline.translated
                && getenv("LAGFX_DISABLE_RESOURCE_FREE_DRAW") == NULL) {
         /* Translated pipeline with no resources and no stage-in: positions
          * come from vertex_id (e.g. full-screen triangles). Draw it as is. */
+        drawpath = "free";
         st = lagfx_vk_draw_record_and_submit(dev_with_vk->vk, pipeline, active_rt, false,
                                              vc, 1, 0, 0, 0);
         if (st == LAGFX_OK) {
@@ -1381,6 +1388,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
          * per-pass surface — it would pollute the surface with a fake triangle
          * and (being the last draw) win the scanout blit over the real composite
          * layers. The substitute still renders to display->rt directly. */
+        drawpath = "substitute";
         st = lagfx_vk_draw_record_and_submit(
             dev_with_vk->vk, pipeline, active_rt, false, 3, 1, 0, 0, 0);
         if (st == LAGFX_OK) {
@@ -1390,6 +1398,11 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
             LAGFX_WARN("%s: substitute draw failed (%d)", op, (int)st);
         }
     }
+
+    if (getenv("LAGFX_DRAWMAP"))
+        LAGFX_WARN("DRAWRES t%u tgt=0x%x pipe=0x%x path=%s st=%d", task->id,
+                   task->render_pass_desc.target_ref, task->pending_pipeline.reference,
+                   drawpath, (int)st);
 
     /* POOR-MAN'S TILE COMPOSITOR (KICKOFF-scanout-composite-reliability).
      *
