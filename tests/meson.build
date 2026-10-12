@@ -1327,6 +1327,15 @@ texobj_test = executable('texture-object-unit',
 )
 test('texture object decode (unit)', texobj_test)
 
+# Resource registry (the real table: capacity, index, removal).
+resreg_test = executable('resource-registry-unit',
+  'resource-registry-unit.c',
+  include_directories : [include_dir, internal_include_dir],
+  dependencies : [libapplegfx_vulkan_dep],
+  build_by_default : true,
+)
+test('resource registry (unit)', resreg_test)
+
 depth_stencil_test = executable('depth-stencil-unit',
   'depth-stencil-unit.c',
   include_directories : [include_dir, internal_include_dir],

@@ -11,6 +11,32 @@
 
 #include <string.h>
 
+static uint32_t index_home(uint32_t ref, uint32_t task_id) {
+    uint32_t h = ref * 0x9e3779b1u ^ task_id * 0x85ebca77u;
+    h ^= h >> 15;
+    return h & (LAGFX_RESOURCE_INDEX_SLOTS - 1u);
+}
+
+/* Index slot holding (ref, task), or the empty slot where it would go. */
+static uint32_t index_find(const lagfx_resource_registry_t *reg, uint32_t ref, uint32_t task_id) {
+    uint32_t s = index_home(ref, task_id);
+    for (;;) {
+        uint32_t v = reg->index[s];
+        if (v == 0u) return s;
+        const lagfx_resource_entry_t *e = &reg->entries[v - 1u];
+        if (e->ref == ref && e->task_id == task_id) return s;
+        s = (s + 1u) & (LAGFX_RESOURCE_INDEX_SLOTS - 1u);
+    }
+}
+
+static void index_rebuild(lagfx_resource_registry_t *reg) {
+    memset(reg->index, 0, sizeof reg->index);
+    for (uint32_t i = 0; i < reg->count; ++i) {
+        const lagfx_resource_entry_t *e = &reg->entries[i];
+        reg->index[index_find(reg, e->ref, e->task_id)] = i + 1u;
+    }
+}
+
 void lagfx_resource_register(lagfx_resource_registry_t *reg,
                              uint32_t ref,
                              lagfx_resource_type_t type,
@@ -21,20 +47,19 @@ void lagfx_resource_register(lagfx_resource_registry_t *reg,
         return;
     }
 
-    for (uint32_t i = 0; i < reg->count; ++i) {
-        if (reg->entries[i].ref == ref
-            && reg->entries[i].task_id == task_id) {
-            reg->entries[i].type     = type;
-            reg->entries[i].gpu_addr = gpu_addr;
-            reg->entries[i].size     = size;
-            reg->entries[i].surface_id = 0u;
-            LAGFX_TRACE("resource_register: updated ref=0x%x task=%u "
-                         "type=%u gpu_addr=0x%llx size=%llu",
-                         ref, task_id, (unsigned)type,
-                         (unsigned long long)gpu_addr,
-                         (unsigned long long)size);
-            return;
-        }
+    uint32_t slot = index_find(reg, ref, task_id);
+    if (reg->index[slot] != 0u) {
+        lagfx_resource_entry_t *e = &reg->entries[reg->index[slot] - 1u];
+        e->type     = type;
+        e->gpu_addr = gpu_addr;
+        e->size     = size;
+        e->surface_id = 0u;
+        LAGFX_TRACE("resource_register: updated ref=0x%x task=%u "
+                     "type=%u gpu_addr=0x%llx size=%llu",
+                     ref, task_id, (unsigned)type,
+                     (unsigned long long)gpu_addr,
+                     (unsigned long long)size);
+        return;
     }
 
     if (reg->count >= LAGFX_MAX_RESOURCES) {
@@ -45,19 +70,17 @@ void lagfx_resource_register(lagfx_resource_registry_t *reg,
     }
 
     lagfx_resource_entry_t *e = &reg->entries[reg->count++];
+    memset(e, 0, sizeof(*e));
     e->ref         = ref;
     e->type        = type;
     e->task_id     = task_id;
-    e->host_handle = NULL;
 #ifdef LAGFX_HAVE_VULKAN
     e->image       = VK_NULL_HANDLE;
     e->view        = VK_NULL_HANDLE;
-#else
-    e->image       = NULL;
 #endif
     e->gpu_addr    = gpu_addr;
     e->size        = size;
-    e->surface_id  = 0u;
+    reg->index[slot] = reg->count;
 
     LAGFX_TRACE("resource_register: inserted ref=0x%x task=%u type=%u "
                   "gpu_addr=0x%llx size=%llu (total=%u)",
@@ -73,14 +96,8 @@ lagfx_resource_entry_t *lagfx_resource_lookup(lagfx_resource_registry_t *reg,
     if (!reg) {
         return NULL;
     }
-
-    for (uint32_t i = 0; i < reg->count; ++i) {
-        if (reg->entries[i].ref == ref
-            && reg->entries[i].task_id == task_id) {
-            return &reg->entries[i];
-        }
-    }
-    return NULL;
+    uint32_t v = reg->index[index_find(reg, ref, task_id)];
+    return v ? &reg->entries[v - 1u] : NULL;
 }
 
 /* M1 B9 — task-agnostic texture lookup. IOSurfaces are global, shared by
@@ -119,6 +136,7 @@ void lagfx_resource_unregister(lagfx_resource_registry_t *reg,
             memset(&reg->entries[reg->count - 1], 0,
                    sizeof(lagfx_resource_entry_t));
             reg->count--;
+            index_rebuild(reg);
             LAGFX_TRACE("resource_unregister: ref=0x%x task=%u "
                          "(remaining=%u)",
                          ref, task_id, reg->count);
@@ -152,6 +170,7 @@ void lagfx_resource_clear_task(lagfx_resource_registry_t *reg,
                removed * sizeof(lagfx_resource_entry_t));
     }
     reg->count = write_idx;
+    if (removed > 0) index_rebuild(reg);
 
     LAGFX_TRACE("resource_clear_task: task=%u removed=%u remaining=%u",
                  task_id, removed, reg->count);

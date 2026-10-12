@@ -27,7 +27,12 @@
 #  include <vulkan/vulkan.h>
 #endif
 
-#define LAGFX_MAX_RESOURCES 256u
+/* Live (ref, task) pairs across all tasks. A desktop session keeps well over
+ * a thousand in WindowServer alone; 256 overflowed as soon as a user logged
+ * in, and the textures that could not register were never drawn. */
+#define LAGFX_MAX_RESOURCES 16384u
+/* Open-addressing index over entries[], kept at most half full. */
+#define LAGFX_RESOURCE_INDEX_SLOTS (2u * LAGFX_MAX_RESOURCES)
 
 typedef enum {
     LAGFX_RESOURCE_TYPE_UNKNOWN = 0,
@@ -71,6 +76,9 @@ typedef struct {
 typedef struct {
     lagfx_resource_entry_t entries[LAGFX_MAX_RESOURCES];
     uint32_t count;
+    /* (ref, task) -> entry index + 1; 0 marks an empty slot. Rebuilt when
+     * entries are removed, which moves them. */
+    uint32_t index[LAGFX_RESOURCE_INDEX_SLOTS];
 } lagfx_resource_registry_t;
 
 void lagfx_resource_register(lagfx_resource_registry_t *reg,
