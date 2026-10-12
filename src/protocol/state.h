@@ -243,6 +243,9 @@ typedef struct {
     /* Colour attachment 0's blend state from the pipeline descriptor
      * (protocol/pipeline_descriptor.h); has_blend 0 = not decoded. */
     lagfx_pso_color_attachment_t blend;
+    /* metal2vulkan's compiled pipeline with its Vulkan objects (m2v/m2v_draw.c),
+     * NULL when this pipeline goes through the older translator. */
+    void      *m2v;
     uint8_t    has_blend;
     uint8_t    n_spv_bindings;
     /* Vertex stage-in attributes reflected from the translated VERTEX shader

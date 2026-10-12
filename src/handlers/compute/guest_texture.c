@@ -155,6 +155,12 @@ static bool read_texture_object(lagfx_protocol_t *p, const lagfx_task_entry_t *t
     return lagfx_parse_texture_object(b, sizeof b, obj);
 }
 
+bool lagfx_guest_texture_info(lagfx_protocol_t *p, const lagfx_task_entry_t *task, uint32_t ref,
+                              lagfx_texture_object_t *out) {
+    const lagfx_task_entry_t *mem_task;
+    return p && task && out && read_texture_object(p, task, ref, out, &mem_task);
+}
+
 /* Find or create the host image for (task, ref) matching the decoded object.
  * *created is set when a new image was made (its contents are undefined). */
 static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_t *task,

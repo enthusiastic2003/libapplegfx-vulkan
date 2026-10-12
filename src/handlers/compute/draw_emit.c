@@ -17,6 +17,7 @@
 #include "device.h"
 #include "protocol/state.h"
 #include "vulkan/iosurface.h"
+#include "m2v/m2v_draw.h"
 #include "vulkan/display_blit.h"
 #include "vulkan/composite.h"
 #include "vulkan/pipeline_build.h"
@@ -870,6 +871,74 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
         return;
     }
     VkDevice device = dev_with_vk->vk->device;
+#ifdef LAGFX_HAVE_M2V
+    /* metal2vulkan (LAGFX_M2V): the pipeline it compiled draws into the pass's
+     * target with the plan it makes from the task's bindings; anything it
+     * can't do falls through to the paths below. */
+    if (task->pending_pipeline.m2v && task->render_pass_desc.target_ref) {
+        lagfx_resource_entry_t *te = lagfx_resource_lookup(&p->resources,
+                                                           task->render_pass_desc.target_ref,
+                                                           task->id);
+        lagfx_vk_iosurface_t *tgt = (te && te->type == LAGFX_RESOURCE_TYPE_TEXTURE)
+                                        ? (lagfx_vk_iosurface_t *)te->host_handle : NULL;
+        if (tgt && tgt->image != VK_NULL_HANDLE) {
+            lagfx_draw_region_t mreg = {0};
+            if (task->vp_current) {
+                mreg.vp_x = task->vp_x; mreg.vp_y = task->vp_y;
+                mreg.vp_w = task->vp_w; mreg.vp_h = task->vp_h;
+            }
+            if (task->sc_have) {
+                mreg.sc_x = task->sc_x; mreg.sc_y = task->sc_y;
+                mreg.sc_w = task->sc_w; mreg.sc_h = task->sc_h;
+            }
+            uint32_t lay = (uint32_t)tgt->layout;
+            if (lagfx_m2v_draw(p, task, dev_with_vk->vk, task->pending_pipeline.m2v, tgt, &lay,
+                               &mreg, task->pending_draw.primitive_type,
+                               (uint32_t)task->pending_draw.base_vertex, count,
+                               task->pending_draw.instance_count)) {
+                tgt->layout = (VkImageLayout)lay;
+                tgt->gpu_drawn = 1u;
+                if (getenv("LAGFX_DRAWMAP"))
+                    LAGFX_WARN("DRAWRES t%u tgt=0x%x pipe=0x%x path=m2v st=0", task->id,
+                               task->render_pass_desc.target_ref, task->pending_pipeline.reference);
+                if (getenv("LAGFX_DRAWCHECK")) {
+                    lagfx_vk_render_target_t crt;
+                    size_t bytes = (size_t)tgt->width * tgt->height * 4u, stride = 0;
+                    uint8_t *px = malloc(bytes);
+                    if (px && lagfx_vk_render_target_wrap(tgt->image, tgt->view, tgt->memory,
+                                                          tgt->width, tgt->height, tgt->format,
+                                                          &crt) == LAGFX_OK) {
+                        crt.layout = tgt->layout;
+                        if (lagfx_vk_render_target_readback(dev_with_vk->vk, &crt, px, bytes,
+                                                            &stride) == LAGFX_OK) {
+                            tgt->layout = crt.layout;
+                            if (!stride) stride = (size_t)tgt->width * 4u;
+                            unsigned nz = 0, n = 0, na = 0;
+                            for (uint32_t y = 0; y < tgt->height; y += 8u)
+                                for (uint32_t x = 0; x < tgt->width; x += 8u) {
+                                    const uint8_t *q = px + (size_t)y * stride + (size_t)x * 4u;
+                                    n++; nz += (q[0] | q[1] | q[2]) != 0u; na += q[3] != 0u;
+                                }
+                            const uint8_t *c = px + (size_t)(tgt->height / 2u) * stride
+                                               + (size_t)(tgt->width / 2u) * 4u;
+                            LAGFX_WARN("DRAWCHECK t%u tgt=0x%x pipe=0x%x m2v %ux%u nonblack=%u%% "
+                                       "alpha=%u%% centre=%02x%02x%02x%02x verts=%u",
+                                       task->id, task->render_pass_desc.target_ref,
+                                       task->pending_pipeline.reference, tgt->width, tgt->height,
+                                       n ? 100u * nz / n : 0u, n ? 100u * na / n : 0u,
+                                       c[0], c[1], c[2], c[3], count);
+                        }
+                    }
+                    free(px);
+                }
+                if (dev_with_vk->displays[0])
+                    lagfx_display_signal_frame_ready(dev_with_vk->displays[0]);
+                return;
+            }
+            tgt->layout = (VkImageLayout)lay;
+        }
+    }
+#endif
     /* M2c SOLIDFRAG (LAGFX_M2_SOLIDFRAG): split-test — draw the REAL translated
      * vertex geometry with the SUBSTITUTE solid-colour fragment. If colour
      * appears where black/teal persisted, the geometry+transform chain is

@@ -8,6 +8,7 @@ lagfx_sources += files(
   'display.c',
   'doorbell.c',        # New: BAR0 write listener and dispatcher routing
   'version.c',
+  'm2v/m2v_draw.c',    # render pipelines and draws through metal2vulkan
 )
 
 # Private internal headers live alongside the .c files; they are NOT

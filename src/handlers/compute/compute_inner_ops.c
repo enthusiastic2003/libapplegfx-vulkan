@@ -60,9 +60,7 @@
 #include "air2spv/translate.h"
 #include "air2spirv/metallib_extract.h"
 #include "protocol/vertex_descriptor.h"
-#ifdef LAGFX_HAVE_M2V
-#include "m2v/lagfx_m2v.h"
-#endif
+#include "m2v/m2v_draw.h"
 
 #ifdef LAGFX_HAVE_VULKAN
 #  include <vulkan/vulkan.h>
@@ -685,6 +683,25 @@ static int op_render_describe_render_pass(lagfx_protocol_t *p,
         }
     }
 
+    if (rp_target == 0u && getenv("LAGFX_DRAWMAP")) {
+        /* a pass whose colour target we couldn't decode: what is it? */
+        lagfx_render_pass_full_desc_t rpd;
+        if (body_len >= LAGFX_RENDER_PASS_WIRE_SIZE
+            && lagfx_parse_render_pass_descriptor(body, body_len, &rpd) == 0) {
+            uint32_t r0 = rpd.colors[0].texture_ref;
+            uint8_t rt = 0; uint64_t rva = 0, rgpa = 0;
+            bool res = r0 && lagfx_resolve_object_data(p, task, r0, &rt, &rva, &rgpa);
+            static unsigned n_nt;
+            if (n_nt++ < 40u) {
+                LAGFX_WARN("RP-NOTARGET t%u color0 ref=0x%x resolved=%d type=0x%02x n_colors=%u "
+                           "depth=0x%x size=%llux%llu", task->id, r0, res, rt,
+                           rpd.color_attachment_count, rpd.depth_texture_ref,
+                           (unsigned long long)rpd.render_target_width,
+                           (unsigned long long)rpd.render_target_height);
+                if (res) dump_object(p, task, r0, "notarget");
+            }
+        }
+    }
     if (rp_target != 0u) {
         task->render_pass_desc.target_ref = rp_target;
         /* Pipelines for this pass must be built for the target's real format. */
@@ -1225,58 +1242,6 @@ static int op_set_vertex_buffer_offset(lagfx_protocol_t *p,
 
 /* === Group D — Pipeline + scissor/viewport (0x74, 0x75, 0x82) == */
 
-#ifdef LAGFX_HAVE_M2V
-/* Compile a pipeline's two stage libraries with metal2vulkan and log the
- * outcome (LAGFX_M2V; first step of moving render pipelines to it). */
-static void m2v_compile_probe(lagfx_protocol_t *p, lagfx_task_entry_t *task, uint32_t reference,
-                              void *m2v, const uint8_t *vlib, size_t vlen,
-                              const uint8_t *flib, size_t flen) {
-    lagfx_m2v_render_desc_t d = {
-        .vertex_lib = vlib, .vertex_lib_len = vlen,
-        .fragment_lib = flib, .fragment_lib_len = flib ? flen : 0u,
-        .color_format = 80u /* BGRA8Unorm */, .write_mask = 0xfu,
-        .src_rgb = 1u, .src_alpha = 1u,
-    };
-    if (task->pending_pipeline.has_blend) {
-        const lagfx_pso_color_attachment_t *b = &task->pending_pipeline.blend;
-        if (b->pixel_format) d.color_format = b->pixel_format;
-        d.blending = b->blending;
-        d.src_rgb = b->src_rgb; d.dst_rgb = b->dst_rgb; d.rgb_op = b->rgb_op;
-        d.src_alpha = b->src_alpha; d.dst_alpha = b->dst_alpha; d.alpha_op = b->alpha_op;
-        d.write_mask = b->write_mask;
-    }
-    uint8_t blob[512];
-    lagfx_vtxdesc_attr_t va[8];
-    lagfx_vtxdesc_layout_t vl[8];
-    uint32_t nl = 0;
-    uint32_t bl = lagfx_read_pso_blob(p, task, reference, blob, sizeof blob, NULL);
-    uint32_t na = bl ? lagfx_parse_vertex_descriptor(blob, bl, va, 8u, vl, 8u, &nl) : 0u;
-    lagfx_m2v_vertex_attribute_t ma[8];
-    lagfx_m2v_vertex_layout_t ml[8];
-    for (uint32_t i = 0; i < na; i++)
-        ma[i] = (lagfx_m2v_vertex_attribute_t){ va[i].index, va[i].fmt, va[i].off, va[i].bufidx };
-    for (uint32_t i = 0; i < nl; i++)
-        ml[i] = (lagfx_m2v_vertex_layout_t){ vl[i].index, vl[i].stride, 1u /* PerVertex */, 1u };
-    if (na) {
-        d.has_vertex_descriptor = 1u;
-        d.n_attributes = na; d.attributes = ma;
-        d.n_layouts = nl; d.layouts = ml;
-    }
-    char err[512] = "";
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    lagfx_m2v_pipeline_t *mp = lagfx_m2v_compile_render((lagfx_m2v_device_t *)m2v, &d, err, sizeof err);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-    if (mp) {
-        LAGFX_WARN("M2V pipe=0x%x PASS %.1f ms (%u stages, vtxdesc attrs=%u)", reference, ms,
-                   lagfx_m2v_pipeline_stage_count(mp), na);
-        lagfx_m2v_pipeline_free(mp);
-    } else {
-        LAGFX_WARN("M2V pipe=0x%x FAIL %.1f ms: %s", reference, ms, err);
-    }
-}
-#endif
 
 static int op_set_render_pipeline_state(lagfx_protocol_t *p,
                                            uint32_t          encoder_type,
@@ -1305,6 +1270,7 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
         lagfx_pso_vtx_attr_t tmp[8];
         (void)lagfx_parse_pso_vertex_attrs(p, task, reference, tmp, 8u);
     }
+    task->pending_pipeline.m2v = NULL;   /* set again below when metal2vulkan compiles it */
     /* Blend state of colour attachment 0 (the only one drawn into). */
     task->pending_pipeline.has_blend = 0;
     if (!getenv("LAGFX_DISABLE_PSO_BLEND")) {
@@ -1451,6 +1417,7 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
             uint8_t *m2v_lib[2] = { NULL, NULL };
             size_t   m2v_len[2] = { 0, 0 };
             const bool m2v_on = getenv("LAGFX_M2V") && dev_with_vk->vk->m2v;
+            task->pending_pipeline.m2v = NULL;
             task->pending_pipeline.has_constexpr_sampler = 0;
 
             /* Inline helper: read metallib at vert/frag ref → extract
@@ -1652,8 +1619,9 @@ static int op_set_render_pipeline_state(lagfx_protocol_t *p,
 
 #ifdef LAGFX_HAVE_M2V
             if (m2v_on && m2v_lib[0])
-                m2v_compile_probe(p, task, reference, dev_with_vk->vk->m2v,
-                                  m2v_lib[0], m2v_len[0], m2v_lib[1], m2v_len[1]);
+                task->pending_pipeline.m2v = lagfx_m2v_pipeline_get(
+                    p, task, dev_with_vk->vk, reference, m2v_lib[0], m2v_len[0],
+                    m2v_lib[1], m2v_len[1]);
 #endif
             free(m2v_lib[0]);
             free(m2v_lib[1]);

@@ -70,6 +70,12 @@ void lagfx_guest_texture_writeback(lagfx_protocol_t *p, lagfx_task_entry_t *task
 uint8_t *lagfx_iosurface_read_pixels(lagfx_protocol_t *p, uint32_t surface_id,
                                      uint32_t *out_w, uint32_t *out_h);
 
+#ifdef LAGFX_HAVE_VULKAN
+/* Decode texture object `ref` of `task` (IOSurface textures included). */
+bool lagfx_guest_texture_info(lagfx_protocol_t *p, const lagfx_task_entry_t *task, uint32_t ref,
+                              lagfx_texture_object_t *out);
+#endif
+
 /* Remember that a pass stored into texture `ref` of `task`. */
 void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref);
 
