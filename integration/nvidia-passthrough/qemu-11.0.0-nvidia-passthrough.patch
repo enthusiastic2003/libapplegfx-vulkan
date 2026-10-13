@@ -1,0 +1,391 @@
+--- a/include/hw/pci/pci_device.h
++++ b/include/hw/pci/pci_device.h
+@@ -30,6 +30,7 @@
+     PCIUnregisterFunc *exit;
+     PCIConfigReadFunc *config_read;
+     PCIConfigWriteFunc *config_write;
++    void (*post_config_reset)(PCIDevice *dev);
+ 
+     uint16_t vendor_id;
+     uint16_t device_id;
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -582,6 +582,10 @@
+     msi_reset(dev);
+     msix_reset(dev);
+     pcie_sriov_pf_reset(dev);
++
++    if (PCI_DEVICE_GET_CLASS(dev)->post_config_reset) {
++        PCI_DEVICE_GET_CLASS(dev)->post_config_reset(dev);
++    }
+ }
+ 
+ /*
+--- a/hw/vfio/pci.h
++++ b/hw/vfio/pci.h
+@@ -57,6 +57,7 @@
+     uint8_t type;
+     bool ioport;
+     bool mem64;
++    bool guest_alias;
+     QLIST_HEAD(, VFIOQuirk) quirks;
+ } VFIOBAR;
+ 
+@@ -187,6 +188,12 @@
+     bool defer_kvm_irq_routing;
+     bool clear_parent_atomics_on_exit;
+     bool skip_vsc_check;
++    bool preserve_fw_resources;
++    uint64_t guest_bar1_size;
++    bool fw_resources_locked;
++    bool fw_resource_reset;
++    uint16_t fw_resource_command;
++    uint32_t fw_resource_bars[PCI_NUM_REGIONS - 1];
+     uint16_t vpasid_cap_offset;
+     VFIODisplay *dpy;
+     Notifier irqchip_change_notifier;
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -1424,6 +1424,42 @@
+     return val;
+ }
+ 
++static bool vfio_pci_bars_have_final_addresses(PCIDevice *pdev)
++{
++    int bar;
++
++    for (bar = 0; bar < PCI_ROM_SLOT; bar++) {
++        PCIIORegion *region = &pdev->io_regions[bar];
++        uint64_t base, probe;
++
++        if (!region->size) {
++            continue;
++        }
++        base = pci_get_long(pdev->config + PCI_BASE_ADDRESS_0 + bar * 4);
++        if (!(region->type & PCI_BASE_ADDRESS_SPACE_IO) &&
++            (region->type & PCI_BASE_ADDRESS_MEM_TYPE_MASK) ==
++             PCI_BASE_ADDRESS_MEM_TYPE_64) {
++            base |= (uint64_t)pci_get_long(pdev->config +
++                                           PCI_BASE_ADDRESS_0 +
++                                           (bar + 1) * 4) << 32;
++            base &= ~0xFULL;
++            probe = ~(region->size - 1) & ~0xFULL;
++            bar++;
++        } else if (region->type & PCI_BASE_ADDRESS_SPACE_IO) {
++            probe = ~(region->size - 1) & PCI_BASE_ADDRESS_IO_MASK;
++            base &= PCI_BASE_ADDRESS_IO_MASK;
++        } else {
++            probe = ~(region->size - 1) & PCI_BASE_ADDRESS_MEM_MASK;
++            base &= PCI_BASE_ADDRESS_MEM_MASK;
++            probe &= UINT32_MAX;
++        }
++        if (!base || base == probe) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ void vfio_pci_write_config(PCIDevice *pdev,
+                            uint32_t addr, uint32_t val, int len)
+ {
+@@ -1434,6 +1470,22 @@
+ 
+     trace_vfio_pci_write_config(vdev->vbasedev.name, addr, val, len);
+ 
++    /*
++     * Some guests cannot represent BARs larger than their allocator's probe
++     * limit and erase otherwise valid firmware assignments.  This opt-in mode
++     * freezes BAR addresses after firmware has enabled memory decoding.  It is
++     * deliberately a device property, not a vendor/device special case.
++     */
++    if (vdev->fw_resources_locked &&
++        ranges_overlap(addr, len, PCI_BASE_ADDRESS_0, 24)) {
++        return;
++    }
++    if (vdev->fw_resources_locked && !vdev->fw_resource_reset &&
++        addr == PCI_COMMAND && len >= 1) {
++        val |= vdev->fw_resource_command;
++        val_le = cpu_to_le32(val);
++    }
++
+     /* Write everything to VFIO, let it filter out what we can't write */
+     ret = vfio_pci_config_space_write(vdev, addr, len, &val_le);
+     if (ret != len) {
+@@ -1497,6 +1549,31 @@
+         /* Write everything to QEMU to keep emulated bits correct */
+         pci_default_write_config(pdev, addr, val, len);
+     }
++
++    if (vdev->preserve_fw_resources && !vdev->fw_resources_locked) {
++        bool ready = (pci_get_word(pdev->config + PCI_COMMAND) &
++                      PCI_COMMAND_MEMORY) &&
++                     vfio_pci_bars_have_final_addresses(pdev);
++
++        vdev->fw_resources_locked = ready;
++        if (ready) {
++            int bar;
++
++            for (bar = 0; bar < PCI_ROM_SLOT; bar++) {
++                vdev->fw_resource_bars[bar] = pci_get_long(
++                    pdev->config + PCI_BASE_ADDRESS_0 + bar * 4);
++            }
++            vdev->fw_resource_command = PCI_COMMAND_MEMORY;
++            for (bar = 0; bar < PCI_ROM_SLOT; bar++) {
++                if (pdev->io_regions[bar].size &&
++                    (pdev->io_regions[bar].type & PCI_BASE_ADDRESS_SPACE_IO)) {
++                    vdev->fw_resource_command |= PCI_COMMAND_IO;
++                }
++            }
++            error_report("%s: firmware BAR resources locked",
++                         vdev->vbasedev.name);
++        }
++    }
+ }
+ 
+ /*
+@@ -1944,6 +2021,12 @@
+     bar->type = pci_bar & (bar->ioport ? ~PCI_BASE_ADDRESS_IO_MASK :
+                                          ~PCI_BASE_ADDRESS_MEM_MASK);
+     bar->size = bar->region.size;
++    if (nr == 1 && vdev->guest_bar1_size &&
++        is_power_of_2(vdev->guest_bar1_size) &&
++        vdev->guest_bar1_size < bar->region.size) {
++        bar->size = vdev->guest_bar1_size;
++        bar->guest_alias = true;
++    }
+ 
+     /* IO regions are sync, memory can be async */
+     bar->region.post_wr = (bar->ioport == 0);
+@@ -1970,11 +2053,19 @@
+ 
+     bar->mr = g_new0(MemoryRegion, 1);
+     name = g_strdup_printf("%s base BAR %d", vdev->vbasedev.name, nr);
+-    memory_region_init_io(bar->mr, OBJECT(vdev), NULL, NULL, name, bar->size);
++    if (bar->guest_alias) {
++        memory_region_init_alias(bar->mr, OBJECT(vdev), name,
++                                 bar->region.mem, 0, bar->size);
++    } else {
++        memory_region_init_io(bar->mr, OBJECT(vdev), NULL, NULL, name,
++                              bar->size);
++    }
+     g_free(name);
+ 
+     if (bar->region.size) {
+-        memory_region_add_subregion(bar->mr, 0, bar->region.mem);
++        if (!bar->guest_alias) {
++            memory_region_add_subregion(bar->mr, 0, bar->region.mem);
++        }
+ 
+         if (vfio_region_mmap(&bar->region)) {
+             error_report("Failed to mmap %s BAR %d. Performance may be slow",
+@@ -2004,7 +2095,7 @@
+ 
+         vfio_bar_quirk_exit(vdev, i);
+         vfio_region_exit(&bar->region);
+-        if (bar->region.size) {
++        if (bar->region.size && !bar->guest_alias) {
+             memory_region_del_subregion(bar->mr, bar->region.mem);
+         }
+     }
+@@ -2682,6 +2773,9 @@
+ 
+     vfio_disable_interrupts(vdev);
+ 
++    /* A reset must be able to disable decoding temporarily. */
++    vdev->fw_resource_reset = true;
++
+     /*
+      * Stop any ongoing DMA by disconnecting I/O, MMIO, and bus master.
+      * Also put INTx Disable in known state.
+@@ -2735,6 +2829,44 @@
+     }
+ 
+     vfio_quirk_reset(vdev);
++
++}
++
++static void vfio_pci_post_config_reset(PCIDevice *pdev)
++{
++    VFIOPCIDevice *vdev = VFIO_PCI_DEVICE(pdev);
++    int bar;
++
++    vdev->fw_resource_reset = false;
++    if (!vdev->fw_resources_locked) {
++        return;
++    }
++
++    for (bar = 0; bar < PCI_ROM_SLOT; bar++) {
++        pci_default_write_config(pdev, PCI_BASE_ADDRESS_0 + bar * 4,
++                                 vdev->fw_resource_bars[bar], 4);
++    }
++    vfio_pci_write_config(pdev, PCI_COMMAND,
++                          pci_get_word(pdev->config + PCI_COMMAND) |
++                          vdev->fw_resource_command, 2);
++    error_report("%s: restored BARs cmd=%04x enabled=%d pm=%d "
++                 "cfg=%08x/%08x:%08x/%08x:%08x/%08x "
++                 "map=%"PRIx64"/%"PRIx64"/%"PRIx64"/%"PRIx64,
++                 vdev->vbasedev.name,
++                 pci_get_word(pdev->config + PCI_COMMAND), pdev->enabled,
++                 pdev->pm_cap ?
++                 pci_get_word(pdev->config + pdev->pm_cap + PCI_PM_CTRL) &
++                 PCI_PM_CTRL_STATE_MASK : 0,
++                 pci_get_long(pdev->config + PCI_BASE_ADDRESS_0),
++                 pci_get_long(pdev->config + PCI_BASE_ADDRESS_1),
++                 pci_get_long(pdev->config + PCI_BASE_ADDRESS_2),
++                 pci_get_long(pdev->config + PCI_BASE_ADDRESS_3),
++                 pci_get_long(pdev->config + PCI_BASE_ADDRESS_4),
++                 pci_get_long(pdev->config + PCI_BASE_ADDRESS_5),
++                 (uint64_t)pdev->io_regions[0].addr,
++                 (uint64_t)pdev->io_regions[1].addr,
++                 (uint64_t)pdev->io_regions[3].addr,
++                 (uint64_t)pdev->io_regions[5].addr);
+ }
+ 
+ bool vfio_pci_host_match(PCIHostDeviceAddress *addr, const char *name)
+@@ -3821,6 +3953,10 @@
+                      TYPE_IOMMUFD_BACKEND, IOMMUFDBackend *),
+ #endif
+     DEFINE_PROP_BOOL("skip-vsc-check", VFIOPCIDevice, skip_vsc_check, true),
++    DEFINE_PROP_BOOL("x-preserve-fw-resources", VFIOPCIDevice,
++                     preserve_fw_resources, false),
++    DEFINE_PROP_SIZE("x-guest-bar1-size", VFIOPCIDevice,
++                     guest_bar1_size, 0),
+     DEFINE_PROP_UINT16("x-vpasid-cap-offset", VFIOPCIDevice,
+                        vpasid_cap_offset, 0),
+ };
+@@ -3846,6 +3982,7 @@
+     dc->vmsd = &vfio_cpr_pci_vmstate;
+     dc->desc = "VFIO-based PCI device assignment";
+     pdc->realize = vfio_pci_realize;
++    pdc->post_config_reset = vfio_pci_post_config_reset;
+ 
+     object_class_property_set_description(klass, /* 1.3 */
+                                           "host",
+--- a/include/hw/pci/pcie_port.h
++++ b/include/hw/pci/pcie_port.h
+@@ -66,6 +66,9 @@
+     /* broken ACPI hotplug compat knob to preserve 6.1 ABI intact */
+     bool        hide_native_hotplug_cap;
+ 
++    /* Keep an occupied virtual slot present for guests that clear status. */
++    bool        force_slot_present;
++
+     QLIST_ENTRY(PCIESlot) next;
+ };
+ 
+--- a/include/hw/pci/pcie.h
++++ b/include/hw/pci/pcie.h
+@@ -108,6 +108,7 @@
+ 
+ void pcie_cap_slot_init(PCIDevice *dev, PCIESlot *s);
+ void pcie_cap_slot_reset(PCIDevice *dev);
++void pcie_cap_slot_force_present(PCIDevice *dev);
+ void pcie_cap_slot_get(PCIDevice *dev, uint16_t *slt_ctl, uint16_t *slt_sta);
+ void pcie_cap_slot_write_config(PCIDevice *dev,
+                                 uint16_t old_slt_ctl, uint16_t old_slt_sta,
+--- a/hw/pci/pcie_port.c
++++ b/hw/pci/pcie_port.c
+@@ -209,6 +209,8 @@
+     DEFINE_PROP_BOOL("hotplug", PCIESlot, hotplug, true),
+     DEFINE_PROP_BOOL("x-do-not-expose-native-hotplug-cap", PCIESlot,
+                      hide_native_hotplug_cap, false),
++    DEFINE_PROP_BOOL("x-force-slot-present", PCIESlot,
++                     force_slot_present, false),
+ };
+ 
+ static void pcie_slot_class_init(ObjectClass *oc, const void *data)
+--- a/hw/pci/pcie.c
++++ b/hw/pci/pcie.c
+@@ -787,6 +787,20 @@
+ 
+     pcie_cap_update_power(dev);
+     hotplug_event_update_event_status(dev);
++
++    if (PCIE_SLOT(dev)->force_slot_present) {
++        pcie_cap_slot_force_present(dev);
++    }
++}
++
++void pcie_cap_slot_force_present(PCIDevice *dev)
++{
++    uint8_t *exp_cap = dev->config + dev->exp.exp_cap;
++
++    pci_word_test_and_set_mask(exp_cap + PCI_EXP_SLTSTA,
++                               PCI_EXP_SLTSTA_PDS);
++    pci_word_test_and_set_mask(exp_cap + PCI_EXP_LNKSTA,
++                               PCI_EXP_LNKSTA_DLLLA);
+ }
+ 
+ void pcie_cap_slot_get(PCIDevice *dev, uint16_t *slt_ctl, uint16_t *slt_sta)
+--- a/hw/pci-bridge/pcie_root_port.c
++++ b/hw/pci-bridge/pcie_root_port.c
+@@ -39,6 +39,9 @@
+     pci_bridge_write_config(d, address, val, len);
+     rp_aer_vector_update(d);
+     pcie_cap_slot_write_config(d, slt_ctl, slt_sta, address, val, len);
++    if (PCIE_SLOT(d)->force_slot_present) {
++        pcie_cap_slot_force_present(d);
++    }
+     pcie_aer_write_config(d, address, val, len);
+     pcie_aer_root_write_config(d, address, val, len, root_cmd);
+ }
+--- a/hw/pci-bridge/gen_pcie_root_port.c
++++ b/hw/pci-bridge/gen_pcie_root_port.c
+@@ -37,8 +37,37 @@
+ 
+     /* additional resources to reserve */
+     PCIResReserve res_reserve;
++    bool preserve_fw_resources;
++    bool fw_resources_locked;
+ };
+ 
++static PCIConfigWriteFunc *gen_rp_parent_config_write;
++
++static void gen_rp_write_config(PCIDevice *d, uint32_t address,
++                                uint32_t val, int len)
++{
++    GenPCIERootPort *grp = GEN_PCIE_ROOT_PORT(d);
++
++    if (grp->fw_resources_locked &&
++        ranges_overlap(address, len, PCI_IO_BASE,
++                       PCI_PREF_LIMIT_UPPER32 + 4 - PCI_IO_BASE)) {
++        return;
++    }
++    if (grp->fw_resources_locked && address == PCI_COMMAND && len >= 1) {
++        val |= pci_get_word(d->config + PCI_COMMAND) &
++               (PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
++    }
++
++    gen_rp_parent_config_write(d, address, val, len);
++
++    if (grp->preserve_fw_resources && !grp->fw_resources_locked &&
++        (pci_get_word(d->config + PCI_COMMAND) & PCI_COMMAND_MEMORY) &&
++        pci_get_long(d->config + PCI_PREF_BASE_UPPER32) != UINT32_MAX &&
++        pci_get_long(d->config + PCI_PREF_LIMIT_UPPER32) != 0) {
++        grp->fw_resources_locked = true;
++    }
++}
++
+ static uint8_t gen_rp_aer_vector(const PCIDevice *d)
+ {
+     return 0;
+@@ -133,6 +162,8 @@
+                                 speed, PCIE_LINK_SPEED_16),
+     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", PCIESlot,
+                                 width, PCIE_LINK_WIDTH_32),
++    DEFINE_PROP_BOOL("x-preserve-fw-resources", GenPCIERootPort,
++                     preserve_fw_resources, false),
+ };
+ 
+ static void gen_rp_dev_class_init(ObjectClass *klass, const void *data)
+@@ -147,6 +178,9 @@
+     dc->vmsd = &vmstate_rp_dev;
+     device_class_set_props(dc, gen_rp_props);
+ 
++    gen_rp_parent_config_write = k->config_write;
++    k->config_write = gen_rp_write_config;
++
+     device_class_set_parent_realize(dc, gen_rp_realize, &rpc->parent_realize);
+ 
+     rpc->aer_vector = gen_rp_aer_vector;
