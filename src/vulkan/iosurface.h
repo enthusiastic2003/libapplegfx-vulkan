@@ -56,6 +56,11 @@ typedef struct lagfx_vk_iosurface {
      * buffer (guest_map.c); NULL until then. map_failed: don't retry. */
     struct lagfx_guest_map *gmap;
     uint8_t map_failed;
+    /* sum_valid: the image equals the guest memory whose checksum is mem_sum
+     * (set by a GPU-copy write-back or upload, cleared whenever the image
+     * changes), so an upload finding the same checksum is skipped. */
+    uint8_t sum_valid;
+    uint64_t mem_sum;
 } lagfx_vk_iosurface_t;
 
 lagfx_status_t lagfx_vk_iosurface_create(struct lagfx_vk_state *vk,

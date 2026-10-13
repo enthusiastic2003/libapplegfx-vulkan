@@ -25,6 +25,7 @@
 static struct {
     unsigned long targets, created, clears, writebacks, skipped_storage, uploads;
     unsigned long mapped_uploads, mapped_writebacks;   /* GPU copies (guest_map_copy) */
+    unsigned long skipped_uploads;                     /* guest memory unchanged */
     unsigned long long wb_bytes, up_bytes;
     double clear_ms, wb_ms, up_ms;
     unsigned long events;
@@ -44,10 +45,11 @@ static void stats_tick(void) {
     last = now;
     LAGFX_WARN("guest_texture stats: targets=%lu created=%lu clears=%lu (%.0f ms) "
                "writebacks=%lu (%llu KiB, %.0f ms) skipped(storage)=%lu uploads=%lu (%llu KiB) "
-               "upload_ms=%.0f mapped: uploads=%lu writebacks=%lu",
+               "upload_ms=%.0f mapped: uploads=%lu writebacks=%lu unchanged=%lu",
                stats.targets, stats.created, stats.clears, stats.clear_ms, stats.writebacks,
                stats.wb_bytes / 1024u, stats.wb_ms, stats.skipped_storage, stats.uploads,
-               stats.up_bytes / 1024u, stats.up_ms, stats.mapped_uploads, stats.mapped_writebacks);
+               stats.up_bytes / 1024u, stats.up_ms, stats.mapped_uploads, stats.mapped_writebacks,
+               stats.skipped_uploads);
 }
 
 void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref) {
@@ -263,6 +265,7 @@ static lagfx_vk_iosurface_t *ensure_image(lagfx_protocol_t *p, lagfx_task_entry_
             e->gpu_addr = where;
             e->backing_dirty = 0u;
             cur->gpu_drawn = 0u;
+            cur->sum_valid = 0u;
             *created = true;
             return cur;
         }
@@ -409,6 +412,7 @@ lagfx_vk_iosurface_t *lagfx_guest_texture_target(lagfx_protocol_t *p,
         ios->upload_gen = task->cmdbuf_gen + 1u;
     /* Rendered into: the GPU copy is now the authoritative one. */
     ios->gpu_drawn = 1u;
+    ios->sum_valid = 0u;
     return ios;
 }
 
@@ -435,6 +439,42 @@ static bool read_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *t
 static bool guest_map_copy(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
                            struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                            const lagfx_texture_object_t *obj, bool to_image);
+static bool texture_mapping(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
+                            struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                            const lagfx_texture_object_t *obj, VkDeviceSize *off_out,
+                            VkDeviceSize *len_out);
+
+/* A fast 64-bit checksum of `n` bytes (four independent lanes, so it runs
+ * near memory speed); used to tell whether guest memory changed. */
+static uint64_t mem_checksum(const uint8_t *b, size_t n) {
+    const uint64_t k = 0x9e3779b97f4a7c15ull;
+    uint64_t h[4] = { k, k ^ 1u, k ^ 2u, k ^ 3u };
+    size_t i = 0;
+    for (; i + 32u <= n; i += 32u) {
+        uint64_t w[4];
+        memcpy(w, b + i, 32);
+        for (int l = 0; l < 4; l++) {
+            uint64_t x = h[l] ^ w[l];
+            h[l] = ((x << 29) | (x >> 35)) * k;
+        }
+    }
+    uint64_t t = 0;
+    for (; i < n; i++) t = (t << 8) ^ b[i] ^ (t >> 56);
+    uint64_t r = h[0] ^ (h[1] * 3u) ^ (h[2] * 5u) ^ (h[3] * 7u) ^ t ^ (uint64_t)n;
+    return (r ^ (r >> 31)) * k;
+}
+
+/* The checksum of the texture's mapped guest memory; false when unmapped. */
+static bool texture_checksum(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
+                             struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                             const lagfx_texture_object_t *obj, uint64_t *sum) {
+    VkDeviceSize off = 0, len = 0;
+    if (getenv("LAGFX_DISABLE_UPLOAD_SKIP")
+        || !texture_mapping(p, mem_task, vk, ios, obj, &off, &len))
+        return false;
+    *sum = mem_checksum(ios->gmap->base + off, (size_t)len);
+    return true;
+}
 
 /* Copy the texture's guest memory (rows of bytes_per_row) into the image. */
 static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
@@ -449,9 +489,21 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
     }
     size_t tight = (size_t)obj->width * bpp;
     if (obj->bytes_per_row < tight) return false;
-    /* the GPU copies straight from guest memory where it can */
+    /* the GPU copies straight from guest memory where it can; nothing to
+     * copy when the memory still matches the image (written back or
+     * uploaded since and unchanged) */
     double t0 = now_ms();
-    if (!getenv("LAGFX_DUMP_WB") && guest_map_copy(p, mem_task, vk, ios, obj, true)) {
+    uint64_t sum = 0;
+    bool summed = !getenv("LAGFX_DUMP_WB") && texture_checksum(p, mem_task, vk, ios, obj, &sum);
+    if (summed && ios->sum_valid && !ios->gpu_drawn && sum == ios->mem_sum) {
+        stats.skipped_uploads++;
+        stats.up_ms += now_ms() - t0;
+        stats_tick();
+        return true;
+    }
+    if (summed && guest_map_copy(p, mem_task, vk, ios, obj, true)) {
+        ios->mem_sum = sum;
+        ios->sum_valid = 1u;
         stats.up_ms += now_ms() - t0;
         stats.uploads++;
         stats.up_bytes += (unsigned long long)tight * obj->height;
@@ -479,6 +531,7 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
     }
     if (ok) dump_image("up", task, ref, obj, px, tight);
     if (ok) ok = lagfx_vk_iosurface_upload_pixels(vk, ios, px, tight * obj->height) == LAGFX_OK;
+    ios->sum_valid = 0u;   /* the image changed; its checksum isn't known */
     free(px);
     stats.uploads++;
     stats.up_bytes += (unsigned long long)tight * obj->height;
@@ -538,9 +591,14 @@ static bool submit_wait(struct lagfx_vk_state *vk, VkCommandBuffer cb) {
  * False when the texture can't be mapped (the caller copies instead). The
  * mapping is kept with the image and checked against the task's page table
  * on each use. */
-static bool guest_map_copy(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
-                           struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
-                           const lagfx_texture_object_t *obj, bool to_image) {
+/* The texture's guest memory mapped into this process (ios->gmap, made or
+ * checked against the task's page table here): *off is texel (0,0) in it,
+ * *len the bytes from there to the end of the last row. False when the
+ * texture can't be mapped. */
+static bool texture_mapping(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
+                            struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                            const lagfx_texture_object_t *obj, VkDeviceSize *off_out,
+                            VkDeviceSize *len_out) {
     lagfx_device_t *dev = (lagfx_device_t *)p->dev;
     uint32_t bpp = lagfx_metal_pixel_format_bytes(obj->pixel_format);
     if (!vk->have_host_import || !dev->desc.shell.ram_fd || ios->map_failed
@@ -580,6 +638,18 @@ static bool guest_map_copy(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_ta
     }
     free(gpa);
     if (!ios->gmap) return false;
+    *off_out = off;
+    *len_out = end - start;
+    return true;
+}
+
+static bool guest_map_copy(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
+                           struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                           const lagfx_texture_object_t *obj, bool to_image) {
+    VkDeviceSize off = 0, len = 0;
+    uint32_t bpp = lagfx_metal_pixel_format_bytes(obj->pixel_format);
+    if (!texture_mapping(p, mem_task, vk, ios, obj, &off, &len)) return false;
+    (void)len;
 
     VkCommandBuffer cb = VK_NULL_HANDLE;
     if (lagfx_vk_cmdbuf_alloc(vk, &cb) != LAGFX_OK) return false;
@@ -716,6 +786,7 @@ lagfx_vk_iosurface_t *lagfx_guest_texture_snapshot(struct lagfx_vk_state *vk,
 bool lagfx_guest_texture_clear(struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
                                const double rgba[4]) {
     if (!vk || !ios || ios->image == VK_NULL_HANDLE) return false;
+    ios->sum_valid = 0u;
     double t0 = now_ms();
     VkCommandBuffer cb = VK_NULL_HANDLE;
     if (lagfx_vk_cmdbuf_alloc(vk, &cb) != LAGFX_OK) return false;
@@ -825,6 +896,13 @@ static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     bool ok = true;
     if (!getenv("LAGFX_DUMP_WB") && guest_map_copy(p, mem_task, vk, ios, &obj, false)) {
         stats.mapped_writebacks++;
+        /* the memory now equals the image: remember its checksum */
+        uint64_t sum = 0;
+        ios->sum_valid = 0u;
+        if (obj.surface_id != 0u && texture_checksum(p, mem_task, vk, ios, &obj, &sum)) {
+            ios->mem_sum = sum;
+            ios->sum_valid = 1u;
+        }
         goto written;
     }
     lagfx_vk_render_target_t rt;

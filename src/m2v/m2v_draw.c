@@ -2410,6 +2410,7 @@ image_done:
         for (uint32_t m = 0; m < nimg; m++) {
             outimg[m].ios->layout = VK_IMAGE_LAYOUT_GENERAL;
             outimg[m].ios->gpu_drawn = 1u;
+            outimg[m].ios->sum_valid = 0u;
             lagfx_guest_texture_mark_written(task, outimg[m].ref);
         }
     }

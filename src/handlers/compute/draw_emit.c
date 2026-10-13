@@ -898,6 +898,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                                task->pending_draw.instance_count)) {
                 tgt->layout = (VkImageLayout)lay;
                 tgt->gpu_drawn = 1u;
+                tgt->sum_valid = 0u;
                 if (getenv("LAGFX_DRAWMAP"))
                     LAGFX_WARN("DRAWRES t%u tgt=0x%x pipe=0x%x path=m2v st=0 prim=%u start=%d count=%u inst=%u",
                                task->id, task->render_pass_desc.target_ref,
@@ -1369,7 +1370,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                           task->pending_pipeline.n_spv_bindings);
                 if (active_rt == &perpass_rt) {
                     perpass_real_draw = true;
-                    if (perpass_ios) perpass_ios->gpu_drawn = 1u;
+                    if (perpass_ios) perpass_ios->gpu_drawn = 1u, perpass_ios->sum_valid = 0u;
                 }
                 if (getenv("LAGFX_FRAME_ON_SWAP") == NULL) lagfx_display_signal_frame_ready(display);
             } else {
@@ -1435,7 +1436,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                       op, task->pending_pipeline.reference, vc, vstride);
             if (active_rt == &perpass_rt) {
                 perpass_real_draw = true;
-                if (perpass_ios) perpass_ios->gpu_drawn = 1u;
+                if (perpass_ios) perpass_ios->gpu_drawn = 1u, perpass_ios->sum_valid = 0u;
             }
             if (getenv("LAGFX_FRAME_ON_SWAP") == NULL) lagfx_display_signal_frame_ready(display);
         } else {
@@ -1458,7 +1459,7 @@ void lagfx_emit_pending_draw(lagfx_protocol_t *p, lagfx_task_entry_t *task,
                       op, task->pending_pipeline.reference, vc);
             if (active_rt == &perpass_rt) {
                 perpass_real_draw = true;
-                if (perpass_ios) perpass_ios->gpu_drawn = 1u;
+                if (perpass_ios) perpass_ios->gpu_drawn = 1u, perpass_ios->sum_valid = 0u;
             }
             if (getenv("LAGFX_FRAME_ON_SWAP") == NULL) lagfx_display_signal_frame_ready(display);
         } else {
