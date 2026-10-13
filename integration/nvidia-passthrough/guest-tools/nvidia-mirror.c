@@ -16,7 +16,8 @@ int main(void)
                ids[i], CGDisplayPixelsWide(ids[i]), CGDisplayPixelsHigh(ids[i]),
                CGDisplayVendorNumber(ids[i]), CGDisplayModelNumber(ids[i]),
                CGDisplayIsMain(ids[i]), CGDisplayMirrorsDisplay(ids[i]));
-        if (CGDisplayVendorNumber(ids[i]) == 0x2157) {
+        /* the capture card on HDMI (0x2157), or NVRMFB's forced EDID "NVS" (0x3ad3) */
+        if (CGDisplayVendorNumber(ids[i]) == 0x2157 || CGDisplayVendorNumber(ids[i]) == 0x3ad3) {
             nvidia = ids[i];
         }
     }

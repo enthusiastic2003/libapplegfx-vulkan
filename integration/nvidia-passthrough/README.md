@@ -45,9 +45,10 @@ reported Metal 3 with 8 GB VRAM.
 - `guest-tools/nvidia-mirror.c`: makes NVIDIA HDMI primary and mirrors the VGA
   display from it (hardware mirror); keeps both at a shared mode, so the
   NVIDIA display cannot switch to a 5K mode whose frames don't fit a slot.
-- `nullmoth-nvscan.patch`: the NullMoth driver change (NVRMFB) that publishes
-  the scanout through ivshmem and has the GPU copy the frames; the same commit
-  is on the local `nvscan` branch of `downloads/src/nvidia-macos-driver`.
+- `nullmoth-nvscan.patch`: the NullMoth driver changes (NVRMFB): the scanout
+  published through ivshmem with GPU copies, the cursor, and a forced display
+  when nothing is connected. The same commits are the `nvscan` branch of
+  github.com/enthusiastic2003/nvidia-macos-driver (on NullMoth 1.14.7).
 - `qemu-nvscan-display.c`: QEMU's `nvscan-display` device (committed in
   mos-qemu as `hw/display/nvscan-display.c`; `build-qemu.sh` copies it from
   there into the QEMU tree).
@@ -117,10 +118,17 @@ Notes:
 
 - NullMoth turns on its flip path about 60 s after the display is armed;
   until then QEMU shows the VGA mirror.
-- The GPU drives a head only with an HDMI sink attached (here a USB capture
-  card; a dummy plug would do). If the boot logs
-  `NVRM-fb: dpy 0/1 0x100: connected 0`, the sink was not seen: restart the
-  VM (after `gpu-reset.sh`).
+- No monitor is needed on HDMI. The GPU drives a head only with a sink on a
+  connector, so with `nvscan=1` and nothing connected NVRMFB forces the first
+  connector connected through NVKMS (`forceConnected` + `overrideEdid`) with a
+  built-in EDID: "NVSCAN", one mode, 1920x1080 at 60 Hz. The boot then logs
+  `nothing connected - FORCED connected with the built-in 1920x1080 EDID`.
+  A real monitor on the port is used as it is.
+- The cursor is a hardware plane, not part of the frames: NVRMFB publishes
+  its image, hotspot, position and visibility in the header, and
+  nvscan-display defines it as the window's pointer (GTK draws it on the
+  host, so it moves at host speed). GTK may show red and blue swapped in
+  coloured cursors.
 - In this setup the driver placed BAR1 at 4 GiB itself
   (`bar1: PLACED — BAR1 4096 MB`), started the card in 500 ms and armed the
   display before its 60 s headless check.

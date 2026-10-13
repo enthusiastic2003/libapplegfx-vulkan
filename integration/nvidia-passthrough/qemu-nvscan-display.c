@@ -34,6 +34,9 @@
 #define NVSCAN_VERSION      1u
 #define NVSCAN_X8R8G8B8     1u
 #define NVSCAN_MAX_SLOTS    2u
+#define NVSCAN_SLOT_BYTES   (32u * 1024 * 1024)
+#define NVSCAN_CURSOR_MAX   256u
+#define NVSCAN_CURSOR_OFFSET (4096ull + 2ull * NVSCAN_SLOT_BYTES)
 
 typedef struct NVScanHeader {
     uint64_t magic;
@@ -50,6 +53,17 @@ typedef struct NVScanHeader {
     uint64_t frame_sequence;
     uint64_t frame_time_ns;
     uint64_t dropped_frames;
+    /* The guest's hardware cursor: image (straight ARGB) at NVSCAN_CURSOR_OFFSET. */
+    uint32_t cursor_width;
+    uint32_t cursor_height;
+    uint32_t cursor_hot_x;
+    uint32_t cursor_hot_y;
+    int32_t cursor_x;           /* the image's top-left */
+    int32_t cursor_y;
+    uint32_t cursor_visible;
+    uint32_t cursor_pad;
+    uint64_t cursor_image_sequence;
+    uint64_t cursor_state_sequence;
 } NVScanHeader;
 
 #define TYPE_NVSCAN_DISPLAY "nvscan-display"
@@ -67,6 +81,11 @@ struct NVScanDisplay {
     uint64_t size;
     uint64_t shown_sequence;    /* last frame put on the console; 0 = none */
     bool showing_frames;
+
+    QEMUCursor *cursor;         /* the guest's cursor image */
+    uint64_t cursor_image_sequence;
+    uint64_t cursor_state_sequence;
+    bool cursor_shown;
 };
 
 /* Make the console's surface width x height, x8r8g8b8. */
@@ -130,6 +149,56 @@ static bool nvscan_show_frame(NVScanDisplay *s)
     return true;
 }
 
+/*
+ * The guest's cursor is a hardware plane, not part of the frames: it becomes
+ * the console's cursor, which a UI with an absolute pointer (GTK) draws as the
+ * host pointer itself.
+ */
+static void nvscan_update_cursor(NVScanDisplay *s)
+{
+    NVScanHeader *h = (NVScanHeader *)s->base;
+    bool redefine = false;
+
+    uint64_t image_seq = qatomic_load_acquire(&h->cursor_image_sequence);
+    if (image_seq && image_seq != s->cursor_image_sequence) {
+        uint32_t w = h->cursor_width, ht = h->cursor_height;
+        if (w && ht && w <= NVSCAN_CURSOR_MAX && ht <= NVSCAN_CURSOR_MAX &&
+            NVSCAN_CURSOR_OFFSET + (uint64_t)w * ht * 4 <= s->size) {
+            QEMUCursor *c = cursor_alloc(w, ht);
+            c->hot_x = MIN(h->cursor_hot_x, w - 1);
+            c->hot_y = MIN(h->cursor_hot_y, ht - 1);
+            memcpy(c->data, s->base + NVSCAN_CURSOR_OFFSET, (size_t)w * ht * 4);
+            if (s->cursor) {
+                cursor_unref(s->cursor);
+            }
+            s->cursor = c;
+            redefine = true;
+        }
+        s->cursor_image_sequence = image_seq;
+    }
+
+    uint64_t state_seq = qatomic_load_acquire(&h->cursor_state_sequence);
+    if (state_seq == s->cursor_state_sequence && !redefine) {
+        return;
+    }
+    s->cursor_state_sequence = state_seq;
+    bool visible = h->cursor_visible && s->cursor;
+    if (visible != s->cursor_shown || redefine) {
+        if (visible) {
+            dpy_cursor_define(s->con, s->cursor);
+        } else {
+            QEMUCursor *hidden = cursor_builtin_hidden();
+            dpy_cursor_define(s->con, hidden);
+            cursor_unref(hidden);
+        }
+        s->cursor_shown = visible;
+    }
+    if (s->cursor) {
+        dpy_mouse_set(s->con, h->cursor_x + s->cursor->hot_x,
+                      h->cursor_y + s->cursor->hot_y, visible);
+    }
+}
+
 /* Before frames arrive: mirror the fallback console. */
 static void nvscan_show_fallback(NVScanDisplay *s)
 {
@@ -161,6 +230,8 @@ static void nvscan_gfx_update(void *opaque)
     }
     if (!live) {
         nvscan_show_fallback(s);
+    } else {
+        nvscan_update_cursor(s);
     }
 }
 
@@ -184,7 +255,11 @@ static void nvscan_reset(void *opaque)
 
     qatomic_set(&h->magic, 0);
     qatomic_set(&h->frame_sequence, 0);
+    qatomic_set(&h->cursor_image_sequence, 0);
+    qatomic_set(&h->cursor_state_sequence, 0);
     s->shown_sequence = 0;
+    s->cursor_image_sequence = 0;
+    s->cursor_state_sequence = 0;
 }
 
 static void nvscan_realize(DeviceState *dev, Error **errp)
@@ -211,6 +286,10 @@ static void nvscan_unrealize(DeviceState *dev)
     NVScanDisplay *s = NVSCAN_DISPLAY(dev);
 
     qemu_unregister_reset(nvscan_reset, s);
+    if (s->cursor) {
+        cursor_unref(s->cursor);
+        s->cursor = NULL;
+    }
     graphic_console_close(s->con);
 }
 
