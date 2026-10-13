@@ -129,6 +129,49 @@ bool lagfx_task_translate(lagfx_protocol_t *p,
     return true;
 }
 
+bool lagfx_task_translate_pages(lagfx_protocol_t *p,
+                                const lagfx_task_entry_t *task,
+                                uint64_t va, uint32_t npages,
+                                uint64_t *out_gpa) {
+    if (!task || task->root_page_pfn == 0u || (va & 0xfffu) != 0u) return false;
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    if (!dev || !dev->desc.shell.read_memory) return false;
+    void *op = dev->desc.shell.opaque;
+    uint8_t header[8];
+    if (!dev->desc.shell.read_memory(op, task->root_page_pfn << 12, 8, header)) return false;
+    uint32_t l1_pfn = lagfx_le32(header + 0), levels = lagfx_le32(header + 4);
+    if (l1_pfn == 0u || levels == 0u || levels > 4u) return false;
+
+    uint32_t done = 0;
+    uint8_t leaf[4096];
+    while (done < npages) {
+        uint64_t page_idx = (va >> 12) + done;
+        /* walk the interior levels down to the leaf node */
+        uint32_t node_pfn = l1_pfn;
+        for (int shift = (int)(levels - 1u) * 10; shift > 0; shift -= 10) {
+            uint8_t pte_buf[4];
+            uint64_t pte_gpa = ((uint64_t)node_pfn << 12) + ((page_idx >> shift) & 0x3ffu) * 4u;
+            if (!dev->desc.shell.read_memory(op, pte_gpa, 4, pte_buf)) return false;
+            uint32_t pte = lagfx_le32(pte_buf);
+            if (pte == 0u || (pte & 0x80000000u)) return false;
+            node_pfn = pte & 0x7fffffffu;
+        }
+        /* this leaf node's run of entries in one read */
+        uint32_t first = (uint32_t)(page_idx & 0x3ffu);
+        uint32_t n = 1024u - first;
+        if (n > npages - done) n = npages - done;
+        if (!dev->desc.shell.read_memory(op, ((uint64_t)node_pfn << 12) + first * 4u, n * 4u, leaf))
+            return false;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t pte = lagfx_le32(leaf + i * 4u);
+            if (pte == 0u) return false;
+            out_gpa[done + i] = (uint64_t)(pte & 0x7fffffffu) << 12;
+        }
+        done += n;
+    }
+    return true;
+}
+
 /* === Inner segment + PGCmdHeader walker ==========================
  *
  * Per inner-opcode-format.md:

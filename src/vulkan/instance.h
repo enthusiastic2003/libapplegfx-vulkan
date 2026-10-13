@@ -59,6 +59,11 @@ struct lagfx_vk_state {
     bool have_shader_object;
     bool have_extended_dynamic_state3;
     bool have_buffer_device_address;  /* M2 host-flattening (PhysicalStorageBuffer) */
+    /* VK_EXT_external_memory_host: guest memory mapped into this process is
+     * imported as buffers the GPU copies textures to and from (guest_map.c). */
+    bool have_host_import;
+    VkDeviceSize host_import_align;
+    PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_props;
 
     /* Phase 1.B.2: command pool bound to the graphics queue family.
      * Created at lagfx_vk_init completion, destroyed in

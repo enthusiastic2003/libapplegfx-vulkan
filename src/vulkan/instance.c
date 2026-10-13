@@ -423,6 +423,9 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
         has_ext(dext, dext_n, "VK_EXT_shader_object");
     bool want_eds3 =
         has_ext(dext, dext_n, "VK_EXT_extended_dynamic_state3");
+    bool want_host_import =
+        has_ext(dext, dext_n, "VK_EXT_external_memory_host")
+        && !getenv("LAGFX_DISABLE_HOST_IMPORT");
 
     if (want_dyn_rendering) {
         wanted_dev_exts[wanted_dev_n++] = "VK_KHR_dynamic_rendering";
@@ -442,6 +445,8 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
         LAGFX_LOG("vk_init: VK_EXT_extended_dynamic_state3 missing — "
                   "later phases may need fallbacks");
     }
+    if (want_host_import)
+        wanted_dev_exts[wanted_dev_n++] = "VK_EXT_external_memory_host";
     free(dext);
 
     /* === Device features =========================================
@@ -619,6 +624,20 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
     s->have_timeline_semaphore     = have_timeline_semaphore_feat;
     s->have_descriptor_indexing    = have_descriptor_indexing;
     s->have_shader_object          = want_shader_object;
+    if (want_host_import) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+        };
+        VkPhysicalDeviceProperties2 pp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp,
+        };
+        vkGetPhysicalDeviceProperties2(s->phys_device, &pp);
+        s->get_host_pointer_props = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+            vkGetDeviceProcAddr(s->device, "vkGetMemoryHostPointerPropertiesEXT");
+        s->host_import_align = hp.minImportedHostPointerAlignment;
+        s->have_host_import = s->get_host_pointer_props && s->host_import_align
+                              && s->host_import_align <= 4096u;
+    }
     s->have_extended_dynamic_state3= want_eds3;
     s->have_buffer_device_address  = have_buffer_device_address;
     LAGFX_LOG("vk_init: bufferDeviceAddress=%d (M2 host-flattening %s)",

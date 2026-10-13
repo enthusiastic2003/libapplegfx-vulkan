@@ -24,8 +24,9 @@
 /* Periodic warn-level summary, so cost is visible without info logging. */
 static struct {
     unsigned long targets, created, clears, writebacks, skipped_storage, uploads;
+    unsigned long mapped_uploads, mapped_writebacks;   /* GPU copies (guest_map_copy) */
     unsigned long long wb_bytes, up_bytes;
-    double clear_ms, wb_ms;
+    double clear_ms, wb_ms, up_ms;
     unsigned long events;
 } stats;
 
@@ -36,12 +37,17 @@ static double now_ms(void) {
 }
 
 static void stats_tick(void) {
-    if (++stats.events % 500u) return;
+    /* every 500 events, and at least once a second while busy */
+    static double last;
+    double now = now_ms();
+    if (++stats.events % 500u && now - last < 1000.0) return;
+    last = now;
     LAGFX_WARN("guest_texture stats: targets=%lu created=%lu clears=%lu (%.0f ms) "
-               "writebacks=%lu (%llu KiB, %.0f ms) skipped(storage)=%lu uploads=%lu (%llu KiB)",
+               "writebacks=%lu (%llu KiB, %.0f ms) skipped(storage)=%lu uploads=%lu (%llu KiB) "
+               "upload_ms=%.0f mapped: uploads=%lu writebacks=%lu",
                stats.targets, stats.created, stats.clears, stats.clear_ms, stats.writebacks,
                stats.wb_bytes / 1024u, stats.wb_ms, stats.skipped_storage, stats.uploads,
-               stats.up_bytes / 1024u);
+               stats.up_bytes / 1024u, stats.up_ms, stats.mapped_uploads, stats.mapped_writebacks);
 }
 
 void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref) {
@@ -58,6 +64,7 @@ void lagfx_guest_texture_mark_written(lagfx_task_entry_t *task, uint32_t ref) {
 #ifdef LAGFX_HAVE_VULKAN
 #include "vulkan/command.h"
 #include "vulkan/instance.h"
+#include "vulkan/guest_map.h"
 #include "vulkan/render_target.h"
 
 /* Read an IOSurface record: one plane's worth, then the rest of the plane
@@ -425,6 +432,10 @@ static bool read_texture_memory(lagfx_protocol_t *p, const lagfx_task_entry_t *t
     return len == 0u;
 }
 
+static bool guest_map_copy(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
+                           struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                           const lagfx_texture_object_t *obj, bool to_image);
+
 /* Copy the texture's guest memory (rows of bytes_per_row) into the image. */
 static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *task,
                               const lagfx_task_entry_t *mem_task,
@@ -438,6 +449,16 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
     }
     size_t tight = (size_t)obj->width * bpp;
     if (obj->bytes_per_row < tight) return false;
+    /* the GPU copies straight from guest memory where it can */
+    double t0 = now_ms();
+    if (!getenv("LAGFX_DUMP_WB") && guest_map_copy(p, mem_task, vk, ios, obj, true)) {
+        stats.up_ms += now_ms() - t0;
+        stats.uploads++;
+        stats.up_bytes += (unsigned long long)tight * obj->height;
+        stats.mapped_uploads++;
+        stats_tick();
+        return true;
+    }
     uint8_t *px = malloc(tight * obj->height);
     if (!px) return false;
     bool ok = true;
@@ -461,6 +482,7 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
     free(px);
     stats.uploads++;
     stats.up_bytes += (unsigned long long)tight * obj->height;
+    stats.up_ms += now_ms() - t0;
     stats_tick();
     if (!ok)
         LAGFX_WARN("guest_texture: upload of ref 0x%x (task %u) failed", ref, task->id);
@@ -507,6 +529,107 @@ static bool submit_wait(struct lagfx_vk_state *vk, VkCommandBuffer cb) {
     bool ok = lagfx_vk_queue_submit(vk, 1, &si, fence) == VK_SUCCESS
               && vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 2000000000ull) == VK_SUCCESS;
     vkDestroyFence(vk->device, fence, NULL);
+    return ok;
+}
+
+/* Copy between the image and the texture's guest memory on the GPU: the
+ * guest pages are mapped into this process and imported as a buffer
+ * (guest_map.c), so neither the CPU nor read/write_memory touch the texels.
+ * False when the texture can't be mapped (the caller copies instead). The
+ * mapping is kept with the image and checked against the task's page table
+ * on each use. */
+static bool guest_map_copy(lagfx_protocol_t *p, const lagfx_task_entry_t *mem_task,
+                           struct lagfx_vk_state *vk, lagfx_vk_iosurface_t *ios,
+                           const lagfx_texture_object_t *obj, bool to_image) {
+    lagfx_device_t *dev = (lagfx_device_t *)p->dev;
+    uint32_t bpp = lagfx_metal_pixel_format_bytes(obj->pixel_format);
+    if (!vk->have_host_import || !dev->desc.shell.ram_fd || ios->map_failed
+        || getenv("LAGFX_DISABLE_GUEST_MAP"))
+        return false;
+    if (bpp == 0u || obj->n_place != 1u || obj->bytes_per_row % bpp != 0u
+        || obj->pixel_format == 250u || obj->pixel_format == 252u
+        || ios->width != obj->width || ios->height != obj->height)
+        return false;
+    uint64_t start = (obj->place[0].page << 12) + obj->base_offset;
+    uint64_t end = start + (uint64_t)obj->bytes_per_row * (obj->height - 1u)
+                 + (uint64_t)obj->width * bpp;
+    if (end - (obj->place[0].page << 12) > obj->place[0].size) return false;
+    uint64_t first = start & ~0xfffull;
+    uint32_t npages = (uint32_t)((end - first + 0xfffu) >> 12);
+    VkDeviceSize off = start - first;
+    if (npages == 0u || npages > 65536u || off % bpp != 0u || off % 4u != 0u) return false;
+
+    uint64_t *gpa = malloc(sizeof(uint64_t) * npages);
+    if (!gpa) return false;
+    if (!lagfx_task_translate_pages(p, mem_task, first, npages, gpa)) {
+        free(gpa);
+        return false;
+    }
+    if (!lagfx_guest_map_same(ios->gmap, npages, gpa)) {
+        lagfx_guest_map_destroy(vk, ios->gmap);
+        ios->gmap = NULL;
+        int *fd = malloc(sizeof(int) * npages);
+        uint64_t *fo = malloc(sizeof(uint64_t) * npages);
+        bool ok = fd && fo;
+        for (uint32_t i = 0; ok && i < npages; i++)
+            ok = dev->desc.shell.ram_fd(dev->desc.shell.opaque, gpa[i], &fd[i], &fo[i]);
+        if (ok) ios->gmap = lagfx_guest_map_create(vk, npages, gpa, fd, fo);
+        free(fd);
+        free(fo);
+        if (!ios->gmap) ios->map_failed = 1u;
+    }
+    free(gpa);
+    if (!ios->gmap) return false;
+
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (lagfx_vk_cmdbuf_alloc(vk, &cb) != LAGFX_OK) return false;
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(cb, &bi);
+    VkImageLayout keep = ios->layout;
+    VkImageLayout xfer = to_image ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                  : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    VkImageMemoryBarrier b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = to_image ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = to_image ? VK_IMAGE_LAYOUT_UNDEFINED : keep, .newLayout = xfer,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = ios->image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &b);
+    VkBufferImageCopy c = {
+        .bufferOffset = off, .bufferRowLength = obj->bytes_per_row / bpp,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { obj->width, obj->height, 1 },
+    };
+    if (to_image)
+        vkCmdCopyBufferToImage(cb, ios->gmap->buffer, ios->image, xfer, 1, &c);
+    else
+        vkCmdCopyImageToBuffer(cb, ios->image, xfer, ios->gmap->buffer, 1, &c);
+    /* an upload leaves the image ready to sample; a write-back puts it back */
+    VkImageLayout after = to_image || keep == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : keep;
+    b.srcAccessMask = to_image ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b.oldLayout = xfer;
+    b.newLayout = after;
+    VkBufferMemoryBarrier hb = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = ios->gmap->buffer, .size = VK_WHOLE_SIZE,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL,
+                         to_image ? 0u : 1u, &hb, 1, &b);
+    vkEndCommandBuffer(cb);
+    bool ok = submit_wait(vk, cb);
+    lagfx_vk_cmdbuf_free(vk, cb);
+    if (ok) ios->layout = after;
     return ok;
 }
 
@@ -698,12 +821,17 @@ static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     lagfx_vk_iosurface_t *ios = e ? (lagfx_vk_iosurface_t *)e->host_handle : NULL;
     if (!ios || ios->width != obj.width || ios->height != obj.height) return;
 
+    size_t tight = (size_t)obj.width * bpp, stride = 0;
+    bool ok = true;
+    if (!getenv("LAGFX_DUMP_WB") && guest_map_copy(p, mem_task, vk, ios, &obj, false)) {
+        stats.mapped_writebacks++;
+        goto written;
+    }
     lagfx_vk_render_target_t rt;
     if (lagfx_vk_render_target_wrap(ios->image, ios->view, ios->memory, ios->width,
                                     ios->height, ios->format, &rt) != LAGFX_OK)
         return;
     rt.layout = ios->layout;
-    size_t tight = (size_t)obj.width * bpp, stride = 0;
     uint8_t *px = malloc(tight * obj.height);
     if (!px) return;
     if (lagfx_vk_render_target_readback(vk, &rt, px, tight * obj.height, &stride) != LAGFX_OK) {
@@ -713,11 +841,11 @@ static void writeback_one(lagfx_protocol_t *p, lagfx_task_entry_t *task,
     ios->layout = rt.layout;
     if (stride == 0u) stride = tight;
     dump_image("wb", task, ref, &obj, px, stride);
-    bool ok = true;
     for (uint32_t y = 0; y < obj.height && ok; y++)
         ok = write_texture_memory(p, mem_task, &obj, (uint64_t)y * obj.bytes_per_row,
                                   px + (size_t)y * stride, tight);
     free(px);
+written:
     stats.writebacks++;
     stats.wb_bytes += (unsigned long long)tight * obj.height;
     stats.wb_ms += now_ms() - t0;

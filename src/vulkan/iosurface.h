@@ -52,6 +52,10 @@ typedef struct lagfx_vk_iosurface {
     /* Copy of this image taken before a draw that samples the image it
      * renders into (same size and format; reused). */
     struct lagfx_vk_iosurface *snapshot;
+    /* The guest memory last uploaded from or written back to, imported as a
+     * buffer (guest_map.c); NULL until then. map_failed: don't retry. */
+    struct lagfx_guest_map *gmap;
+    uint8_t map_failed;
 } lagfx_vk_iosurface_t;
 
 lagfx_status_t lagfx_vk_iosurface_create(struct lagfx_vk_state *vk,

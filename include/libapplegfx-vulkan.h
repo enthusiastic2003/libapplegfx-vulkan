@@ -134,6 +134,14 @@ typedef struct {
 
     /* Raise an MSI-X interrupt on `vector` back to the guest. */
     void (*raise_interrupt)(void *opaque, uint32_t vector);
+
+    /* The file holding guest-physical page `guest_physical_address` and the
+     * byte offset of that address in it (guest RAM backed by a shareable
+     * memfd). Optional: lets the library map texture memory into its own
+     * address space and have the GPU copy to and from it. NULL or false:
+     * the read_memory/write_memory copies are used. */
+    bool (*ram_fd)(void *opaque, uint64_t guest_physical_address,
+                   int *fd, uint64_t *offset);
 } lagfx_shell_callbacks_t;
 
 /* === Direct task memory API ===================================

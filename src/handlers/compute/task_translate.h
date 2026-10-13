@@ -39,4 +39,12 @@ bool lagfx_task_translate(lagfx_protocol_t *p,
                           uint64_t dev_addr,
                           uint64_t *out_gpa);
 
+/* The GPA of each of `npages` consecutive pages from page-aligned `va`,
+ * reading each leaf node's entries in one read. False when a page isn't
+ * present or the walk ends early (lagfx_task_translate handles that). */
+bool lagfx_task_translate_pages(lagfx_protocol_t *p,
+                                const lagfx_task_entry_t *task,
+                                uint64_t va, uint32_t npages,
+                                uint64_t *out_gpa);
+
 #endif /* LAGFX_HANDLERS_COMPUTE_TASK_TRANSLATE_H */

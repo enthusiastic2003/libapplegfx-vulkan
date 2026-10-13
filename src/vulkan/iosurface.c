@@ -7,6 +7,7 @@
  */
 
 #include "iosurface.h"
+#include "guest_map.h"
 #include "instance.h"
 #include "command.h"
 #include "common/log.h"
@@ -482,6 +483,7 @@ void lagfx_vk_iosurface_destroy(struct lagfx_vk_state *vk,
         free(ios);
         return;
     }
+    lagfx_guest_map_destroy(vk, ios->gmap);
     if (ios->view != VK_NULL_HANDLE) {
         vkDestroyImageView(vk->device, ios->view, NULL);
     }
