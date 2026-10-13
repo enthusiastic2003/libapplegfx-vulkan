@@ -21,6 +21,7 @@
 
 #include "common/le.h"
 #include "common/log.h"
+#include "common/perf.h"
 #include "device.h"
 #include "handlers/compute/compute_draw_internal.h"
 #include "handlers/compute/guest_texture.h"
@@ -295,7 +296,7 @@ static bool submit_once(struct lagfx_vk_state *vk, VkCommandBuffer cb) {
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
                         .pCommandBuffers = &cb };
     bool ok = vkCreateFence(vk->device, &fci, NULL, &f) == VK_SUCCESS
-              && vkQueueSubmit(vk->graphics_queue, 1, &si, f) == VK_SUCCESS
+              && lagfx_vk_queue_submit(vk, 1, &si, f) == VK_SUCCESS
               && vkWaitForFences(vk->device, 1, &f, VK_TRUE, 2000000000ull) == VK_SUCCESS;
     if (f) vkDestroyFence(vk->device, f, NULL);
     return ok;
@@ -1790,12 +1791,13 @@ image_done:
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &post);
     vkEndCommandBuffer(cb);
 
+    uint64_t perf_t0 = getenv("LAGFX_PERF") ? lagfx_now_ns() : 0u;
     VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
                         .pCommandBuffers = &cb };
     if (vkCreateFence(vk->device, &fci, NULL, &fence) == VK_SUCCESS
-        && vkQueueSubmit(vk->graphics_queue, 1, &si, fence) == VK_SUCCESS) {
+        && lagfx_vk_queue_submit(vk, 1, &si, fence) == VK_SUCCESS) {
         VkResult wr2 = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 10000000000ull);
         if (wr2 == VK_SUCCESS) {
             ok = true;
@@ -1809,6 +1811,10 @@ image_done:
         }
     }
     if (fence) vkDestroyFence(vk->device, fence, NULL);
+    if (perf_t0) {
+        vk->perf_frame_draw_ns += lagfx_now_ns() - perf_t0;
+        vk->perf_frame_draws += 1u;
+    }
     lagfx_vk_cmdbuf_free(vk, cb);
     *target_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 out:
@@ -2366,12 +2372,13 @@ image_done:
     vkEndCommandBuffer(cb);
 
     {
+        uint64_t perf_t0 = getenv("LAGFX_PERF") ? lagfx_now_ns() : 0u;
         VkFence fence = VK_NULL_HANDLE;
         VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
                             .pCommandBuffers = &cb };
         if (vkCreateFence(vk->device, &fci, NULL, &fence) == VK_SUCCESS
-            && vkQueueSubmit(vk->graphics_queue, 1, &si, fence) == VK_SUCCESS) {
+            && lagfx_vk_queue_submit(vk, 1, &si, fence) == VK_SUCCESS) {
             VkResult wr2 = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 10000000000ull);
             if (wr2 == VK_SUCCESS) {
                 ok = true;
@@ -2381,6 +2388,10 @@ image_done:
             }
         }
         if (fence) vkDestroyFence(vk->device, fence, NULL);
+        if (perf_t0) {
+            vk->perf_frame_draw_ns += lagfx_now_ns() - perf_t0;
+            vk->perf_frame_draws += 1u;
+        }
     }
     if (ok) {
         /* the kernel's results: buffers back to guest memory, images marked */

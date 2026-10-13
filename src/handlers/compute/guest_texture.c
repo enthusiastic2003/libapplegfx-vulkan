@@ -504,7 +504,7 @@ static bool submit_wait(struct lagfx_vk_state *vk, VkCommandBuffer cb) {
         .commandBufferCount = 1,
         .pCommandBuffers = &cb,
     };
-    bool ok = vkQueueSubmit(vk->graphics_queue, 1, &si, fence) == VK_SUCCESS
+    bool ok = lagfx_vk_queue_submit(vk, 1, &si, fence) == VK_SUCCESS
               && vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 2000000000ull) == VK_SUCCESS;
     vkDestroyFence(vk->device, fence, NULL);
     return ok;

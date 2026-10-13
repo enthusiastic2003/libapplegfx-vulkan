@@ -284,7 +284,7 @@ lagfx_status_t lagfx_vk_display_present_surface(
             .commandBufferCount = 1,
             .pCommandBuffers    = &cb,
         };
-        VkResult vr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+        VkResult vr = lagfx_vk_queue_submit(vk, 1, &si, fence);
         if (vr != VK_SUCCESS) {
             LAGFX_ERR("display_blit: vkQueueSubmit failed (%d)", (int)vr);
             result = LAGFX_ERR_BACKEND;

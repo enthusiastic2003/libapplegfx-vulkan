@@ -191,7 +191,7 @@ lagfx_status_t lagfx_vk_clear_image(struct lagfx_vk_state *vk,
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     if (vkCreateFence(vk->device, &fci, NULL, &fence) != VK_SUCCESS) return LAGFX_ERR_BACKEND;
     lagfx_status_t st = LAGFX_OK;
-    if (vkQueueSubmit(vk->graphics_queue, 1, &si, fence) != VK_SUCCESS
+    if (lagfx_vk_queue_submit(vk, 1, &si, fence) != VK_SUCCESS
         || vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 1000000000ull) != VK_SUCCESS)
         st = LAGFX_ERR_BACKEND;
     vkDestroyFence(vk->device, fence, NULL);
@@ -276,7 +276,7 @@ lagfx_status_t lagfx_vk_composite_over(struct lagfx_vk_state *vk,
     if (vkCreateFence(dev, &fci, NULL, &fence) != VK_SUCCESS) { lagfx_vk_cmdbuf_free(vk, cb); return LAGFX_ERR_BACKEND; }
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &cb };
-    VkResult sr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+    VkResult sr = lagfx_vk_queue_submit(vk, 1, &si, fence);
     if (sr == VK_SUCCESS)
         vkWaitForFences(dev, 1, &fence, VK_TRUE, 1000000000ull);
     vkDestroyFence(dev, fence, NULL);

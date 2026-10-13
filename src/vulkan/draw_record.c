@@ -253,7 +253,7 @@ lagfx_status_t lagfx_vk_draw_record_and_submit_bound(
      * synchronous GPU round-trip (B3). At N draws/frame this is the prime
      * throughput suspect; aggregated per frame at readback. */
     uint64_t perf_t0 = getenv("LAGFX_PERF") ? lagfx_now_ns() : 0u;
-    vr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+    vr = lagfx_vk_queue_submit(vk, 1, &si, fence);
     if (vr != VK_SUCCESS) {
         LAGFX_ERR("draw_record_and_submit: vkQueueSubmit failed (%d)", (int)vr);
         vkDestroyFence(vk->device, fence, NULL);

@@ -575,7 +575,7 @@ lagfx_status_t lagfx_vk_render_target_readback(struct lagfx_vk_state *vk,
         .commandBufferCount = 1,
         .pCommandBuffers    = &cb,
     };
-    vr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+    vr = lagfx_vk_queue_submit(vk, 1, &si, fence);
     if (vr != VK_SUCCESS) {
         LAGFX_ERR("render_target_readback: vkQueueSubmit failed (%d)", (int)vr);
         result = LAGFX_ERR_BACKEND;

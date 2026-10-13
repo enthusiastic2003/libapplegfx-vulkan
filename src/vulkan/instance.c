@@ -634,6 +634,18 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
         free(s);
         return LAGFX_ERR_VULKAN_INIT;
     }
+    if (pthread_mutex_init(&s->queue_mutex, NULL) != 0) {
+        LAGFX_ERR("vk_init: failed to initialize Vulkan synchronization mutexes");
+        lagfx_vk_shutdown(s);
+        return LAGFX_ERR_BACKEND;
+    }
+    if (pthread_mutex_init(&s->cmd_pool_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&s->queue_mutex);
+        LAGFX_ERR("vk_init: failed to initialize Vulkan synchronization mutexes");
+        lagfx_vk_shutdown(s);
+        return LAGFX_ERR_BACKEND;
+    }
+    s->sync_mutexes_initialized = true;
 
     s->initialized = true;
     LAGFX_LOG("vk_init: device=%p queue=%p (fam=%u) shader_object=%d "
@@ -687,6 +699,15 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
     return LAGFX_OK;
 }
 
+VkResult lagfx_vk_queue_submit(struct lagfx_vk_state *vk, uint32_t submit_count,
+                               const VkSubmitInfo *submits, VkFence fence) {
+    if (!vk || !vk->sync_mutexes_initialized) return VK_ERROR_INITIALIZATION_FAILED;
+    pthread_mutex_lock(&vk->queue_mutex);
+    VkResult result = vkQueueSubmit(vk->graphics_queue, submit_count, submits, fence);
+    pthread_mutex_unlock(&vk->queue_mutex);
+    return result;
+}
+
 void lagfx_vk_shutdown(struct lagfx_vk_state *state) {
     if (!state) {
         return;
@@ -712,6 +733,11 @@ void lagfx_vk_shutdown(struct lagfx_vk_state *state) {
 #endif
     if (state->device != VK_NULL_HANDLE) {
         vkDestroyDevice(state->device, NULL);
+    }
+    if (state->sync_mutexes_initialized) {
+        pthread_mutex_destroy(&state->cmd_pool_mutex);
+        pthread_mutex_destroy(&state->queue_mutex);
+        state->sync_mutexes_initialized = false;
     }
     
     /* Destroy debug messenger before instance */

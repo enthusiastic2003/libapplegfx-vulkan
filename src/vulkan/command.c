@@ -126,7 +126,9 @@ lagfx_status_t lagfx_vk_cmdbuf_alloc(struct lagfx_vk_state *vk,
         .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = 1,
     };
+    pthread_mutex_lock(&vk->cmd_pool_mutex);
     VkResult vr = vkAllocateCommandBuffers(vk->device, &ai, out);
+    pthread_mutex_unlock(&vk->cmd_pool_mutex);
     if (vr != VK_SUCCESS) {
         LAGFX_ERR("cmdbuf_alloc: vkAllocateCommandBuffers failed "
                   "(VkResult=%d)", (int)vr);
@@ -143,7 +145,9 @@ void lagfx_vk_cmdbuf_free(struct lagfx_vk_state *vk, VkCommandBuffer cb) {
     if (vk->cmd_pool == VK_NULL_HANDLE || vk->device == VK_NULL_HANDLE) {
         return;
     }
+    pthread_mutex_lock(&vk->cmd_pool_mutex);
     vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cb);
+    pthread_mutex_unlock(&vk->cmd_pool_mutex);
 }
 
 lagfx_status_t lagfx_vk_submit_empty(struct lagfx_vk_state *vk) {
@@ -209,7 +213,7 @@ lagfx_status_t lagfx_vk_submit_empty(struct lagfx_vk_state *vk) {
         .commandBufferCount   = 1,
         .pCommandBuffers      = &cb,
     };
-    vr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+    vr = lagfx_vk_queue_submit(vk, 1, &si, fence);
     if (vr != VK_SUCCESS) {
         LAGFX_ERR("submit_empty: vkQueueSubmit failed (VkResult=%d)",
                   (int)vr);
@@ -352,7 +356,7 @@ lagfx_status_t lagfx_vk_end_frame(struct lagfx_vk_state *vk) {
         .commandBufferCount = 1,
         .pCommandBuffers    = &vk->frame_cmdbuf,
     };
-    vr = vkQueueSubmit(vk->graphics_queue, 1, &si, vk->frame_fence);
+    vr = lagfx_vk_queue_submit(vk, 1, &si, vk->frame_fence);
     if (vr != VK_SUCCESS) {
         LAGFX_ERR("end_frame: vkQueueSubmit failed (VkResult=%d)", (int)vr);
         lagfx_vk_cmdbuf_free(vk, vk->frame_cmdbuf);

@@ -165,7 +165,7 @@ lagfx_status_t lagfx_vk_cursor_upload_glyph(struct lagfx_vk_state *vk,
         .commandBufferCount = 1,
         .pCommandBuffers    = &cb,
     };
-    vr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+    vr = lagfx_vk_queue_submit(vk, 1, &si, fence);
     if (vr == VK_SUCCESS) {
         const uint64_t timeout_ns = 1ull * 1000ull * 1000ull * 1000ull;
         vr = vkWaitForFences(vk->device, 1, &fence, VK_TRUE, timeout_ns);

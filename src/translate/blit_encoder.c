@@ -240,7 +240,7 @@ lagfx_status_t lagfx_translate_blit_fill_texture_color(void *vk,
             .commandBufferCount = 1,
             .pCommandBuffers    = &cb,
         };
-        vkQueueSubmit(vk_impl->graphics_queue, 1, &si, fence);
+        lagfx_vk_queue_submit(vk_impl, 1, &si, fence);
         vkWaitForFences(vk_impl->device, 1, &fence, VK_TRUE, UINT64_MAX);
         vkDestroyFence(vk_impl->device, fence, NULL);
     } else {
@@ -427,7 +427,7 @@ lagfx_status_t lagfx_translate_blit_copy_texture_to_texture(void *vk,
             .commandBufferCount = 1,
             .pCommandBuffers    = &cb,
         };
-        vkQueueSubmit(vk_impl->graphics_queue, 1, &si, fence);
+        lagfx_vk_queue_submit(vk_impl, 1, &si, fence);
         vkWaitForFences(vk_impl->device, 1, &fence, VK_TRUE, UINT64_MAX);
         vkDestroyFence(vk_impl->device, fence, NULL);
     } else {

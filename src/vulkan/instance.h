@@ -21,6 +21,7 @@
 #include <stdint.h>
 
 #ifdef LAGFX_HAVE_VULKAN
+#  include <pthread.h>
 #  include <vulkan/vulkan.h>
 #endif
 
@@ -36,6 +37,9 @@ struct lagfx_vk_state {
     VkDevice         device;
     VkQueue          graphics_queue;
     uint32_t         graphics_queue_family;
+    pthread_mutex_t  queue_mutex;
+    pthread_mutex_t  cmd_pool_mutex;
+    bool             sync_mutexes_initialized;
 
     /* Selected physical-device properties, cached at init for logging
      * + later extension decisions. */
@@ -191,6 +195,12 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
 /* Tear down: pipeline resources + command pool + device + instance.
  * Safe on NULL. */
 void lagfx_vk_shutdown(struct lagfx_vk_state *state);
+
+#ifdef LAGFX_HAVE_VULKAN
+/* Vulkan requires external synchronization for VkQueue and VkCommandPool. */
+VkResult lagfx_vk_queue_submit(struct lagfx_vk_state *vk, uint32_t submit_count,
+                               const VkSubmitInfo *submits, VkFence fence);
+#endif
 
 #ifdef LAGFX_HAVE_VULKAN
 /* Stage 85b — create a host-visible STORAGE buffer and upload `data` (NULL ⇒

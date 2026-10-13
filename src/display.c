@@ -110,7 +110,7 @@ static void display_rt_tint(lagfx_display_t *disp) {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .commandBufferCount = 1, .pCommandBuffers = &cb,
             };
-            if (vkQueueSubmit(vk->graphics_queue, 1, &si, fence) == VK_SUCCESS)
+            if (lagfx_vk_queue_submit(vk, 1, &si, fence) == VK_SUCCESS)
                 vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 1000000000ull);
             if (fence != VK_NULL_HANDLE) vkDestroyFence(vk->device, fence, NULL);
             LAGFX_LOG("display_rt_tint: RT cleared teal once (raster-coverage test)");
@@ -760,7 +760,7 @@ lagfx_status_t lagfx_display_submit_clear_color(lagfx_display_t *display,
         .commandBufferCount = 1,
         .pCommandBuffers    = &cb,
     };
-    vr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+    vr = lagfx_vk_queue_submit(vk, 1, &si, fence);
     if (vr != VK_SUCCESS) {
         LAGFX_ERR("display_submit_clear: vkQueueSubmit failed (%d)", (int)vr);
         vkDestroyFence(vk->device, fence, NULL);
@@ -1118,7 +1118,7 @@ lagfx_status_t lagfx_display_overlay_cursor(lagfx_display_t *display) {
         .commandBufferCount = 1,
         .pCommandBuffers    = &cb,
     };
-    VkResult vr = vkQueueSubmit(vk->graphics_queue, 1, &si, fence);
+    VkResult vr = lagfx_vk_queue_submit(vk, 1, &si, fence);
     if (vr == VK_SUCCESS) {
         vkWaitForFences(vk->device, 1, &fence, VK_TRUE,
                         1000ull * 1000ull * 1000ull);
@@ -1444,7 +1444,7 @@ lagfx_status_t lagfx_display_submit_rendered_frame(
             .commandBufferCount = 1,
             .pCommandBuffers    = &cb,
         };
-        vr = vkQueueSubmit(vk->graphics_queue, 1, &si, slot->fence);
+        vr = lagfx_vk_queue_submit(vk, 1, &si, slot->fence);
         if (vr != VK_SUCCESS) {
             LAGFX_ERR("display_submit_rendered_frame: vkQueueSubmit failed (%d)",
                       (int)vr);
