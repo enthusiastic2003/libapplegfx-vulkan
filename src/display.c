@@ -34,6 +34,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+#ifdef LAGFX_HAVE_VULKAN
+static void dmabuf_image_destroy(lagfx_display_t *d, struct lagfx_vk_state *vk);
+#endif
 
 #ifdef LAGFX_HAVE_VULKAN
 #  include <vulkan/vulkan.h>
@@ -301,6 +306,7 @@ void lagfx_display_free(lagfx_display_t *display) {
             display_staging_slot_destroy(vk, s);
         }
         display->staging_size = 0;
+        dmabuf_image_destroy(display, vk);
     }
 #endif
 
@@ -352,6 +358,237 @@ void lagfx_display_set_presented(lagfx_display_t *display, uint8_t *px,
     set_frame_ready(display);
 }
 
+#ifdef LAGFX_HAVE_VULKAN
+#define DRM_FORMAT_XRGB8888 0x34325258u   /* 'XR24': B, G, R, x in memory */
+
+/* A linear, dma-buf exportable image of the render target's size. */
+static bool dmabuf_img_create(lagfx_display_t *d, struct lagfx_vk_state *vk,
+                              struct lagfx_display_dmabuf_img *im) {
+    uint64_t linear = 0;   /* DRM_FORMAT_MOD_LINEAR */
+    VkImageDrmFormatModifierListCreateInfoEXT ml = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+        .drmFormatModifierCount = 1, .pDrmFormatModifiers = &linear,
+    };
+    VkExternalMemoryImageCreateInfo ei = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, .pNext = &ml,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &ei,
+        .imageType = VK_IMAGE_TYPE_2D, .format = d->rt.format,
+        .extent = { d->rt.width, d->rt.height, 1u }, .mipLevels = 1u, .arrayLayers = 1u,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    im->fd = -1;
+    if (vkCreateImage(vk->device, &ici, NULL, &im->image) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(vk->device, im->image, &req);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(vk->phys_device, &mp);
+    /* device-local, and host-visible where it can be (integrated GPUs): a
+     * frame that only exists in guest memory is then copied in directly */
+    const VkMemoryPropertyFlags want[2] = {
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+            | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    };
+    uint32_t type = UINT32_MAX;
+    for (int w = 0; w < 2 && type == UINT32_MAX; w++)
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+            if ((req.memoryTypeBits & (1u << i))
+                && (mp.memoryTypes[i].propertyFlags & want[w]) == want[w]) {
+                type = i;
+                break;
+            }
+    if (type == UINT32_MAX) return false;
+    VkMemoryDedicatedAllocateInfo ded = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .image = im->image,
+    };
+    VkExportMemoryAllocateInfo ex = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .pNext = &ded,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    VkMemoryAllocateInfo ai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ex,
+        .allocationSize = req.size, .memoryTypeIndex = type,
+    };
+    if (vkAllocateMemory(vk->device, &ai, NULL, &im->memory) != VK_SUCCESS
+        || vkBindImageMemory(vk->device, im->image, im->memory, 0) != VK_SUCCESS)
+        return false;
+    if (mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+        (void)vkMapMemory(vk->device, im->memory, 0, VK_WHOLE_SIZE, 0, &im->map);
+
+    VkImageSubresource sub = { VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT, 0, 0 };
+    VkSubresourceLayout lay;
+    vkGetImageSubresourceLayout(vk->device, im->image, &sub, &lay);
+    VkImageDrmFormatModifierPropertiesEXT mod = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
+    };
+    if (vk->get_drm_modifier_props(vk->device, im->image, &mod) != VK_SUCCESS) return false;
+    VkMemoryGetFdInfoKHR fi = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = im->memory,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    if (vk->get_memory_fd(vk->device, &fi, &im->fd) != VK_SUCCESS || im->fd < 0) {
+        im->fd = -1;
+        return false;
+    }
+    im->stride = (uint32_t)lay.rowPitch;
+    im->offset = (uint32_t)lay.offset;
+    im->modifier = mod.drmFormatModifier;
+    return true;
+}
+
+static void dmabuf_image_destroy(lagfx_display_t *d, struct lagfx_vk_state *vk) {
+    for (int i = 0; i < 2; i++) {
+        struct lagfx_display_dmabuf_img *im = &d->dmabuf[i];
+        if (im->image) vkDestroyImage(vk->device, im->image, NULL);
+        if (im->memory) {
+            if (im->map) vkUnmapMemory(vk->device, im->memory);
+            vkFreeMemory(vk->device, im->memory, NULL);
+        }
+        if (im->fd > 0) close(im->fd);
+        *im = (struct lagfx_display_dmabuf_img){ .fd = -1 };
+    }
+    d->dmabuf_active = false;
+}
+
+bool lagfx_display_export_dmabuf(lagfx_display_t *display, lagfx_display_dmabuf_t *out) {
+    if (!display || display->magic != LAGFX_DISPLAY_MAGIC || !out || !display->device
+        || !display->device->vk || !display->device->vk->have_dmabuf_export)
+        return false;
+    struct lagfx_vk_state *vk = display->device->vk;
+    LAGFX_DISPLAY_RT_LOCK(display);
+    bool ok = display->rt_ready && display->rt.format == VK_FORMAT_B8G8R8A8_UNORM
+              && !display->dmabuf_failed;
+    /* the render target was made again at another size: so are the images
+     * (new fds, which the shell announces again) */
+    if (ok && display->dmabuf_active
+        && (display->dmabuf_width != display->rt.width
+            || display->dmabuf_height != display->rt.height)) {
+        vkDeviceWaitIdle(vk->device);
+        dmabuf_image_destroy(display, vk);
+    }
+    if (ok && !display->dmabuf_active) {
+        ok = dmabuf_img_create(display, vk, &display->dmabuf[0])
+             && dmabuf_img_create(display, vk, &display->dmabuf[1]);
+        if (ok) {
+            display->dmabuf_active = true;
+            display->dmabuf_front = 0;
+            display->dmabuf_width = display->rt.width;
+            display->dmabuf_height = display->rt.height;
+            LAGFX_WARN("display: frames go to two dma-bufs (%ux%u stride %u modifier 0x%llx)",
+                       display->rt.width, display->rt.height, display->dmabuf[0].stride,
+                       (unsigned long long)display->dmabuf[0].modifier);
+        } else {
+            dmabuf_image_destroy(display, vk);
+            display->dmabuf_failed = true;
+            LAGFX_WARN("display: can't export a dma-buf; copying frames out instead");
+        }
+    }
+    if (ok) {
+        const struct lagfx_display_dmabuf_img *im = &display->dmabuf[display->dmabuf_front];
+        *out = (lagfx_display_dmabuf_t){
+            .fd = im->fd,
+            .backing_width = display->rt.width, .backing_height = display->rt.height,
+            .width = display->rt.width, .height = display->rt.height,
+            .stride = im->stride, .offset = im->offset,
+            .fourcc = DRM_FORMAT_XRGB8888, .modifier = im->modifier,
+        };
+        /* only the guest's mode is shown (what the gutter crop blacks out
+         * on the copy path) */
+        if (display->scanout_valid && display->scanout_width && display->scanout_height
+            && display->scanout_width <= display->rt.width
+            && display->scanout_height <= display->rt.height) {
+            out->width = display->scanout_width;
+            out->height = display->scanout_height;
+        }
+    }
+    LAGFX_DISPLAY_RT_UNLOCK(display);
+    return ok;
+}
+
+/* Copy the render target into the image not shown, on the GPU, and make
+ * it the front. */
+static bool dmabuf_present(lagfx_display_t *d) {
+    struct lagfx_vk_state *vk = d->device->vk;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (lagfx_vk_cmdbuf_alloc(vk, &cb) != LAGFX_OK) return false;
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    LAGFX_DISPLAY_RT_LOCK(d);
+    if (d->rt.width != d->dmabuf_width || d->rt.height != d->dmabuf_height) {
+        /* resized since the export; the next export makes new ones */
+        LAGFX_DISPLAY_RT_UNLOCK(d);
+        lagfx_vk_cmdbuf_free(vk, cb);
+        return false;
+    }
+    uint32_t back = d->dmabuf_front ^ 1u;
+    vkBeginCommandBuffer(cb, &bi);
+    VkImageLayout rt_keep = d->rt.layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : d->rt.layout;
+    VkImageMemoryBarrier b[2] = {
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+          .oldLayout = d->rt.layout, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = d->rt.image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = d->dmabuf[back].image, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 2, b);
+    VkImageCopy c = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .extent = { d->rt.width, d->rt.height, 1u },
+    };
+    vkCmdCopyImage(cb, d->rt.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->dmabuf[back].image,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b[0].newLayout = rt_keep;
+    b[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    b[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, NULL, 0, NULL, 2, b);
+    vkEndCommandBuffer(cb);
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence = VK_NULL_HANDLE;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                        .pCommandBuffers = &cb };
+    bool ok = vkCreateFence(vk->device, &fci, NULL, &fence) == VK_SUCCESS
+              && lagfx_vk_queue_submit(vk, 1, &si, fence) == VK_SUCCESS
+              && vkWaitForFences(vk->device, 1, &fence, VK_TRUE, 2000000000ull) == VK_SUCCESS;
+    if (fence) vkDestroyFence(vk->device, fence, NULL);
+    if (ok) {
+        d->rt.layout = rt_keep;
+        d->dmabuf_front = back;
+    }
+    LAGFX_DISPLAY_RT_UNLOCK(d);
+    lagfx_vk_cmdbuf_free(vk, cb);
+    return ok;
+}
+#else
+bool lagfx_display_export_dmabuf(lagfx_display_t *display, lagfx_display_dmabuf_t *out) {
+    (void)display;
+    (void)out;
+    return false;
+}
+#endif
+
 lagfx_status_t lagfx_display_read_frame(lagfx_display_t *display,
                                          void *dst,
                                          size_t dst_size_bytes,
@@ -399,6 +636,28 @@ lagfx_status_t lagfx_display_read_frame(lagfx_display_t *display,
 
     /* The guest's presented frame wins over every other path. */
     LAGFX_DISPLAY_RT_LOCK(display);
+#ifdef LAGFX_HAVE_VULKAN
+    if (display->presented && !dst && display->dmabuf_active) {
+        /* a frame only in guest memory: into the dma-buf directly where it's
+         * host-visible (else it's dropped; the GPU frames follow) */
+        struct lagfx_display_dmabuf_img *im = &display->dmabuf[display->dmabuf_front ^ 1u];
+        if (im->map && display->presented_w <= display->rt.width
+            && display->presented_h <= display->rt.height) {
+            size_t row = (size_t)display->presented_w * 4u;
+            uint8_t *to = (uint8_t *)im->map + im->offset;
+            for (uint32_t y = 0; y < display->presented_h; y++)
+                memcpy(to + (size_t)y * im->stride, display->presented + y * row, row);
+            display->dmabuf_front ^= 1u;
+            if (new_frame_out) *new_frame_out = true;
+        }
+        free(display->presented);
+        display->presented = NULL;
+        display->new_frame_ready = false;
+        display->has_frame = 1;
+        LAGFX_DISPLAY_RT_UNLOCK(display);
+        return LAGFX_OK;
+    }
+#endif
     if (display->presented && dst) {
         size_t row = (size_t)display->presented_w * 4u;
         size_t bytes = row * display->presented_h;
@@ -500,6 +759,19 @@ lagfx_status_t lagfx_display_read_frame(lagfx_display_t *display,
                               (void *)display->device);
         display->new_frame_ready = false;
         return LAGFX_ERR_NO_FRAME;
+    }
+    if (!dst && display->dmabuf_active) {
+        /* the shell shows the dma-buf: copy the frame into it on the GPU */
+        if (!dmabuf_present(display)) {
+            LAGFX_ERR("display_read_frame: copy into the dma-buf failed");
+            return LAGFX_ERR_BACKEND;
+        }
+        const struct lagfx_display_dmabuf_img *fim = &display->dmabuf[display->dmabuf_front];
+        if (stride_out) *stride_out = fim->stride;
+        if (new_frame_out) *new_frame_out = true;
+        display->new_frame_ready = false;
+        display->has_frame = 1;
+        return LAGFX_OK;
     }
     if (!dst) {
         return LAGFX_ERR_INVALID_ARG;

@@ -64,6 +64,12 @@ struct lagfx_vk_state {
     bool have_host_import;
     VkDeviceSize host_import_align;
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_props;
+    /* VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf +
+     * VK_EXT_image_drm_format_modifier: the display image is exported as a
+     * dma-buf the shell shows directly (lagfx_display_export_dmabuf). */
+    bool have_dmabuf_export;
+    PFN_vkGetMemoryFdKHR get_memory_fd;
+    PFN_vkGetImageDrmFormatModifierPropertiesEXT get_drm_modifier_props;
 
     /* Phase 1.B.2: command pool bound to the graphics queue family.
      * Created at lagfx_vk_init completion, destroyed in

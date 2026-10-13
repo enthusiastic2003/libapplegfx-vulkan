@@ -95,6 +95,26 @@ struct lagfx_display {
      * concurrent access (VBlank tick + doorbell drain). */
     pthread_mutex_t rt_lock;
 
+#ifdef LAGFX_HAVE_VULKAN
+    /* lagfx_display_export_dmabuf: frames are copied (GPU) from rt into this
+     * linear exportable image, which the shell shows; no CPU readback. */
+    bool          dmabuf_active;
+    bool          dmabuf_failed;     /* don't try again */
+    /* two images: a frame is copied into the one not shown (front ^ 1),
+     * which then becomes the front, so the shell never reads an image
+     * being written */
+    struct lagfx_display_dmabuf_img {
+        VkImage        image;
+        VkDeviceMemory memory;
+        void          *map;          /* host-visible mapping, or NULL */
+        int            fd;
+        uint32_t       stride, offset;
+        uint64_t       modifier;
+    } dmabuf[2];
+    uint32_t      dmabuf_front;
+    uint32_t      dmabuf_width, dmabuf_height;   /* rt's size when made */
+#endif
+
     /* Latched "a new frame has rendered" flag. Set by the protocol
      * decoder (ops_display.c) when a clear-colour transaction has been
      * submitted + waited-on. Consumed + cleared by

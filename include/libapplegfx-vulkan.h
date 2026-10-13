@@ -331,6 +331,25 @@ LAGFX_EXPORT void lagfx_display_free(lagfx_display_t *display);
 /* Shell queries current cursor position. */
 LAGFX_EXPORT lagfx_coord_t lagfx_display_cursor_position(lagfx_display_t *display);
 
+/* The display image as a dma-buf (lagfx_display_export_dmabuf). */
+typedef struct {
+    int      fd;            /* owned by the library: dup() it to keep it */
+    uint32_t backing_width, backing_height;   /* the whole image */
+    uint32_t width, height; /* the visible part (the guest's mode), from (0,0) */
+    uint32_t stride, offset;
+    uint32_t fourcc;        /* DRM_FORMAT_XRGB8888 */
+    uint64_t modifier;      /* DRM format modifier (linear) */
+} lagfx_display_dmabuf_t;
+
+/* Switch the display to presenting into a dma-buf the shell shows directly
+ * (e.g. QEMU's dpy_gl_scanout_dmabuf), instead of copying frames out on the
+ * CPU. Afterwards lagfx_display_read_frame takes dst == NULL: it puts the
+ * latest frame into the dma-buf on the GPU and reports *new_frame_out.
+ * Call again to see a change of the visible size. False: not supported
+ * (keep using read_frame with a buffer). */
+LAGFX_EXPORT bool lagfx_display_export_dmabuf(lagfx_display_t *display,
+                                              lagfx_display_dmabuf_t *out);
+
 /* Read the current display surface into a caller-provided buffer.
  * Returns pixels in BGRA8 (matches QEMU's DisplaySurface format by
  * default) and writes the stride into *stride_out.

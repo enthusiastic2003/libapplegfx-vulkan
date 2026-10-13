@@ -415,7 +415,7 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
 
     /* Required (core-1.3 promoted but still enumerated as extensions
      * on some ICDs; ask explicitly for widest compatibility). */
-    const char *wanted_dev_exts[8];
+    const char *wanted_dev_exts[12];
     uint32_t    wanted_dev_n = 0;
     bool want_dyn_rendering =
         has_ext(dext, dext_n, "VK_KHR_dynamic_rendering");
@@ -426,6 +426,11 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
     bool want_host_import =
         has_ext(dext, dext_n, "VK_EXT_external_memory_host")
         && !getenv("LAGFX_DISABLE_HOST_IMPORT");
+    bool want_dmabuf =
+        has_ext(dext, dext_n, "VK_KHR_external_memory_fd")
+        && has_ext(dext, dext_n, "VK_EXT_external_memory_dma_buf")
+        && has_ext(dext, dext_n, "VK_EXT_image_drm_format_modifier")
+        && !getenv("LAGFX_DISABLE_DMABUF");
 
     if (want_dyn_rendering) {
         wanted_dev_exts[wanted_dev_n++] = "VK_KHR_dynamic_rendering";
@@ -447,6 +452,11 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
     }
     if (want_host_import)
         wanted_dev_exts[wanted_dev_n++] = "VK_EXT_external_memory_host";
+    if (want_dmabuf) {
+        wanted_dev_exts[wanted_dev_n++] = "VK_KHR_external_memory_fd";
+        wanted_dev_exts[wanted_dev_n++] = "VK_EXT_external_memory_dma_buf";
+        wanted_dev_exts[wanted_dev_n++] = "VK_EXT_image_drm_format_modifier";
+    }
     free(dext);
 
     /* === Device features =========================================
@@ -624,6 +634,13 @@ lagfx_status_t lagfx_vk_init(struct lagfx_vk_state **out,
     s->have_timeline_semaphore     = have_timeline_semaphore_feat;
     s->have_descriptor_indexing    = have_descriptor_indexing;
     s->have_shader_object          = want_shader_object;
+    if (want_dmabuf) {
+        s->get_memory_fd = (PFN_vkGetMemoryFdKHR)
+            vkGetDeviceProcAddr(s->device, "vkGetMemoryFdKHR");
+        s->get_drm_modifier_props = (PFN_vkGetImageDrmFormatModifierPropertiesEXT)
+            vkGetDeviceProcAddr(s->device, "vkGetImageDrmFormatModifierPropertiesEXT");
+        s->have_dmabuf_export = s->get_memory_fd && s->get_drm_modifier_props;
+    }
     if (want_host_import) {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
