@@ -9,10 +9,12 @@ VM=/home/sirjanh/vm
 PREFIX=$VM/prefix
 SRC=$VM/downloads/qemu/qemu-11.0.0
 MOS=$VM/downloads/src/mos-qemu
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-NV_PATCH=$SCRIPT_DIR/../qemu-11.0.0-nvidia-passthrough.patch
 JOBS=${JOBS:-3}
 MEMMAX=${MEMMAX:-2G}
+
+# Generic VFIO/PCIe changes for GPU passthrough (x-guest-bar1-size, x-force-slot-present,
+# x-preserve-fw-resources), kept with the passthrough setup in libapplegfx-vulkan.
+NV_PATCH=${NV_PATCH:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../qemu-11.0.0-nvidia-passthrough.patch}
 
 cd "$SRC"
 
@@ -28,6 +30,24 @@ fi
 # Device sources (idempotent).
 cp "$MOS"/hw/display/apple-gfx-pci-linux.c "$MOS"/hw/display/apple-gfx-common-linux.c \
    "$MOS"/hw/display/apple-gfx-linux.h hw/display/
+
+# nvscan-display: a passed-through GPU's scanout (shared memory) as a console.
+cp "$MOS"/hw/display/nvscan-display.c hw/display/
+if ! grep -q NVSCAN_DISPLAY hw/display/Kconfig; then
+    cat >> hw/display/Kconfig <<'EOF2'
+
+config NVSCAN_DISPLAY
+    bool
+    default y
+EOF2
+fi
+if ! grep -q NVSCAN_DISPLAY hw/display/meson.build; then
+    cat >> hw/display/meson.build <<'EOF2'
+
+# Guest scanout published in shared memory, shown as a console.
+system_ss.add(when: 'CONFIG_NVSCAN_DISPLAY', if_true: files('nvscan-display.c'))
+EOF2
+fi
 
 # No default option ROM: upstream mos ships Apple's extracted EFI ROM, which we don't use.
 # Boot display comes from the std VGA device instead.

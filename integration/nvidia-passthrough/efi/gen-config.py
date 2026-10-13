@@ -30,6 +30,8 @@ NV_BOOT_ARGS = ("nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_
                 "amfi=0x80 ipc_control_port_options=0")
 if NV:
     BOOT_ARGS = BOOT_ARGS + " " + NV_BOOT_ARGS
+    if os.environ.get("NVSCAN") == "1":
+        BOOT_ARGS += " nvscan=1"
     if os.environ.get("NVNOGO") == "1":   # start the card by hand: nvrmctl go 2
         BOOT_ARGS += " -nvrmnogo"
 

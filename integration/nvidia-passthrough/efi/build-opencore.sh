@@ -10,6 +10,7 @@ STAGE=$HERE/stage
 IMG=$VM/images/opencore.img
 [ "${NV:-0}" != 0 ] && IMG=$VM/images/opencore-nv.img
 export NV=${NV:-0}
+export NVSCAN=${NVSCAN:-0}
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/EFI/BOOT" "$STAGE/EFI/OC"/{ACPI,Drivers,Kexts,Tools}

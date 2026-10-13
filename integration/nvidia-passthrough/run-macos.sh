@@ -41,6 +41,20 @@ fi
 # preservation properties even when the PVG device itself is disabled.
 [ "${NVPT:-0}" = 1 ] && QEMU=$VM/prefix/bin/qemu-system-x86_64
 
+# NVSCAN=1 exposes a host-backed 128 MiB ivshmem BAR to the guest.  The
+# NullMoth scanout bridge writes a small header and two 32 MiB frame slots;
+# tools/qemu-scanout/nvscan-viewer displays the newest completed slot.
+NVSCAN_ARGS=()
+if [ "${NVSCAN:-0}" = 1 ]; then
+    NVSCAN_FILE=${NVSCAN_FILE:-/dev/shm/nvscanout}
+    truncate -s 128M "$NVSCAN_FILE"
+    NVSCAN_ARGS=(-object memory-backend-file,id=nvscan,size=128M,mem-path="$NVSCAN_FILE",share=on
+                 -device ivshmem-plain,memdev=nvscan)
+    # QEMU shows the frames itself: console 0 (so it must come before the VGA
+    # device), mirroring VGA until the guest driver publishes frames
+    VGA_ARGS=(-device nvscan-display,id=nvscan-display,memdev=nvscan,fallback=vga "${VGA_ARGS[@]}")
+fi
+
 INSTALLER_ARGS=()
 if [ "${INSTALLER:-1}" = 1 ]; then
     INSTALLER_ARGS=(-drive id=installer,if=none,format=raw,file="$IMG/BaseSystem.img"
@@ -110,6 +124,7 @@ exec "$QEMU" \
     "${VGA_ARGS[@]}" \
     "${PVG_ARGS[@]}" \
     "${NVPT_ARGS[@]}" \
+    "${NVSCAN_ARGS[@]}" \
     "${DISPLAY_ARGS[@]}" \
     "${VNC_ARGS[@]}" \
     -chardev file,id=serial0,path="$IMG/serial.log" \

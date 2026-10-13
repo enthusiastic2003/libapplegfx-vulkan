@@ -1,0 +1,661 @@
+From dcca4fe68d6758167b79a8a5a5b81207473ff33e Mon Sep 17 00:00:00 2001
+From: Sirjan Hansda <sirjan.20031231@gmail.com>
+Date: Tue, 13 Oct 2026 18:01:21 +0530
+Subject: [PATCH] NVRMFB: publish the scanout to the host through ivshmem
+ (nvscan)
+
+With nvscan=1 and a QEMU ivshmem device, NVRMFB copies every flipped
+frame into the shared memory: a one-page header and two 32 MiB slots.
+QEMU's nvscan-display device (or tools/qemu-scanout/nvscan-viewer)
+shows it, so a passed-through GPU's output appears on the host without
+a capture card.
+
+- The GPU copies the frames: NVRM's copy-engine page-off (nvSurfPageoff)
+  writes the flipped surface straight to the slot's guest-physical pages.
+  A CPU copy reads VRAM through BAR1, which KVM maps uncached: ~70 MB/s,
+  115 ms a 1080p frame inside the flip. The GPU copy takes 0.8 ms.
+  The CPU copy stays as the fallback; a timing line every 120 frames.
+- The ivshmem device's memory decoding is enabled: no macOS driver
+  claims it, so its BAR was assigned but writes went nowhere.
+- Flip ABI v3 carries the surface's kernel address (sourceKva) for the
+  CPU fallback.
+- build/fb_build.sh builds NVRMFB alone; accel_build.sh tolerates a
+  missing RM compile_cmds.sh.
+
+Claude-Session: https://claude.ai/code/session_017YK5S8VabduTJdwQ14fPhS
+---
+ build/accel_build.sh                     |   7 +-
+ build/fb_build.sh                        |  48 +++++++
+ kexts/NVRM/accel/nvrm-accel.cpp          |   5 +-
+ kexts/NVRM/nvrm_gpuva_abi.h              |   3 +-
+ kexts/NVRMFB/fb/nvrm-fb.cpp              | 159 +++++++++++++++++++++++
+ kexts/NVRMFB/nvrm_gpuva_abi.h            |   3 +-
+ kexts/NVRMFB/nvscanout_abi.h             |  49 +++++++
+ tools/qemu-scanout/Makefile              |  15 +++
+ tools/qemu-scanout/nvscan-test-pattern.c |  58 +++++++++
+ tools/qemu-scanout/nvscan-viewer.c       | 115 ++++++++++++++++
+ 10 files changed, 456 insertions(+), 6 deletions(-)
+ create mode 100755 build/fb_build.sh
+ create mode 100644 kexts/NVRMFB/nvscanout_abi.h
+ create mode 100644 tools/qemu-scanout/Makefile
+ create mode 100644 tools/qemu-scanout/nvscan-test-pattern.c
+ create mode 100644 tools/qemu-scanout/nvscan-viewer.c
+
+diff --git a/build/accel_build.sh b/build/accel_build.sh
+index b5a1680..9e7a459 100644
+--- a/build/accel_build.sh
++++ b/build/accel_build.sh
+@@ -1,5 +1,5 @@
+ #!/bin/bash
+-set -uo pipefail
++set -o pipefail
+ SRC=$1; OUT=$2; mkdir -p "$OUT/NVAccel.kext/Contents/MacOS"
+ OGKM=${OGKM:-$HOME/ogkm610}; RE=${RE:-$SRC/accel/re}   # the reconstructed IOGraphicsAccelerator2 / IOAccelerator headers ship in the repo
+ SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"; NV="$OGKM/src/nvidia"; KMS="$OGKM/src/nvidia-modeset"
+@@ -12,7 +12,10 @@ RMINC=( -I"$NV/arch/nvalloc/unix/include" -I"$NV/arch/nvalloc/common/inc" -I"$NV
+   -I"$OGKM/src/common/inc/displayport" -I"$OGKM/src/common/nvlink/inband/interface" )
+ KMSINC=( -I"$KMS/os-interface/include" -I"$KMS/kapi/interface" -I"$KMS/kapi/include" -I"$OGKM/src/common/unix/nvidia-push/interface" -I"$KMS/interface" -I"$KMS/include"
+          -I"$OGKM/src/common/unix/common/inc" -I"$OGKM/src/common/modeset" -I"$OGKM/src/common/unix/common/utils/interface" )
+-RMDEFS=(); while read -r d; do RMDEFS+=("$d"); done < <(head -1 "$NV/_out/Darwin_x86_64/compile_cmds.sh" | tr ' ' '\n' | grep -E '^-D' | sed -e 's/"//g' | grep -v -E '^-D(NVRM|_LANGUAGE_C)$')
++RMDEFS=()
++if [[ -f "$NV/_out/Darwin_x86_64/compile_cmds.sh" ]]; then
++  while read -r d; do RMDEFS+=("$d"); done < <(head -1 "$NV/_out/Darwin_x86_64/compile_cmds.sh" | tr ' ' '\n' | grep -E '^-D' | sed -e 's/"//g' | grep -v -E '^-D(NVRM|_LANGUAGE_C)$')
++fi
+ CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" "${RMINC[@]}" "${KMSINC[@]}"
+   -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT "${RMDEFS[@]}" ${NM_TAHOE:+-DNM_TAHOE}   # NM_TAHOE=1: the macOS 26 build
+   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
+diff --git a/build/fb_build.sh b/build/fb_build.sh
+new file mode 100755
+index 0000000..c2cd808
+--- /dev/null
++++ b/build/fb_build.sh
+@@ -0,0 +1,48 @@
++#!/bin/bash
++set -euo pipefail
++
++SRC=$1
++OUT=$2
++mkdir -p "$OUT/NVRMFB.kext/Contents/MacOS"
++
++OGKM=${OGKM:-$HOME/ogkm610}
++SDK=$(xcrun --show-sdk-path)
++KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
++NV="$OGKM/src/nvidia"
++KMS="$OGKM/src/nvidia-modeset"
++
++RMINC=(
++  -I"$NV/arch/nvalloc/unix/include" -I"$NV/arch/nvalloc/common/inc"
++  -I"$NV/arch/nvalloc/common/inc/gsp" -I"$OGKM/src/common/sdk/nvidia/inc"
++  -I"$OGKM/src/common/sdk/nvidia/inc/hw" -I"$OGKM/src/common/inc"
++  -I"$OGKM/src/common/shared/inc" -I"$NV/inc" -I"$NV/inc/os"
++  -I"$NV/inc/kernel" -I"$NV/kernel/inc" -I"$NV/interface"
++)
++KMSINC=(
++  -I"$KMS/os-interface/include" -I"$KMS/kapi/interface" -I"$KMS/kapi/include"
++  -I"$OGKM/src/common/unix/nvidia-push/interface" -I"$KMS/interface" -I"$KMS/include"
++  -I"$OGKM/src/common/unix/common/inc" -I"$OGKM/src/common/modeset"
++  -I"$OGKM/src/common/unix/common/utils/interface"
++)
++CFLAGS=(
++  -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC"
++  "${RMINC[@]}" "${KMSINC[@]}"
++  -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
++  -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
++  -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override
++  -Wno-unused-function -O2
++)
++
++xcrun clang++ "${CFLAGS[@]}" -I"$SRC/fb" -c "$SRC/fb/nvrm-fb.cpp" \
++  -o "$OUT/nvrm-fb.o" 2>"$OUT/fb.err" || {
++    grep -E 'error:|fatal error:' "$OUT/fb.err" | head -40
++    exit 1
++  }
++xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext \
++  -lkmodc++ -lkmod -lcc_kext "$OUT/nvrm-fb.o" \
++  -o "$OUT/NVRMFB.kext/Contents/MacOS/NVRMFB" 2>"$OUT/fbld.err" || {
++    head -40 "$OUT/fbld.err"
++    exit 1
++  }
++cp "$SRC/fb/Info.plist" "$OUT/NVRMFB.kext/Contents/Info.plist"
++echo "NVRMFB $(md5 -q "$OUT/NVRMFB.kext/Contents/MacOS/NVRMFB") $(stat -f %z "$OUT/NVRMFB.kext/Contents/MacOS/NVRMFB") B"
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index a82d6e3..0086741 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -1568,7 +1568,8 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
+     const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
+     if (!W || !H || P < 4 * W || H * P > bytes) return nvAccelIopFlipNo(6);
+     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
+-    f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
++    f.version = NVRM_FLIP_ABI_VERSION; f.kapiMemory = kmem; f.allocationCookie = vm->fAllocationCookie;
++    f.sourceKva = vm->fKva; f.width = (unsigned)W; f.height = (unsigned)H; f.pitch = (unsigned)P;
+     if (gIopAsync && pipe) return nvAccelIopAsyncStart(pipe, fb, head, s, &f);
+     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");
+     IOReturn rr = sym ? fb->callPlatformFunction(sym, false, &f, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
+@@ -1936,7 +1937,7 @@ static bool nvAccelFlipTo(IOAccelResource2 *res)
+     volatile unsigned char *z = (volatile unsigned char *)&f;
+     for (unsigned i = 0; i < sizeof f; i++) z[i] = 0;
+     f.version = NVRM_FLIP_ABI_VERSION;
+-    f.kapiMemory = vm->fRmHandle; f.allocationCookie = vm->fAllocationCookie;
++    f.kapiMemory = vm->fRmHandle; f.allocationCookie = vm->fAllocationCookie; f.sourceKva = vm->fKva;
+     f.width = w; f.height = h; f.pitch = pitch;
+ 
+     const OSSymbol *sym = OSSymbol::withCStringNoCopy(NVRM_FLIP_FN);
+diff --git a/kexts/NVRM/nvrm_gpuva_abi.h b/kexts/NVRM/nvrm_gpuva_abi.h
+index e26646c..56f3a23 100644
+--- a/kexts/NVRM/nvrm_gpuva_abi.h
++++ b/kexts/NVRM/nvrm_gpuva_abi.h
+@@ -14,7 +14,7 @@
+ #define NVRM_GPUVA_FN_MAP     "nvGpuVaMap"
+ #define NVRM_GPUVA_FN_FREE    "nvGpuVaFree"
+ 
+-#define NVRM_FLIP_ABI_VERSION 2u
++#define NVRM_FLIP_ABI_VERSION 3u
+ 
+ #define NVRM_FLIP_FN  "nvFlipToSurface"
+ 
+@@ -26,6 +26,7 @@ struct NVRMFlipRequest {
+     unsigned int pitch;
+     int          flipResult;
+     unsigned long long allocationCookie;
++    const void  *sourceKva;
+ };
+ #define NVRM_GPUVA_FN_HANDLES "nvRmHandles"
+ 
+diff --git a/kexts/NVRMFB/fb/nvrm-fb.cpp b/kexts/NVRMFB/fb/nvrm-fb.cpp
+index e83865b..c95cc28 100644
+--- a/kexts/NVRMFB/fb/nvrm-fb.cpp
++++ b/kexts/NVRMFB/fb/nvrm-fb.cpp
+@@ -16,6 +16,7 @@
+ #include <mach/mach_time.h>
+ #include <IOKit/IODeviceMemory.h>
+ #include <IOKit/IOPlatformExpert.h>
++#include <IOKit/pci/IOPCIDevice.h>
+ #include <IOKit/IOSubMemoryDescriptor.h>
+ #include <IOKit/graphics/IOFramebuffer.h>
+ #include <IOKit/graphics/IOGraphicsTypes.h>
+@@ -27,6 +28,9 @@
+ #include "nvrm-hud.h"
+ #include "nvrm-fb-safety.h"
+ #include "nvrm-allocation-table.h"
++#include "../nvscanout_abi.h"
++#define NVRM_SS_KERNEL_ABI 1
++#include "../nvrm_surfshare_abi.h"
+ static IORecursiveLock *startLock();
+ class NVRMCallReference {
+     OSObject *owner;
+@@ -203,6 +207,21 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
+     IOMemoryDescriptor *fBarMem = nullptr; IOMemoryMap *fBarMap = nullptr;
+     void *fBarKva = nullptr; NvU64 fBarLen = 0;
+     void surveyBar1();
++    IOMemoryMap *fNvscanMap = nullptr;
++    volatile UInt8 *fNvscanKva = nullptr;
++    UInt64 fNvscanSequence = 0;
++    UInt64 fNvscanCopyNs = 0, fNvscanCopyMaxNs = 0;
++    UInt32 fNvscanCopies = 0, fNvscanGpuCopies = 0, fNvscanGpuFailures = 0;
++    // The GPU copies frames into the ivshmem slots through NVRM's copy-engine
++    // page-off; the slots' guest-physical pages, one array per slot
++    IOService *fNvscanRM = nullptr;
++    const OSSymbol *fNvscanPageoffFn = nullptr;
++    unsigned long long *fNvscanPages[2] = { nullptr, nullptr };
++    bool fNvscanGpu = false;
++    bool fNvscanTried = false;
++    bool nvscanInit();
++    void nvscanPublish(struct NvKmsKapiMemory *memory, const void *source, NvU32 width, NvU32 height, NvU32 pitch);
++    bool nvscanGpuCopy(struct NvKmsKapiMemory *memory, UInt32 slot, UInt64 bytes);
+     bool fConsoleAperture = false;
+     NvU64 fBar1Base = 0;
+     NvU8 fEdid[NVKMS_KAPI_EDID_BUFFER_SIZE]; NvU16 fEdidSize = 0;
+@@ -1887,6 +1906,10 @@ IOReturn NVRMNVDAFramebuffer::getAppleSense(IOIndex connectIndex, UInt32 *senseT
+ 
+ void NVRMNVDAFramebuffer::free()
+ {
++    if (fNvscanMap) { fNvscanMap->release(); fNvscanMap = nullptr; fNvscanKva = nullptr; }
++    for (unsigned i = 0; i < 2; i++)
++        if (fNvscanPages[i]) { IODelete(fNvscanPages[i], unsigned long long, NVSCAN_SLOT_BYTES / 4096); fNvscanPages[i] = nullptr; }
++    OSSafeReleaseNULL(fNvscanPageoffFn);
+     if (fFlipCacheLock) { IOSimpleLockFree(fFlipCacheLock); fFlipCacheLock = nullptr; }
+     if (fLogoKeep) { IODelete(fLogoKeep, uint32_t, (size_t)fLogoW * fLogoH); fLogoKeep = nullptr; }
+     super::free();
+@@ -2528,6 +2551,139 @@ bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
+     return true;
+ }
+ 
++bool NVRMNVDAFramebuffer::nvscanInit()
++{
++    if (fNvscanKva) return true;
++    if (fNvscanTried || fIndex != 0) return false;
++    fNvscanTried = true;
++    int enabled = 0;
++    if (!PE_parse_boot_argn("nvscan", &enabled, sizeof enabled) || !enabled) return false;
++
++    OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
++    OSIterator *iterator = match ? IOService::getMatchingServices(match) : nullptr;
++    OSSafeReleaseNULL(match);
++    if (!iterator) { FBLOG("nvscan: no PCI iterator"); return false; }
++
++    IOPCIDevice *device = nullptr;
++    while (OSObject *object = iterator->getNextObject()) {
++        IOPCIDevice *candidate = OSDynamicCast(IOPCIDevice, object);
++        if (candidate && candidate->configRead16(kIOPCIConfigVendorID) == 0x1af4 &&
++            candidate->configRead16(kIOPCIConfigDeviceID) == 0x1110) {
++            device = candidate;
++            break;
++        }
++    }
++    if (device) device->retain();
++    iterator->release();
++    if (!device) { FBLOG("nvscan: ivshmem PCI device 1af4:1110 not found"); return false; }
++
++    IODeviceMemory *memory = device->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
++    if (!memory || memory->getLength() < NVSCAN_SHMEM_BYTES) {
++        FBLOG("nvscan: BAR2 missing or smaller than %u MiB", NVSCAN_SHMEM_BYTES >> 20);
++        device->release();
++        return false;
++    }
++    // No macOS driver claims ivshmem, so nothing has enabled its memory
++    // decoding: without this the BAR is assigned but writes go nowhere
++    device->setMemoryEnable(true);
++    const UInt64 barPhys = memory->getPhysicalAddress();
++    fNvscanMap = memory->map(kIOMapAnywhere);
++    device->release();
++    if (!fNvscanMap) { FBLOG("nvscan: BAR2 map failed"); return false; }
++
++    // GPU copies: the copy engine writes each frame straight into a slot by
++    // guest-physical address (KVM maps passed-through VRAM uncached, so a CPU
++    // copy reads ~70 MB/s: 115 ms a 1080p frame)
++    IOService *rm = getProvider();
++    while (rm && strcmp(rm->getMetaClass()->getClassName(), "NVRM") != 0) rm = rm->getProvider();
++    const unsigned pages = NVSCAN_SLOT_BYTES / 4096;
++    fNvscanPageoffFn = OSSymbol::withCString(NVRM_SS_FN_PAGEOFF);
++    for (unsigned i = 0; i < 2; i++) {
++        fNvscanPages[i] = IONew(unsigned long long, pages);
++        if (!fNvscanPages[i]) break;
++        for (unsigned p = 0; p < pages; p++)
++            fNvscanPages[i][p] = barPhys + nvscan_slot_offset(i) + (UInt64)p * 4096;
++    }
++    fNvscanRM = rm;
++    fNvscanGpu = rm && fNvscanPageoffFn && fNvscanPages[0] && fNvscanPages[1];
++    FBLOG("nvscan: BAR2 at guest-physical 0x%llx; GPU copies %s", (unsigned long long)barPhys,
++          fNvscanGpu ? "on" : "unavailable (no NVRM service): CPU copies");
++    fNvscanKva = (volatile UInt8 *)(uintptr_t)fNvscanMap->getVirtualAddress();
++
++    struct nvscan_header *header = (struct nvscan_header *)(uintptr_t)fNvscanKva;
++    nvu_zero(header, sizeof *header);
++    header->version = NVSCAN_VERSION;
++    header->header_bytes = NVSCAN_HEADER_BYTES;
++    header->pixel_format = NVSCAN_X8R8G8B8;
++    header->slot_bytes = NVSCAN_SLOT_BYTES;
++    header->slot_count = 2;
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    header->magic = NVSCAN_MAGIC;
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    FBLOG("nvscan: mapped %u MiB ivshmem BAR2 at %p", NVSCAN_SHMEM_BYTES >> 20,
++          (void *)(uintptr_t)fNvscanKva);
++    return true;
++}
++
++bool NVRMNVDAFramebuffer::nvscanGpuCopy(struct NvKmsKapiMemory *memory, UInt32 slot, UInt64 bytes)
++{
++    if (!fNvscanGpu || !memory || !fDev) return false;
++    struct NVRMSurfPageoff p;
++    nvu_zero(&p, sizeof p);
++    p.version = NVRM_SS_RM_VERSION;
++    p.kapiDevice = fDev;
++    p.kapiMemory = memory;
++    p.pages = fNvscanPages[slot];
++    p.pageCount = (bytes + 4095) / 4096;
++    p.length = bytes;
++    IOReturn r = fNvscanRM->callPlatformFunction(fNvscanPageoffFn, false, &p, NULL, NULL, NULL);
++    if (r == kIOReturnSuccess && p.status == 0) {
++        fNvscanGpuFailures = 0;
++        return true;
++    }
++    if (++fNvscanGpuFailures <= 4)
++        FBLOG("nvscan: GPU copy failed (IOReturn 0x%x, status 0x%x): CPU copy instead", r, p.status);
++    if (fNvscanGpuFailures == 16) {
++        fNvscanGpu = false;
++        FBLOG("nvscan: GPU copies off after 16 failures in a row");
++    }
++    return false;
++}
++
++void NVRMNVDAFramebuffer::nvscanPublish(struct NvKmsKapiMemory *memory, const void *source, NvU32 width,
++                                        NvU32 height, NvU32 pitch)
++{
++    if (!source || !width || !height || pitch < width * 4u ||
++        (UInt64)pitch * height > NVSCAN_SLOT_BYTES || !nvscanInit()) return;
++
++    struct nvscan_header *header = (struct nvscan_header *)(uintptr_t)fNvscanKva;
++    const UInt32 slot = (UInt32)((fNvscanSequence + 1) & 1u);
++    void *destination = (void *)(uintptr_t)(fNvscanKva + nvscan_slot_offset(slot));
++    uint64_t t0 = mach_absolute_time();
++    if (nvscanGpuCopy(memory, slot, (UInt64)pitch * height)) fNvscanGpuCopies++;
++    else nvu_copy(destination, source, (size_t)pitch * height);
++    uint64_t ns = 0;
++    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++    fNvscanCopyNs += ns;
++    if (ns > fNvscanCopyMaxNs) fNvscanCopyMaxNs = ns;
++    if (++fNvscanCopies == 120) {
++        FBLOG("nvscan: copy of %ux%u (%u KB) avg %llu us max %llu us = %llu MB/s (%u of 120 by the GPU)",
++              width, height, (unsigned)((size_t)pitch * height >> 10),
++              fNvscanCopyNs / 120000, fNvscanCopyMaxNs / 1000,
++              fNvscanCopyNs ? (unsigned long long)((uint64_t)pitch * height * 120 * 1000 / fNvscanCopyNs) : 0ULL,
++              fNvscanGpuCopies);
++        fNvscanCopies = 0; fNvscanCopyNs = 0; fNvscanCopyMaxNs = 0; fNvscanGpuCopies = 0;
++    }
++    header->width = width;
++    header->height = height;
++    header->stride = pitch;
++    header->pixel_format = NVSCAN_X8R8G8B8;
++    header->write_slot = slot;
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    header->frame_sequence = ++fNvscanSequence;
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++}
++
+ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
+                                                void *param1, void *param2, void *param3, void *param4)
+ {
+@@ -2570,6 +2726,8 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
+         bool ok = flipToMemory(home ? nullptr : (struct NvKmsKapiMemory *)f->kapiMemory,
+                                f->width, f->height, f->pitch, &rc, !home || pureHome, f->allocationCookie);
+         f->flipResult = rc;
++        if (ok) nvscanPublish(home ? fMem : (struct NvKmsKapiMemory *)f->kapiMemory,
++                              home ? fKva : f->sourceKva, f->width, f->height, f->pitch);
+         return ok ? kIOReturnSuccess : kIOReturnIOError;
+     }
+     if (functionName && functionName->isEqualTo(NVRM_FLIP_FN)) {
+@@ -2579,6 +2737,7 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
+         bool ok = flipToMemory((struct NvKmsKapiMemory *)f->kapiMemory,
+                                f->width, f->height, f->pitch, &rc, false, f->allocationCookie);
+         f->flipResult = rc;
++        if (ok) nvscanPublish((struct NvKmsKapiMemory *)f->kapiMemory, f->sourceKva, f->width, f->height, f->pitch);
+         return ok ? kIOReturnSuccess : kIOReturnIOError;
+     }
+     const char *name = functionName ? functionName->getCStringNoCopy() : "(null)";
+diff --git a/kexts/NVRMFB/nvrm_gpuva_abi.h b/kexts/NVRMFB/nvrm_gpuva_abi.h
+index e26646c..56f3a23 100644
+--- a/kexts/NVRMFB/nvrm_gpuva_abi.h
++++ b/kexts/NVRMFB/nvrm_gpuva_abi.h
+@@ -14,7 +14,7 @@
+ #define NVRM_GPUVA_FN_MAP     "nvGpuVaMap"
+ #define NVRM_GPUVA_FN_FREE    "nvGpuVaFree"
+ 
+-#define NVRM_FLIP_ABI_VERSION 2u
++#define NVRM_FLIP_ABI_VERSION 3u
+ 
+ #define NVRM_FLIP_FN  "nvFlipToSurface"
+ 
+@@ -26,6 +26,7 @@ struct NVRMFlipRequest {
+     unsigned int pitch;
+     int          flipResult;
+     unsigned long long allocationCookie;
++    const void  *sourceKva;
+ };
+ #define NVRM_GPUVA_FN_HANDLES "nvRmHandles"
+ 
+diff --git a/kexts/NVRMFB/nvscanout_abi.h b/kexts/NVRMFB/nvscanout_abi.h
+new file mode 100644
+index 0000000..b4ebc8d
+--- /dev/null
++++ b/kexts/NVRMFB/nvscanout_abi.h
+@@ -0,0 +1,49 @@
++/*
++ * NullMoth/QEMU shared scanout ABI.
++ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
++ */
++#pragma once
++
++#include <stdint.h>
++
++#define NVSCAN_MAGIC UINT64_C(0x4e565343414e3031) /* "NVSCAN01" */
++#define NVSCAN_VERSION 1u
++#define NVSCAN_HEADER_BYTES 4096u
++#define NVSCAN_SLOT_BYTES (32u * 1024u * 1024u)
++#define NVSCAN_SHMEM_BYTES (128u * 1024u * 1024u)
++
++enum nvscan_pixel_format {
++    NVSCAN_X8R8G8B8 = 1,
++};
++
++struct nvscan_header {
++    uint64_t magic;
++    uint32_t version;
++    uint32_t header_bytes;
++    uint32_t width;
++    uint32_t height;
++    uint32_t stride;
++    uint32_t pixel_format;
++    uint32_t slot_bytes;
++    uint32_t slot_count;
++    uint32_t write_slot;
++    uint32_t flags;
++    uint64_t frame_sequence;
++    uint64_t frame_time_ns;
++    uint64_t dropped_frames;
++    uint8_t reserved[NVSCAN_HEADER_BYTES - 72];
++};
++
++#if defined(__cplusplus)
++static_assert(sizeof(struct nvscan_header) == NVSCAN_HEADER_BYTES,
++              "nvscan header must occupy one page");
++#else
++_Static_assert(sizeof(struct nvscan_header) == NVSCAN_HEADER_BYTES,
++               "nvscan header must occupy one page");
++#endif
++
++static inline uint64_t nvscan_slot_offset(uint32_t slot)
++{
++    return NVSCAN_HEADER_BYTES + (uint64_t)slot * NVSCAN_SLOT_BYTES;
++}
++
+diff --git a/tools/qemu-scanout/Makefile b/tools/qemu-scanout/Makefile
+new file mode 100644
+index 0000000..fe8df73
+--- /dev/null
++++ b/tools/qemu-scanout/Makefile
+@@ -0,0 +1,15 @@
++CC ?= cc
++CFLAGS ?= -O2 -g -Wall -Wextra
++
++.PHONY: all clean
++all: nvscan-viewer nvscan-test-pattern
++
++nvscan-viewer: nvscan-viewer.c ../../kexts/NVRMFB/nvscanout_abi.h
++	$(CC) $(CFLAGS) $(shell pkg-config --cflags sdl2) $< -o $@ \
++		$(shell pkg-config --libs sdl2)
++
++nvscan-test-pattern: nvscan-test-pattern.c ../../kexts/NVRMFB/nvscanout_abi.h
++	$(CC) $(CFLAGS) $< -o $@
++
++clean:
++	rm -f nvscan-viewer nvscan-test-pattern
+diff --git a/tools/qemu-scanout/nvscan-test-pattern.c b/tools/qemu-scanout/nvscan-test-pattern.c
+new file mode 100644
+index 0000000..5795c1a
+--- /dev/null
++++ b/tools/qemu-scanout/nvscan-test-pattern.c
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 */
++#include "../../kexts/NVRMFB/nvscanout_abi.h"
++
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++int main(int argc, char **argv)
++{
++    const char *path = argc > 1 ? argv[1] : "/dev/shm/nvscanout-test";
++    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
++    if (fd < 0 || ftruncate(fd, NVSCAN_SHMEM_BYTES)) {
++        perror(path);
++        return 1;
++    }
++    uint8_t *shared = mmap(NULL, NVSCAN_SHMEM_BYTES, PROT_READ | PROT_WRITE,
++                           MAP_SHARED, fd, 0);
++    if (shared == MAP_FAILED) {
++        perror("mmap");
++        return 1;
++    }
++    close(fd);
++
++    struct nvscan_header *header = (void *)shared;
++    memset(header, 0, sizeof(*header));
++    header->magic = NVSCAN_MAGIC;
++    header->version = NVSCAN_VERSION;
++    header->header_bytes = NVSCAN_HEADER_BYTES;
++    header->width = 1920;
++    header->height = 1080;
++    header->stride = 1920 * 4;
++    header->pixel_format = NVSCAN_X8R8G8B8;
++    header->slot_bytes = NVSCAN_SLOT_BYTES;
++    header->slot_count = 2;
++
++    for (uint64_t frame = 1;; frame++) {
++        uint32_t slot = frame & 1;
++        uint32_t *pixels = (void *)(shared + nvscan_slot_offset(slot));
++        for (uint32_t y = 0; y < header->height; y++) {
++            for (uint32_t x = 0; x < header->width; x++) {
++                uint8_t r = (x + frame * 4) & 255;
++                uint8_t g = (y + frame * 2) & 255;
++                uint8_t b = ((x ^ y) + frame) & 255;
++                pixels[(uint64_t)y * header->width + x] =
++                    0xff000000u | (uint32_t)r << 16 | (uint32_t)g << 8 | b;
++            }
++        }
++        header->write_slot = slot;
++        __atomic_store_n(&header->frame_sequence, frame, __ATOMIC_RELEASE);
++        usleep(16667);
++    }
++}
+diff --git a/tools/qemu-scanout/nvscan-viewer.c b/tools/qemu-scanout/nvscan-viewer.c
+new file mode 100644
+index 0000000..6ce04c6
+--- /dev/null
++++ b/tools/qemu-scanout/nvscan-viewer.c
+@@ -0,0 +1,115 @@
++/* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 */
++#include "../../kexts/NVRMFB/nvscanout_abi.h"
++
++#include <SDL.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++static void die(const char *what)
++{
++    fprintf(stderr, "nvscan-viewer: %s: %s\n", what, strerror(errno));
++    exit(1);
++}
++
++int main(int argc, char **argv)
++{
++    const char *path = argc > 1 ? argv[1] : "/dev/shm/nvscanout";
++    int fd = open(path, O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        die(path);
++    }
++
++    uint8_t *shared = mmap(NULL, NVSCAN_SHMEM_BYTES, PROT_READ, MAP_SHARED,
++                           fd, 0);
++    if (shared == MAP_FAILED) {
++        die("mmap");
++    }
++    close(fd);
++
++    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
++        fprintf(stderr, "nvscan-viewer: SDL_Init: %s\n", SDL_GetError());
++        return 1;
++    }
++
++    SDL_Window *window = SDL_CreateWindow("macOS NVIDIA scanout",
++        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 960, 540,
++        SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
++    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1,
++        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
++    SDL_Texture *texture = NULL;
++    uint32_t texture_w = 0, texture_h = 0;
++    uint64_t displayed = 0;
++    bool running = window && renderer;
++
++    while (running) {
++        SDL_Event event;
++        while (SDL_PollEvent(&event)) {
++            if (event.type == SDL_QUIT ||
++                (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
++                running = false;
++            }
++        }
++
++        struct nvscan_header snapshot;
++        const struct nvscan_header *header = (const void *)shared;
++        uint64_t sequence = __atomic_load_n(&header->frame_sequence,
++                                             __ATOMIC_ACQUIRE);
++        if (sequence == displayed || header->magic != NVSCAN_MAGIC ||
++            header->version != NVSCAN_VERSION) {
++            SDL_Delay(2);
++            continue;
++        }
++        memcpy(&snapshot, header, sizeof(snapshot));
++        if (!snapshot.width || !snapshot.height ||
++            snapshot.pixel_format != NVSCAN_X8R8G8B8 ||
++            snapshot.write_slot >= snapshot.slot_count ||
++            snapshot.slot_count > 2 ||
++            (uint64_t)snapshot.stride * snapshot.height > snapshot.slot_bytes ||
++            nvscan_slot_offset(snapshot.write_slot) + snapshot.slot_bytes >
++                NVSCAN_SHMEM_BYTES) {
++            SDL_Delay(10);
++            continue;
++        }
++
++        if (!texture || texture_w != snapshot.width ||
++            texture_h != snapshot.height) {
++            SDL_DestroyTexture(texture);
++            texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
++                SDL_TEXTUREACCESS_STREAMING, snapshot.width, snapshot.height);
++            texture_w = snapshot.width;
++            texture_h = snapshot.height;
++            SDL_SetWindowSize(window, snapshot.width / 2,
++                              snapshot.height / 2);
++        }
++        if (!texture) {
++            fprintf(stderr, "nvscan-viewer: texture: %s\n", SDL_GetError());
++            break;
++        }
++
++        const void *pixels = shared + nvscan_slot_offset(snapshot.write_slot);
++        SDL_UpdateTexture(texture, NULL, pixels, snapshot.stride);
++        if (__atomic_load_n(&header->frame_sequence, __ATOMIC_ACQUIRE) !=
++            sequence) {
++            continue;
++        }
++        SDL_RenderClear(renderer);
++        SDL_RenderCopy(renderer, texture, NULL, NULL);
++        SDL_RenderPresent(renderer);
++        displayed = sequence;
++    }
++
++    SDL_DestroyTexture(texture);
++    SDL_DestroyRenderer(renderer);
++    SDL_DestroyWindow(window);
++    SDL_Quit();
++    munmap(shared, NVSCAN_SHMEM_BYTES);
++    return 0;
++}
+-- 
+2.55.0
+

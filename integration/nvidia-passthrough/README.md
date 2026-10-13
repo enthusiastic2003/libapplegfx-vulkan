@@ -42,6 +42,20 @@ reported Metal 3 with 8 GB VRAM.
 - `efi/`: OpenCore configuration/image-generation snapshot for NullMoth.
 - `guest-tools/nvidia-main.c`: makes NVIDIA HDMI primary for the current login
   session and removes broken hardware mirroring.
+- `guest-tools/nvidia-mirror.c`: makes NVIDIA HDMI primary and mirrors the VGA
+  display from it (hardware mirror); keeps both at a shared mode, so the
+  NVIDIA display cannot switch to a 5K mode whose frames don't fit a slot.
+- `nullmoth-nvscan.patch`: the NullMoth driver change (NVRMFB) that publishes
+  the scanout through ivshmem and has the GPU copy the frames; the same commit
+  is on the local `nvscan` branch of `downloads/src/nvidia-macos-driver`.
+- `qemu-nvscan-display.c`: QEMU's `nvscan-display` device (committed in
+  mos-qemu as `hw/display/nvscan-display.c`; `build-qemu.sh` copies it from
+  there into the QEMU tree).
+- `guest-tools/install-nvrmfb.sh`, `guest-tools/nvscan-install-bg.sh`: install
+  a rebuilt NVRMFB into the auxiliary kernel collection (with a backup and
+  rollback), in the background so the build survives SSH drops.
+- `guest-tools/ce-probe.c`: user-space copy-engine probe (VRAM -> sysmem,
+  physical addressing, VRAM -> ivshmem by guest-physical address).
 
 ## Boot sequence
 
@@ -67,3 +81,46 @@ clang nvidia-main.c -framework ApplicationServices -o nvidia-main
 
 The helper uses `kCGConfigureForSession`; the boot display arrangement returns
 after logout or reboot.
+
+## The NVIDIA output in QEMU's window (NVSCAN)
+
+With `NVSCAN=1` the launcher adds a 128 MiB ivshmem device backed by
+`/dev/shm/nvscanout`, and QEMU's `nvscan-display` device on the same memory,
+placed before the VGA device so it is console 0. NVRMFB (with the boot arg
+`nvscan=1`: `cd efi && NV=2 NVSCAN=1 ./build-opencore.sh`) writes every flipped
+frame into it; nvscan-display shows the newest one, and mirrors the VGA
+console until frames arrive or after a guest reset. The raw VGA console stays
+on the second tab.
+
+The GPU copies the frames: NVRMFB hands the flipped surface to NVRM's
+copy-engine page-off (`nvSurfPageoff`, NVIDIA's CeUtils), which writes it
+straight to the slot's guest-physical pages. Measured at 1920x1080:
+
+| | per frame |
+|---|---|
+| CPU copy (reads VRAM through BAR1, which KVM maps uncached: ~72 MB/s) | ~115 ms |
+| GPU copy | ~0.82 ms (about 10 GB/s) |
+
+The CPU copy ran inside the flip and held the whole desktop at ~8 fps; with
+the GPU copy frames reach QEMU at the display's rate (54 fps measured while
+dragging windows).
+
+Boot:
+
+```bash
+sudo ./qemu-pvg/gpu-reset.sh 12            # before every VM start
+NVPT=1 NVSCAN=1 PVG=0 HEADLESS=0 MEM=6G INSTALLER=0 ./run-macos.sh
+ssh -p 2222 <user>@localhost ~/tools/nvidia-mirror   # after each login
+```
+
+Notes:
+
+- NullMoth turns on its flip path about 60 s after the display is armed;
+  until then QEMU shows the VGA mirror.
+- The GPU drives a head only with an HDMI sink attached (here a USB capture
+  card; a dummy plug would do). If the boot logs
+  `NVRM-fb: dpy 0/1 0x100: connected 0`, the sink was not seen: restart the
+  VM (after `gpu-reset.sh`).
+- In this setup the driver placed BAR1 at 4 GiB itself
+  (`bar1: PLACED — BAR1 4096 MB`), started the card in 500 ms and armed the
+  display before its 60 s headless check.
