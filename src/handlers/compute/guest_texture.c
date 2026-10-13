@@ -494,16 +494,21 @@ static bool upload_from_guest(lagfx_protocol_t *p, const lagfx_task_entry_t *tas
      * uploaded since and unchanged) */
     double t0 = now_ms();
     uint64_t sum = 0;
-    bool summed = !getenv("LAGFX_DUMP_WB") && texture_checksum(p, mem_task, vk, ios, obj, &sum);
-    if (summed && ios->sum_valid && !ios->gpu_drawn && sum == ios->mem_sum) {
+    bool dump = getenv("LAGFX_DUMP_WB") != NULL;
+    /* the checksum only when it can save the copy: an image unchanged since
+     * its memory was last checksummed */
+    bool summed = !dump && ios->sum_valid && !ios->gpu_drawn
+                  && texture_checksum(p, mem_task, vk, ios, obj, &sum);
+    if (summed && sum == ios->mem_sum) {
         stats.skipped_uploads++;
         stats.up_ms += now_ms() - t0;
         stats_tick();
         return true;
     }
-    if (summed && guest_map_copy(p, mem_task, vk, ios, obj, true)) {
+    if (!dump && guest_map_copy(p, mem_task, vk, ios, obj, true)) {
+        /* the image now equals the memory: checksum it unless that's done */
+        ios->sum_valid = summed || texture_checksum(p, mem_task, vk, ios, obj, &sum);
         ios->mem_sum = sum;
-        ios->sum_valid = 1u;
         stats.up_ms += now_ms() - t0;
         stats.uploads++;
         stats.up_bytes += (unsigned long long)tight * obj->height;
